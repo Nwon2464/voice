@@ -171,6 +171,7 @@ interview_app.py        GTK UI, 오디오 스트림, Whisper/Codex 작업 관리
 audio_utils.py          F8 질문 경계 계산과 JSONL 기록
 start_interview_app.sh  백그라운드 실행 진입점
 requirements.txt        직접 사용하는 Python 패키지
+benchmarks/             v0 모델·Fast mode 응답시간 기록
 README.md               설치와 운용 문서
 ```
 
@@ -193,3 +194,5 @@ README.md               설치와 운용 문서
 - Windows 포팅: Linux 최종 버전을 확정한 뒤 Windows 오디오 캡처·전역 단축키·UI에 맞게 별도 개발
 
 v0와 v1 비교 시에는 질문 경계 정확도, F8부터 첫 글자까지의 시간, 전체 답변 완료시간, 대화 일관성, 장애 복구 여부를 동일한 조건에서 기록합니다.
+
+기존 v0 Codex 응답시간은 [`benchmarks/README.md`](benchmarks/README.md)에 정리되어 있습니다.
