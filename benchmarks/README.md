@@ -25,3 +25,7 @@ Fast off 기록은 실제 면접 테스트에서 수집했습니다. 질문이 �
 - `codex_live_20260808_sol_low_no_fast.jsonl`
 
 오디오 WAV, 마이크 전사, 장치 이름 등 성능 비교에 필요하지 않은 실제 세션 데이터는 포함하지 않았습니다.
+
+## v1 App Server smoke test
+
+`codex_app_server_smoke_20260808_sol_low_no_fast.jsonl`은 v1 구현 직후 실행한 통합 확인 기록입니다. App Server 준비에는 0.704초가 걸렸고, 두 turn은 동일한 thread id를 사용했습니다. 두 번째 turn이 첫 번째 turn에서만 전달한 코드워드 `ORCHID`를 답해 세션 문맥 유지도 확인했습니다. 이 테스트는 질문과 실행 방식이 v0 벤치마크와 다르므로 속도 A/B 비교에는 사용하지 않습니다.

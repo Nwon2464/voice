@@ -1,8 +1,10 @@
-# Interview Assistant v0
+# Interview Assistant v1 App Server
 
 Linux GNOME에서 웹 화상면접의 상대방 음성과 내 마이크 음성을 실시간으로 전사하고, F8을 누른 시점의 질문을 Codex에 보내 말하기 쉬운 답변 초안을 표시하는 로컬 데스크톱 도구입니다.
 
-이 저장소의 `v0`는 현재 검증된 기준 버전입니다. Codex 호출 방식은 질문마다 독립적인 `codex exec` 프로세스를 실행합니다. 후속 `v1-app-server` 브랜치에서는 하나의 Codex App Server와 하나의 대화 스레드를 면접 내내 유지하는 방식을 실험합니다.
+`v0` 태그와 `main` 브랜치는 질문마다 독립적인 `codex exec` 프로세스를 실행하는 검증 기준입니다. 현재 `v1-app-server` 브랜치는 하나의 Codex App Server와 하나의 대화 thread를 앱이 종료될 때까지 유지하는 방식을 실험합니다.
+
+`v1-app-server` 브랜치의 현재 범위와 보류 항목은 [`docs/V1_APP_SERVER.md`](docs/V1_APP_SERVER.md)에 기록합니다.
 
 ## 현재 동작
 
@@ -14,7 +16,7 @@ Linux GNOME에서 웹 화상면접의 상대방 음성과 내 마이크 음성�
                                                     ↓
                                   최근 질문 + 대화 문맥
                                                     ↓
-                                  Codex CLI (Sol, low, Fast off)
+                              Codex App Server (Sol, low, Fast off)
                                                     ↓
                                             답변 초안 창
 ```
@@ -26,7 +28,7 @@ Linux GNOME에서 웹 화상면접의 상대방 음성과 내 마이크 음성�
 - F8 연속 오입력은 300ms 안에서는 한 번으로 처리합니다.
 - 질문 경계는 F8 시각 주변의 문장부호·무음·반응시간 보정을 사용합니다.
 
-## v0 기본 설정
+## 현재 v1 기본 설정
 
 | 항목 | 값 |
 |---|---|
@@ -35,7 +37,7 @@ Linux GNOME에서 웹 화상면접의 상대방 음성과 내 마이크 음성�
 | Codex 모델 | `gpt-5.6-sol` |
 | Reasoning effort | `low` |
 | Fast mode | 끔 |
-| Codex 세션 | F8마다 독립적인 ephemeral `codex exec` |
+| Codex 세션 | 앱 수명 동안 하나의 ephemeral App Server thread |
 | 테스트 기록 | 기본값 끔 |
 
 ## 필요한 프로그램
@@ -169,9 +171,11 @@ $XDG_RUNTIME_DIR/interview-assistant.log
 ```text
 interview_app.py        GTK UI, 오디오 스트림, Whisper/Codex 작업 관리
 audio_utils.py          F8 질문 경계 계산과 JSONL 기록
+codex_app_server.py     상주 App Server와 단일 thread의 stdio 클라이언트
 start_interview_app.sh  백그라운드 실행 진입점
 requirements.txt        직접 사용하는 Python 패키지
 benchmarks/             v0 모델·Fast mode 응답시간 기록
+docs/                   v1 범위와 후속 개선 기록
 README.md               설치와 운용 문서
 ```
 
@@ -184,12 +188,12 @@ README.md               설치와 운용 문서
 - 브라우저별 음성이 아니라 시스템 기본 출력 전체를 캡처합니다.
 - Whisper 전사는 로컬이지만 질문과 최근 대화 문맥은 Codex 응답 생성을 위해 OpenAI 서비스로 전달됩니다.
 - F8 시점은 사람의 반응시간과 Whisper 단어 타임스탬프를 보정한 추정 경계입니다.
-- v0는 F8마다 새 `codex exec` 프로세스를 실행하므로 대화 세션 자체는 유지하지 않습니다.
+- App Server는 아직 실험적이므로 Codex CLI 버전 변경 후 프로토콜 검증이 필요합니다.
 
 ## 버전 계획
 
 - `v0` 태그: 현재 검증된 `codex exec` 기준 버전
-- `v1-app-server` 브랜치: App Server 상주 프로세스, 단일 thread, 답변 스트리밍과 장애 복구 실험
+- `v1-app-server` 브랜치: App Server 상주 프로세스와 단일 thread를 먼저 검증한 뒤 스트리밍과 장애 복구 실험
 - 최종 Linux 버전 선정: 동일한 테스트 질문과 로그 지표로 v0/v1 비교
 - Windows 포팅: Linux 최종 버전을 확정한 뒤 Windows 오디오 캡처·전역 단축키·UI에 맞게 별도 개발
 

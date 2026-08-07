@@ -58,6 +58,7 @@ from audio_utils import (
     append_log,
     transcribe_question,
 )
+from codex_app_server import CodexAppServerClient
 
 
 # Ubuntu의 python3-gi는 시스템 경로에 설치되어 있고 venv에는 노출되지 않는다.
@@ -73,14 +74,21 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 
-APP_VERSION = "v0"
+APP_VERSION = "v1-app-server-dev"
 WHISPER_MODEL = os.environ.get("INTERVIEW_WHISPER_MODEL", "small")
 LANGUAGE = os.environ.get("INTERVIEW_LANGUAGE", "en")
 CODEX_MODEL = os.environ.get("INTERVIEW_CODEX_MODEL", "gpt-5.6-sol")
 CODEX_REASONING = os.environ.get("INTERVIEW_CODEX_REASONING", "low")
 CODEX_FAST_MODE = False
 CODEX_TIMEOUT_SECONDS = 60
-CONTEXT_ITEMS = 12
+CODEX_DEVELOPER_INSTRUCTIONS = """You assist a job candidate during a live interview.
+Use only the supplied interview transcript and do not use tools or browse the web.
+Write only a concise, immediately speakable answer draft in the same language as the current question, using 3-5 short sentences.
+Do not add headings, follow-up questions, key-points sections, or commentary.
+Do not invent specific personal facts; use broadly adaptable wording when details are missing.
+Your earlier messages are answer drafts, not proof of what the candidate actually said.
+Only transcript lines labelled ME are the candidate's actual spoken words.
+Each new turn contains only conversation transcribed since the previous request plus the current interviewer question."""
 ANSWER_SCROLL_DEBOUNCE_MS = 450
 ANSWER_SMOOTH_SCROLL_THRESHOLD = 1.5
 ANSWER_CONTENT_SCROLL_PIXELS = 60
@@ -493,13 +501,14 @@ class WhisperWorker:
 
 
 class CodexWorker:
-    """Run isolated Codex requests without blocking audio capture or the UI."""
+    """Run queued turns on one persistent App Server thread."""
 
-    def __init__(self):
+    def __init__(self, on_ready):
         self.jobs = queue.Queue()
         self.accepting = True
-        self.process = None
-        self.process_lock = threading.Lock()
+        self.on_ready = on_ready
+        self.client = None
+        self.client_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -509,10 +518,10 @@ class CodexWorker:
 
     def stop(self):
         self.accepting = False
-        with self.process_lock:
-            process = self.process
-        if process is not None and process.poll() is None:
-            process.terminate()
+        with self.client_lock:
+            client = self.client
+        if client is not None:
+            client.stop()
         while True:
             try:
                 self.jobs.get_nowait()
@@ -521,82 +530,39 @@ class CodexWorker:
         self.jobs.put(None)
         self.thread.join(timeout=3)
 
-    def _run_codex(self, prompt):
-        codex_path = shutil.which("codex")
-        if codex_path is None:
-            raise RuntimeError("Codex CLI was not found in PATH")
-        command = [
-            codex_path,
-            "exec",
-            "--json",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--sandbox", "read-only",
-            "--disable", "fast_mode",
-            "--model", CODEX_MODEL,
-            "--config", f'model_reasoning_effort="{CODEX_REASONING}"',
-            "--cd", str(APP_DIR),
-            "-",
-        ]
-        started = time.perf_counter()
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=APP_DIR,
-        )
-        with self.process_lock:
-            self.process = process
-        try:
-            stdout, stderr = process.communicate(
-                prompt,
-                timeout=CODEX_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            raise RuntimeError(
-                f"Codex did not respond within {CODEX_TIMEOUT_SECONDS} seconds"
-            )
-        finally:
-            with self.process_lock:
-                self.process = None
-        if process.returncode != 0:
-            message = stderr.strip() or f"Codex exited with status {process.returncode}"
-            raise RuntimeError(message)
-
-        answer = ""
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item", {})
-            if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-                answer = item.get("text", "").strip()
-        if not answer:
-            raise RuntimeError("Codex returned no answer")
-        return {
-            "text": answer,
-            "elapsed": time.perf_counter() - started,
-        }
-
     def _run(self):
+        try:
+            client = CodexAppServerClient(
+                model=CODEX_MODEL,
+                effort=CODEX_REASONING,
+                cwd=APP_DIR,
+                developer_instructions=CODEX_DEVELOPER_INSTRUCTIONS,
+                timeout_seconds=CODEX_TIMEOUT_SECONDS,
+            )
+            with self.client_lock:
+                self.client = client
+            ready = client.start()
+            startup_error = None
+        except Exception as caught:
+            ready = None
+            startup_error = caught
+        GLib.idle_add(self.on_ready, ready, startup_error)
+
         while True:
             job = self.jobs.get()
             if job is None:
                 return
             prompt, callback = job
-            try:
-                result = self._run_codex(prompt)
-                error = None
-            except Exception as caught:
+            if startup_error is not None:
                 result = None
-                error = caught
+                error = startup_error
+            else:
+                try:
+                    result = client.run_turn(prompt)
+                    error = None
+                except Exception as caught:
+                    result = None
+                    error = caught
             GLib.idle_add(callback, result, error)
 
 
@@ -856,7 +822,8 @@ class InterviewApp:
         self.codex_request_count = 0
         self.remote_utterances = []
         self.pending_questions = []
-        self.conversation_context = deque(maxlen=CONTEXT_ITEMS)
+        self.conversation_context = []
+        self.codex_context_cursor = 0
         self.transcript_lock = threading.Lock()
         self.last_f8_at = None
         self.socket_thread = None
@@ -932,6 +899,8 @@ class InterviewApp:
             "codex_model": CODEX_MODEL,
             "codex_reasoning_effort": CODEX_REASONING,
             "codex_fast_mode": CODEX_FAST_MODE,
+            "codex_transport": "app_server_stdio",
+            "codex_session_scope": "app_lifetime_ephemeral",
             "question_transcript_mode": "reuse_interviewer_utterance",
             "global_f8": hotkey_status,
             "test_label": TEST_LABEL,
@@ -945,7 +914,7 @@ class InterviewApp:
             self._preview_audio, self._final_audio, self._audio_error,
         )
         self.worker = WhisperWorker(self._whisper_ready)
-        self.codex_worker = CodexWorker()
+        self.codex_worker = CodexWorker(self._codex_ready)
         self.remote_audio.start()
         self.me_audio.start()
 
@@ -1234,20 +1203,16 @@ class InterviewApp:
             self._request_codex_answer(marker["question"], result["text"])
 
     def _request_codex_answer(self, question_number, question_text):
-        context = list(self.conversation_context)
+        context_end = len(self.conversation_context)
+        context = self.conversation_context[self.codex_context_cursor:context_end]
+        self.codex_context_cursor = context_end
         if context and context[-1] == ("INTERVIEWER", question_text):
             context = context[:-1]
         context_text = "\n".join(
             f"{role}: {text}"
             for role, text in context
         ) or "(none)"
-        prompt = f"""You assist a job candidate during a live interview.
-Use only the supplied transcript and do not use tools or browse the web.
-Write only a concise, immediately speakable answer draft in the same language as the question, using 3-5 short sentences.
-Do not add headings, follow-up questions, key-points sections, or commentary.
-Do not invent specific personal facts; use broadly adaptable wording when details are missing.
-
-RECENT CONVERSATION:
+        prompt = f"""NEW CONVERSATION SINCE THE PREVIOUS REQUEST:
 {context_text}
 
 CURRENT INTERVIEWER QUESTION:
@@ -1285,10 +1250,34 @@ CURRENT INTERVIEWER QUESTION:
                     "question": question_number,
                     "text": result["text"],
                     "elapsed_seconds": round(result["elapsed"], 3),
+                    "first_token_seconds": (
+                        round(result["first_token_seconds"], 3)
+                        if result["first_token_seconds"] is not None
+                        else None
+                    ),
+                    "thread_id": result["thread_id"],
+                    "turn_id": result["turn_id"],
                 })
             return False
 
         self.codex_worker.submit(prompt, finished)
+
+    def _codex_ready(self, result, error):
+        if not self.running:
+            return False
+        if error:
+            self.answer_window.set_status(f"Codex startup error: {error}")
+            append_log(self.log_path, {
+                "event": "codex_app_server_error",
+                "error": str(error),
+            })
+        else:
+            append_log(self.log_path, {
+                "event": "codex_app_server_ready",
+                "thread_id": result["thread_id"],
+                "startup_seconds": round(result["startup_seconds"], 3),
+            })
+        return False
 
     def _on_f8(self):
         now = time.perf_counter()
