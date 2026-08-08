@@ -1,32 +1,41 @@
-# Interview Assistant v0
+# Interview Assistant v1 App Server
 
-Linux GNOME에서 웹 화상면접의 상대방 음성과 내 마이크 음성을 실시간으로 전사하고, F8을 누른 시점의 질문을 Codex에 보내 말하기 쉬운 답변 초안을 표시하는 로컬 데스크톱 도구입니다.
+Linux GNOME에서 웹 화상면접의 상대방 음성을 실시간으로 전사하고, F8을 누른 시점의 질문을 Codex에 보내 말하기 쉬운 답변 초안을 표시하는 로컬 데스크톱 도구입니다.
 
-이 저장소의 `v0`는 현재 검증된 기준 버전입니다. Codex 호출 방식은 질문마다 독립적인 `codex exec` 프로세스를 실행합니다. 후속 `v1-app-server` 브랜치에서는 하나의 Codex App Server와 하나의 대화 스레드를 면접 내내 유지하는 방식을 실험합니다.
+`windows-port` 브랜치에는 Linux 진입점의 동작을 유지하면서 WSL에서
+PySide6·Whisper·Codex를 실행하고, 최소 Windows helper가 네이티브 WASAPI
+캡처와 전역 F8만 담당하는 하이브리드 구현이 포함됩니다. 전체 앱보다 먼저
+Windows bridge 오디오/F8 probe와 Whisper 측정을 실행하십시오. 설치 절차는
+[`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)에 있습니다.
+
+`v0` 태그와 `main` 브랜치는 질문마다 독립적인 `codex exec` 프로세스를 실행하는 검증 기준입니다. 현재 `v1-app-server` 브랜치는 앱 전용 영속 세션을 만들거나 선택하고, 하나의 Codex App Server thread를 면접 동안 유지하는 방식을 실험합니다.
+
+`v1-app-server` 브랜치의 현재 범위와 보류 항목은 [`docs/V1_APP_SERVER.md`](docs/V1_APP_SERVER.md)에 기록합니다.
 
 ## 현재 동작
 
 ```text
 브라우저 출력 음성 ──> PulseAudio monitor ──> Whisper small ──> INTERVIEWER 창
-내 마이크 음성 ─────> 기본 입력 장치 ───────> Whisper small ──> ME 창
                                                     │
                               질문 종료 시 F8 ──────┘
                                                     ↓
                                   최근 질문 + 대화 문맥
                                                     ↓
-                                  Codex CLI (Sol, low, Fast off)
+                              Codex App Server (Sol, low, Fast off)
                                                     ↓
-                                            답변 초안 창
+                       답변 초안(사용자가 말한 것으로 간주) ──> Answer 창
 ```
 
-- 상대방 음성과 내 음성을 별도 창에 표시합니다.
-- 세 창은 이동과 가로·세로 크기 조절이 가능하며 항상 위에 표시됩니다.
+- 상대방 음성과 Codex 답변을 별도 창에 표시합니다.
+- INTERVIEWER와 Answer 창은 이동과 가로·세로 크기 조절이 가능하며 항상 위에 표시됩니다.
+- 마이크를 캡처하거나 ME 음성을 전사하지 않습니다. 같은 세션의 직전 Codex 답변을 사용자가 실제로 말한 답변으로 간주합니다.
+- INTERVIEWER 미리보기와 최종 질문은 모두 `small` 모델을 사용합니다. 미리보기는 별도 프로세스에서 실행하고 F8 순간 종료하여 최종 질문 전사가 CPU를 단독 사용하게 합니다.
 - Answer 창은 마우스 휠로 전체 내용을 위아래로 이동할 수 있습니다.
-- 어느 창의 X 버튼을 눌러도 오디오 캡처와 작업 프로세스를 정리하고 종료합니다.
+- 면접 화면에는 이동 가능한 통합 제어창이 하나 표시됩니다. `←`는 준비 채팅으로 돌아가고, `×`는 오디오 캡처와 작업 프로세스를 정리하고 앱을 종료합니다.
 - F8 연속 오입력은 300ms 안에서는 한 번으로 처리합니다.
 - 질문 경계는 F8 시각 주변의 문장부호·무음·반응시간 보정을 사용합니다.
 
-## v0 기본 설정
+## 현재 v1 기본 설정
 
 | 항목 | 값 |
 |---|---|
@@ -35,7 +44,7 @@ Linux GNOME에서 웹 화상면접의 상대방 음성과 내 마이크 음성�
 | Codex 모델 | `gpt-5.6-sol` |
 | Reasoning effort | `low` |
 | Fast mode | 끔 |
-| Codex 세션 | F8마다 독립적인 ephemeral `codex exec` |
+| Codex 세션 | 시작 화면에서 선택한 앱 전용 영속 App Server thread |
 | 테스트 기록 | 기본값 끔 |
 
 ## 필요한 프로그램
@@ -77,17 +86,22 @@ python3 -m venv --system-site-packages .venv
 먼저 GNOME 설정의 **소리**에서 다음 장치를 선택합니다.
 
 - 출력: 면접에서 실제로 사용할 이어폰 또는 헤드셋
-- 입력: 내 목소리를 가장 선명하게 받는 마이크
 
-앱은 실행 시점의 기본 출력 장치 monitor와 기본 입력 장치를 사용합니다. 장치를 바꿨다면 앱을 다시 실행하는 것이 안전합니다.
+앱은 실행 시점의 기본 출력 장치 monitor만 사용하며 마이크는 캡처하지 않습니다. 출력 장치를 바꿨다면 앱을 다시 실행하는 것이 안전합니다.
 
 ```bash
 ./start_interview_app.sh
 ```
 
-터미널에는 PID와 런타임 로그 경로가 출력됩니다. Whisper가 준비되면 창의 상태가 바뀝니다. 브라우저에서 상대방 음성이 재생되는 것을 확인하고, 질문이 끝났다고 판단한 순간 F8을 한 번 누릅니다.
+터미널에는 PID와 런타임 로그 경로가 출력됩니다. 시작 화면에서 `새 세션`을 누르거나 기존 면접 세션을 ↑/↓로 선택한 뒤 Enter를 누릅니다. 준비 채팅에서 경력, 원하는 말투와 답변 방식을 Codex와 조율한 뒤 오른쪽 아래의 `면접 시작`을 누릅니다. Whisper가 준비되면 창의 상태가 바뀝니다. 브라우저에서 상대방 음성이 재생되는 것을 확인하고, 질문이 끝났다고 판단한 순간 F8을 한 번 누릅니다.
 
-종료는 별도 스크립트 없이 아무 창의 X 버튼을 누릅니다.
+`세션 삭제`는 복구 불가능한 삭제가 아니라 Codex 보관함으로 이동하는 동작입니다. 목록에는 이 면접 앱에서 만든 활성 세션만 표시됩니다.
+
+준비 채팅에서는 Enter로 전송하고 Shift+Enter로 줄을 바꿉니다. 동일한 Codex thread의 준비 대화와 이전 F8 질문·답변을 그대로 표시하며, Codex 응답 중에는 `면접 시작`이 비활성화됩니다. 면접 중 통합 제어창의 `←`를 누르면 음성 캡처를 종료하고 같은 준비 채팅으로 돌아갑니다. 제어창의 손잡이를 드래그하면 `←`와 `×`가 함께 이동하며 위치가 저장됩니다.
+
+면접관이 말하는 동안에는 별도 `small` 프로세스가 INTERVIEWER 창에 미리보기 문장을 표시합니다. F8을 누르면 이 프로세스를 즉시 종료하고, 준비된 최종 `small` 모델이 질문을 전사합니다. 질문 확정 후 미리보기 프로세스는 자동으로 다시 준비되므로 사용자가 추가로 조작할 것은 없습니다. 프로세스 통신은 semaphore를 사용하지 않는 Pipe로 처리하며, 종료 시에는 대기 중인 최종 전사와 로그 기록을 마친 뒤 작업자를 정리합니다.
+
+종료는 별도 스크립트 없이 면접 통합 제어창의 `×` 버튼을 누릅니다.
 
 ## 창 사용법
 
@@ -95,13 +109,13 @@ python3 -m venv --system-site-packages .venv
 
 브라우저·화상회의에서 나오는 상대방 음성을 표시합니다. F8 질문 추출의 기준이 되는 음성입니다.
 
-### ME
-
-기본 마이크로 들어오는 내 음성을 별도로 표시합니다. 대화 문맥에는 포함되지만 질문으로 Codex에 직접 전달되지는 않습니다.
-
 ### Answer
 
-Codex의 답변 초안을 표시합니다. 상단의 빈 사각형은 카메라 근처의 시선 위치를 의식하기 위한 가이드입니다. 마우스 포인터를 Answer 창 위에 두고 휠을 사용하면 답변 전체가 이동합니다.
+Codex의 답변 초안을 표시합니다. 면접 중에는 이 초안을 사용자가 실제로 말한 답변으로 간주해 같은 Codex 세션의 다음 답변에 이어서 사용합니다. 상단의 빈 사각형은 카메라 근처의 시선 위치를 의식하기 위한 가이드입니다. 마우스 포인터를 Answer 창 위에 두고 휠을 사용하면 답변 전체가 이동합니다.
+
+### 면접 준비 채팅
+
+선택한 세션의 전체 대화를 확인하고 Codex와 직접 대화합니다. 답변 길이와 형식은 앱이 고정하지 않으며, 이 준비 대화에서 정한 경력·말투·스타일을 같은 세션의 F8 답변이 이어서 사용합니다.
 
 ## 환경 변수
 
@@ -113,7 +127,7 @@ Codex의 답변 초안을 표시합니다. 상단의 빈 사각형은 카메라 
 | `INTERVIEW_LANGUAGE` | `en` | 전사 언어 |
 | `INTERVIEW_CODEX_MODEL` | `gpt-5.6-sol` | Codex 모델 |
 | `INTERVIEW_CODEX_REASONING` | `low` | 추론 강도 |
-| `INTERVIEW_VAD_RMS` | `250` | 마이크 음성 감지 민감도 |
+| `INTERVIEW_VAD_RMS` | `250` | 상대방 출력 음성 감지 민감도 |
 | `INTERVIEW_TEST_LOG` | `0` | `1`이면 테스트 음성·JSONL 저장 |
 | `INTERVIEW_TEST_LABEL` | 없음 | 테스트 세션 라벨 |
 
@@ -135,14 +149,6 @@ pactl list short sources
 ```
 
 기본 sink에 대응하는 `.monitor` source가 있는지 확인합니다. 브라우저 출력 장치와 시스템 기본 출력 장치가 다르면 캡처되지 않을 수 있습니다.
-
-### 내 음성이 표시되지 않음
-
-```bash
-pactl get-default-source
-```
-
-GNOME 소리 설정에서 원하는 Internal Microphone 또는 Headset Microphone을 기본 입력으로 선택한 뒤 앱을 재실행합니다.
 
 ### F8이 작동하지 않음
 
@@ -169,9 +175,17 @@ $XDG_RUNTIME_DIR/interview-assistant.log
 ```text
 interview_app.py        GTK UI, 오디오 스트림, Whisper/Codex 작업 관리
 audio_utils.py          F8 질문 경계 계산과 JSONL 기록
+codex_app_server.py     상주 App Server와 단일 thread의 stdio 클라이언트
+session_store.py        이 앱이 만든 Codex thread id와 최근 사용 순서 저장
 start_interview_app.sh  백그라운드 실행 진입점
 requirements.txt        직접 사용하는 Python 패키지
+audio_stream.py         플랫폼 중립 PCM VAD·발화·F8 marker 처리
+transcription.py        플랫폼 중립 Whisper 로드·전사 도우미
+windows_port/           WSL PySide6 앱과 Windows WASAPI/F8 stdio bridge
+windows_bridge_helper.py Windows Python helper 진입점
+start_wsl_windows_app.sh WSL 하이브리드 앱 진입점
 benchmarks/             v0 모델·Fast mode 응답시간 기록
+docs/                   v1 범위와 후속 개선 기록
 README.md               설치와 운용 문서
 ```
 
@@ -184,14 +198,15 @@ README.md               설치와 운용 문서
 - 브라우저별 음성이 아니라 시스템 기본 출력 전체를 캡처합니다.
 - Whisper 전사는 로컬이지만 질문과 최근 대화 문맥은 Codex 응답 생성을 위해 OpenAI 서비스로 전달됩니다.
 - F8 시점은 사람의 반응시간과 Whisper 단어 타임스탬프를 보정한 추정 경계입니다.
-- v0는 F8마다 새 `codex exec` 프로세스를 실행하므로 대화 세션 자체는 유지하지 않습니다.
+- App Server는 아직 실험적이므로 Codex CLI 버전 변경 후 프로토콜 검증이 필요합니다.
+- GTK 초기화 후 `multiprocessing` 미리보기 프로세스를 재시작할 때 실행당 semaphore 하나가 앱 종료 시점까지 추적되는 경고가 있습니다. 일반적인 한 번의 면접에는 영향이 없고 완전 종료 시 정리되지만, 한 프로세스에서 면접 시작·복귀를 장시간 반복하지 말고 향후 일반 subprocess 통신으로 교체할지 검토합니다.
 
 ## 버전 계획
 
 - `v0` 태그: 현재 검증된 `codex exec` 기준 버전
-- `v1-app-server` 브랜치: App Server 상주 프로세스, 단일 thread, 답변 스트리밍과 장애 복구 실험
+- `v1-app-server` 브랜치: App Server 상주 프로세스와 단일 thread를 먼저 검증한 뒤 스트리밍과 장애 복구 실험
 - 최종 Linux 버전 선정: 동일한 테스트 질문과 로그 지표로 v0/v1 비교
-- Windows 포팅: Linux 최종 버전을 확정한 뒤 Windows 오디오 캡처·전역 단축키·UI에 맞게 별도 개발
+- `windows-port` 브랜치: WSL의 Whisper·Codex·세션과 최소 Windows WASAPI/F8 helper를 결합한 PySide6 하이브리드 구현 검증
 
 v0와 v1 비교 시에는 질문 경계 정확도, F8부터 첫 글자까지의 시간, 전체 답변 완료시간, 대화 일관성, 장애 복구 여부를 동일한 조건에서 기록합니다.
 

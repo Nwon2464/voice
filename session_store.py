@@ -1,0 +1,90 @@
+"""Local registry for Codex threads created by Interview Assistant."""
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+
+class SessionStore:
+    """Persist the app-owned thread ids shown by the session chooser."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def active(self):
+        sessions = [
+            session
+            for session in self._load()
+            if not session.get("archived_at")
+        ]
+        return sorted(
+            sessions,
+            key=lambda session: session.get("last_used_at", ""),
+            reverse=True,
+        )
+
+    def add(self, thread_id, name, timestamp=None):
+        now = timestamp or self._now()
+        sessions = self._load()
+        sessions = [
+            session for session in sessions if session.get("thread_id") != thread_id
+        ]
+        sessions.append({
+            "thread_id": thread_id,
+            "name": name,
+            "created_at": now,
+            "last_used_at": now,
+            "archived_at": None,
+        })
+        self._save(sessions)
+
+    def mark_used(self, thread_id, timestamp=None):
+        return self._update(
+            thread_id,
+            "last_used_at",
+            timestamp or self._now(),
+        )
+
+    def mark_archived(self, thread_id, timestamp=None):
+        return self._update(
+            thread_id,
+            "archived_at",
+            timestamp or self._now(),
+        )
+
+    def _update(self, thread_id, field, value):
+        sessions = self._load()
+        found = False
+        for session in sessions:
+            if session.get("thread_id") == thread_id:
+                session[field] = value
+                found = True
+                break
+        if found:
+            self._save(sessions)
+        return found
+
+    def _load(self):
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        sessions = payload.get("sessions", []) if isinstance(payload, dict) else []
+        return [session for session in sessions if isinstance(session, dict)]
+
+    def _save(self, sessions):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(
+                {"version": 1, "sessions": sessions},
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(self.path)
+
+    @staticmethod
+    def _now():
+        return datetime.now().astimezone().isoformat(timespec="seconds")

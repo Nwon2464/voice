@@ -34,6 +34,7 @@ if __name__ == "__main__" and "--stop" in sys.argv:
 import itertools
 import json
 import math
+import multiprocessing as mp
 import queue
 import re
 import shlex
@@ -48,7 +49,6 @@ from datetime import datetime
 
 import numpy as np
 from faster_whisper import WhisperModel
-from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from audio_utils import (
     BYTES_PER_SECOND,
@@ -58,6 +58,8 @@ from audio_utils import (
     append_log,
     transcribe_question,
 )
+from codex_app_server import CodexAppServerClient, CodexAppServerError
+from session_store import SessionStore
 
 
 # Ubuntu의 python3-gi는 시스템 경로에 설치되어 있고 venv에는 노출되지 않는다.
@@ -73,14 +75,19 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 
-APP_VERSION = "v0"
+APP_VERSION = "v1-app-server-dev"
 WHISPER_MODEL = os.environ.get("INTERVIEW_WHISPER_MODEL", "small")
 LANGUAGE = os.environ.get("INTERVIEW_LANGUAGE", "en")
 CODEX_MODEL = os.environ.get("INTERVIEW_CODEX_MODEL", "gpt-5.6-sol")
 CODEX_REASONING = os.environ.get("INTERVIEW_CODEX_REASONING", "low")
 CODEX_FAST_MODE = False
 CODEX_TIMEOUT_SECONDS = 60
-CONTEXT_ITEMS = 12
+CODEX_DEVELOPER_INSTRUCTIONS = """You assist a job candidate with interview preparation and live answers.
+Follow the candidate's preferences, background, speaking style, and answer format established in the conversation.
+When a turn contains CURRENT INTERVIEWER QUESTION, return an immediately speakable answer draft in the same language as that question.
+Do not invent specific personal facts; ask during preparation or use adaptable wording when details are missing.
+During the live interview, assume the candidate spoke your previous live-answer draft unless the later interviewer transcript indicates otherwise.
+Each live-interview turn contains only conversation transcribed since the previous request plus the current interviewer question."""
 ANSWER_SCROLL_DEBOUNCE_MS = 450
 ANSWER_SMOOTH_SCROLL_THRESHOLD = 1.5
 ANSWER_CONTENT_SCROLL_PIXELS = 60
@@ -93,14 +100,8 @@ PRE_ROLL_MS = 300
 MAX_UTTERANCE_SECONDS = 60
 HISTORY_SECONDS = 180
 ENTER_DEBOUNCE_MS = 300
+WHISPER_WARMUP_SECONDS = 1
 VAD_RMS = int(os.environ.get("INTERVIEW_VAD_RMS", "250"))
-MIC_VAD_CHECK_MS = 500
-MIC_VAD_OPTIONS = VadOptions(
-    threshold=0.5,
-    min_speech_duration_ms=250,
-    min_silence_duration_ms=SILENCE_END_MS,
-    speech_pad_ms=300,
-)
 TEST_LOGGING = os.environ.get("INTERVIEW_TEST_LOG", "0") != "0"
 TEST_LABEL = os.environ.get("INTERVIEW_TEST_LABEL")
 TEXT_WIDTH_CHARS = shutil.get_terminal_size(fallback=(100, 24)).columns
@@ -109,20 +110,22 @@ CONFIG_DIR = Path(
     os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
 ) / "interview-assistant"
 WINDOW_STATE_PATH = CONFIG_DIR / "window_state.json"
+SESSION_STORE_PATH = CONFIG_DIR / "sessions.json"
+SESSION_INITIALIZATION_TEXT = (
+    "Interview Assistant persistent session initialized. "
+    "This is background metadata, not an interview question."
+)
 HOTKEY_PATH = (
     "/org/gnome/settings-daemon/plugins/media-keys/"
     "custom-keybindings/interview-assistant/"
 )
 
 
-def get_audio_sources():
+def get_interviewer_audio_source():
     sink = subprocess.check_output(
         ["pactl", "get-default-sink"], text=True
     ).strip()
-    microphone = subprocess.check_output(
-        ["pactl", "get-default-source"], text=True
-    ).strip()
-    return f"{sink}.monitor", microphone
+    return f"{sink}.monitor"
 
 
 def start_audio_capture(source):
@@ -206,9 +209,6 @@ class AudioStream:
         self.speech_run_ms = 0
         self.silence_ms = 0
         self.last_preview_bytes = 0
-        self.mic_pending = bytearray()
-        self.mic_pending_start = 0
-        self.mic_last_check_bytes = 0
 
     def start(self):
         self.process = start_audio_capture(self.source)
@@ -284,101 +284,7 @@ class AudioStream:
         self.silence_ms = 0
         self.last_preview_bytes = len(self.utterance)
 
-    def _process_mic_pending(self, final=False):
-        if not self.mic_pending:
-            return
-
-        samples = np.frombuffer(self.mic_pending, dtype=np.int16).astype(np.float32)
-        samples /= 32768.0
-        spans = get_speech_timestamps(
-            samples,
-            MIC_VAD_OPTIONS,
-            sampling_rate=SAMPLE_RATE,
-        )
-        complete_spans = [
-            span
-            for span in spans
-            if final or span["end"] < len(samples)
-        ]
-        active_span = (
-            spans[-1]
-            if spans and spans[-1]["end"] >= len(samples) and not final
-            else None
-        )
-
-        pending = bytes(self.mic_pending)
-        pending_start = self.mic_pending_start
-        for span in complete_spans:
-            start_byte = int(span["start"]) * SAMPLE_WIDTH
-            end_byte = int(span["end"]) * SAMPLE_WIDTH
-            pcm_audio = pending[start_byte:end_byte]
-            absolute_start = pending_start + start_byte
-            absolute_end = pending_start + end_byte
-            self.last_completed_span = (absolute_start, absolute_end)
-            self.on_utterance(
-                self.role,
-                pcm_audio,
-                absolute_start,
-                absolute_end,
-                {
-                    "vad_method": "silero",
-                    "vad_probability_threshold": MIC_VAD_OPTIONS.threshold,
-                },
-            )
-
-        if active_span is not None:
-            start_byte = int(active_span["start"]) * SAMPLE_WIDTH
-            preview_size = BYTES_PER_SECOND * PREVIEW_WINDOW_SECONDS
-            preview = pending[max(start_byte, len(pending) - preview_size):]
-            if (
-                self.total_bytes - self.last_preview_bytes
-                >= BYTES_PER_SECOND * PREVIEW_INTERVAL_MS / 1000
-            ):
-                self.last_preview_bytes = self.total_bytes
-                self.on_preview(self.role, preview)
-
-        if complete_spans:
-            remove_bytes = int(complete_spans[-1]["end"]) * SAMPLE_WIDTH
-            del self.mic_pending[:remove_bytes]
-            self.mic_pending_start += remove_bytes
-            self.mic_last_check_bytes = len(self.mic_pending)
-        elif not spans and len(self.mic_pending) > BYTES_PER_SECOND * 5:
-            keep_bytes = BYTES_PER_SECOND * 3
-            remove_bytes = len(self.mic_pending) - keep_bytes
-            remove_bytes -= remove_bytes % SAMPLE_WIDTH
-            del self.mic_pending[:remove_bytes]
-            self.mic_pending_start += remove_bytes
-            self.mic_last_check_bytes = len(self.mic_pending)
-
-    def _read_mic_loop(self):
-        while not self.stopped.is_set():
-            data = self.process.stdout.read(320)
-            if not data:
-                break
-            with self.condition:
-                if not self.mic_pending:
-                    self.mic_pending_start = self.total_bytes
-                self._append_history(data)
-                self.mic_pending.extend(data)
-                should_check = (
-                    len(self.mic_pending) - self.mic_last_check_bytes
-                    >= BYTES_PER_SECOND * MIC_VAD_CHECK_MS / 1000
-                )
-                self.condition.notify_all()
-            if should_check:
-                self.mic_last_check_bytes = len(self.mic_pending)
-                self._process_mic_pending()
-
-        self._process_mic_pending(final=True)
-
     def _read_loop(self):
-        if self.role == "ME":
-            try:
-                self._read_mic_loop()
-            except Exception as error:
-                self.on_error(self.role, error)
-            return
-
         try:
             while not self.stopped.is_set():
                 data = self.process.stdout.read(320)
@@ -468,16 +374,37 @@ class WhisperWorker:
 
     def stop(self):
         self.accepting = False
-        self.jobs.put((-1, next(self.sequence), None, None))
+        self.jobs.put((math.inf, next(self.sequence), None, None))
         self.thread.join()
 
     def _run(self):
+        startup_started = time.perf_counter()
         try:
+            load_started = time.perf_counter()
             model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            load_seconds = time.perf_counter() - load_started
+            warmup_started = time.perf_counter()
+            warmup_audio = np.zeros(
+                SAMPLE_RATE * WHISPER_WARMUP_SECONDS,
+                dtype=np.float32,
+            )
+            segments, _ = model.transcribe(
+                warmup_audio,
+                language=LANGUAGE,
+                vad_filter=False,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+            )
+            list(segments)
+            warmup_seconds = time.perf_counter() - warmup_started
         except Exception as error:
-            GLib.idle_add(self.on_ready, error)
+            GLib.idle_add(self.on_ready, None, error)
             return
-        GLib.idle_add(self.on_ready, None)
+        GLib.idle_add(self.on_ready, {
+            "load_seconds": load_seconds,
+            "warmup_seconds": warmup_seconds,
+            "startup_seconds": time.perf_counter() - startup_started,
+        }, None)
 
         while True:
             _, _, processor, callback = self.jobs.get()
@@ -492,112 +419,951 @@ class WhisperWorker:
             GLib.idle_add(callback, result, error)
 
 
-class CodexWorker:
-    """Run isolated Codex requests without blocking audio capture or the UI."""
+def _preview_whisper_process(input_connection, output_connection):
+    """Run cancelable preview transcription outside the final-answer worker."""
+    startup_started = time.perf_counter()
+    try:
+        load_started = time.perf_counter()
+        model = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",
+        )
+        load_seconds = time.perf_counter() - load_started
+        warmup_started = time.perf_counter()
+        segments, _ = model.transcribe(
+            np.zeros(SAMPLE_RATE * WHISPER_WARMUP_SECONDS, dtype=np.float32),
+            language=LANGUAGE,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        list(segments)
+        output_connection.send((
+            "ready",
+            {
+                "load_seconds": load_seconds,
+                "warmup_seconds": time.perf_counter() - warmup_started,
+                "startup_seconds": time.perf_counter() - startup_started,
+            },
+            None,
+        ))
+    except Exception as error:
+        output_connection.send(("ready", None, str(error)))
+        return
 
-    def __init__(self):
+    try:
+        while True:
+            try:
+                job = input_connection.recv()
+            except EOFError:
+                return
+            if job is None:
+                return
+            job_id, pcm_audio = job
+            started = time.perf_counter()
+            try:
+                text = transcribe_pcm(model, pcm_audio)
+                error = None
+            except Exception as caught:
+                text = None
+                error = str(caught)
+            output_connection.send((
+                "result",
+                job_id,
+                text,
+                error,
+                time.perf_counter() - started,
+            ))
+    finally:
+        input_connection.close()
+        output_connection.close()
+
+
+class PreviewWhisperWorker:
+    """Cancelable small-model process used only for live preview text."""
+
+    def __init__(self, on_ready):
+        self.on_ready = on_ready
+        self.context = mp.get_context("spawn")
+        self.lock = threading.Lock()
+        self.generation = 0
+        self.job_sequence = itertools.count()
+        self.process = None
+        self.input_connection = None
+        self.output_connection = None
+        self.callbacks = {}
+        self.ready = False
+        self.stopped = False
+
+    def start(self):
+        with self.lock:
+            if self.stopped:
+                return False
+            if self.process is not None and self.process.is_alive():
+                return False
+            self.generation += 1
+            generation = self.generation
+            child_input, parent_input = self.context.Pipe(duplex=False)
+            parent_output, child_output = self.context.Pipe(duplex=False)
+            process = self.context.Process(
+                target=_preview_whisper_process,
+                args=(child_input, child_output),
+                daemon=True,
+            )
+            self.process = process
+            self.input_connection = parent_input
+            self.output_connection = parent_output
+            self.ready = False
+            try:
+                process.start()
+            except Exception:
+                self.process = None
+                self.input_connection = None
+                self.output_connection = None
+                for connection in (
+                    child_input,
+                    parent_input,
+                    parent_output,
+                    child_output,
+                ):
+                    connection.close()
+                raise
+            child_input.close()
+            child_output.close()
+        threading.Thread(
+            target=self._listen,
+            args=(generation, process, parent_output),
+            daemon=True,
+        ).start()
+        return True
+
+    def submit(self, pcm_audio, callback):
+        with self.lock:
+            if (
+                self.stopped
+                or not self.ready
+                or self.process is None
+                or not self.process.is_alive()
+            ):
+                return False
+            job_id = next(self.job_sequence)
+            self.callbacks[job_id] = callback
+            input_connection = self.input_connection
+        try:
+            input_connection.send((job_id, pcm_audio))
+            return True
+        except (BrokenPipeError, EOFError, OSError):
+            with self.lock:
+                self.callbacks.pop(job_id, None)
+            return False
+
+    def cancel(self):
+        started = time.perf_counter()
+        with self.lock:
+            self.generation += 1
+            process = self.process
+            input_connection = self.input_connection
+            output_connection = self.output_connection
+            self.process = None
+            self.input_connection = None
+            self.output_connection = None
+            self.ready = False
+            self.callbacks.clear()
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=0.5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=0.5)
+        for connection in (input_connection, output_connection):
+            if connection is not None:
+                connection.close()
+        return time.perf_counter() - started
+
+    def stop(self):
+        self.stopped = True
+        return self.cancel()
+
+    def _listen(self, generation, process, output_connection):
+        was_ready = False
+        while True:
+            with self.lock:
+                if generation != self.generation or self.stopped:
+                    return
+            try:
+                if output_connection.poll(0.1):
+                    message = output_connection.recv()
+                else:
+                    message = None
+            except (EOFError, OSError):
+                return
+            if message is None:
+                if process.is_alive():
+                    continue
+                if not was_ready:
+                    GLib.idle_add(
+                        self._deliver_ready,
+                        generation,
+                        None,
+                        "Preview Whisper process stopped during startup",
+                    )
+                return
+
+            if message[0] == "ready":
+                _, result, error = message
+                was_ready = error is None
+                with self.lock:
+                    if generation != self.generation:
+                        return
+                    self.ready = was_ready
+                GLib.idle_add(
+                    self._deliver_ready,
+                    generation,
+                    result,
+                    error,
+                )
+                if error is not None:
+                    return
+                continue
+
+            _, job_id, text, error, elapsed = message
+            with self.lock:
+                if generation != self.generation:
+                    return
+                callback = self.callbacks.pop(job_id, None)
+            if callback is not None:
+                GLib.idle_add(
+                    self._deliver_result,
+                    generation,
+                    callback,
+                    text,
+                    error,
+                    elapsed,
+                )
+
+    def _deliver_ready(self, generation, result, error):
+        with self.lock:
+            if generation != self.generation or self.stopped:
+                return False
+        return self.on_ready(result, error)
+
+    def _deliver_result(
+        self,
+        generation,
+        callback,
+        text,
+        error,
+        elapsed,
+    ):
+        with self.lock:
+            if generation != self.generation or self.stopped:
+                return False
+        return callback(text, error, elapsed)
+
+
+class CodexWorker:
+    """Run queued turns on one persistent App Server thread."""
+
+    def __init__(self, on_ready, thread_id=None):
         self.jobs = queue.Queue()
         self.accepting = True
-        self.process = None
-        self.process_lock = threading.Lock()
+        self.on_ready = on_ready
+        self.thread_id = thread_id
+        self.client = None
+        self.client_lock = threading.Lock()
+        self.turn_active = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def submit(self, prompt, callback):
+    def submit(
+        self,
+        prompt,
+        callback,
+        on_delta=None,
+        interactive=False,
+        on_approval=None,
+    ):
         if self.accepting:
-            self.jobs.put((prompt, callback))
+            self.jobs.put(
+                (prompt, callback, on_delta, interactive, on_approval)
+            )
 
     def stop(self):
         self.accepting = False
-        with self.process_lock:
-            process = self.process
-        if process is not None and process.poll() is None:
-            process.terminate()
+        with self.client_lock:
+            client = self.client
         while True:
             try:
                 self.jobs.get_nowait()
             except queue.Empty:
                 break
         self.jobs.put(None)
+        if client is not None and self.turn_active.is_set():
+            client.request_interrupt()
         self.thread.join(timeout=3)
-
-    def _run_codex(self, prompt):
-        codex_path = shutil.which("codex")
-        if codex_path is None:
-            raise RuntimeError("Codex CLI was not found in PATH")
-        command = [
-            codex_path,
-            "exec",
-            "--json",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--sandbox", "read-only",
-            "--disable", "fast_mode",
-            "--model", CODEX_MODEL,
-            "--config", f'model_reasoning_effort="{CODEX_REASONING}"',
-            "--cd", str(APP_DIR),
-            "-",
-        ]
-        started = time.perf_counter()
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=APP_DIR,
-        )
-        with self.process_lock:
-            self.process = process
-        try:
-            stdout, stderr = process.communicate(
-                prompt,
-                timeout=CODEX_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            raise RuntimeError(
-                f"Codex did not respond within {CODEX_TIMEOUT_SECONDS} seconds"
-            )
-        finally:
-            with self.process_lock:
-                self.process = None
-        if process.returncode != 0:
-            message = stderr.strip() or f"Codex exited with status {process.returncode}"
-            raise RuntimeError(message)
-
-        answer = ""
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item", {})
-            if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-                answer = item.get("text", "").strip()
-        if not answer:
-            raise RuntimeError("Codex returned no answer")
-        return {
-            "text": answer,
-            "elapsed": time.perf_counter() - started,
-        }
+        if client is not None:
+            client.stop()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
 
     def _run(self):
+        try:
+            client = CodexAppServerClient(
+                model=CODEX_MODEL,
+                effort=CODEX_REASONING,
+                cwd=APP_DIR,
+                developer_instructions=CODEX_DEVELOPER_INSTRUCTIONS,
+                timeout_seconds=CODEX_TIMEOUT_SECONDS,
+            )
+            with self.client_lock:
+                self.client = client
+            ready = client.start(
+                thread_id=self.thread_id,
+                ephemeral=self.thread_id is None,
+            )
+            startup_error = None
+        except Exception as caught:
+            ready = None
+            startup_error = caught
+        GLib.idle_add(self.on_ready, ready, startup_error)
+
         while True:
             job = self.jobs.get()
             if job is None:
                 return
-            prompt, callback = job
-            try:
-                result = self._run_codex(prompt)
-                error = None
-            except Exception as caught:
+            prompt, callback, on_delta, interactive, on_approval = job
+            if startup_error is not None:
                 result = None
-                error = caught
+                error = startup_error
+            else:
+                try:
+                    stream_callback = None
+                    if on_delta is not None:
+                        stream_callback = lambda delta, elapsed: GLib.idle_add(
+                            on_delta, delta, elapsed
+                        )
+                    approval_callback = None
+                    if on_approval is not None:
+                        approval_callback = lambda method, params: (
+                            self._request_approval(on_approval, method, params)
+                        )
+                    self.turn_active.set()
+                    try:
+                        result = client.run_turn(
+                            prompt,
+                            on_delta=stream_callback,
+                            interactive=interactive,
+                            on_approval=approval_callback,
+                        )
+                        error = None
+                    finally:
+                        self.turn_active.clear()
+                except Exception as caught:
+                    result = None
+                    error = caught
             GLib.idle_add(callback, result, error)
+
+    @staticmethod
+    def _request_approval(callback, method, params):
+        completed = threading.Event()
+        decision = {"value": "decline"}
+
+        def ask():
+            try:
+                decision["value"] = callback(method, params)
+            finally:
+                completed.set()
+            return False
+
+        GLib.idle_add(ask)
+        completed.wait()
+        return decision["value"]
+
+
+SESSION_RESPONSE_NEW = 1
+SESSION_RESPONSE_ARCHIVE = 2
+
+
+class SessionChooserDialog(Gtk.Dialog):
+    """Keyboard-friendly chooser for Interview Assistant-owned sessions."""
+
+    def __init__(self, sessions, preferred_thread_id=None):
+        super().__init__(title="Interview Assistant Sessions")
+        self.set_default_size(720, 420)
+        self.set_border_width(12)
+        self.set_modal(True)
+
+        self.new_button = self.add_button("새 세션", SESSION_RESPONSE_NEW)
+        self.archive_button = self.add_button(
+            "세션 삭제",
+            SESSION_RESPONSE_ARCHIVE,
+        )
+        self.add_button("취소", Gtk.ResponseType.CANCEL)
+        self.open_button = self.add_button("선택", Gtk.ResponseType.OK)
+        self.open_button.get_style_context().add_class("suggested-action")
+
+        content = self.get_content_area()
+        content.set_spacing(10)
+        heading = Gtk.Label()
+        heading.set_markup("<b>면접 세션 선택</b>")
+        heading.set_xalign(0)
+        content.pack_start(heading, False, False, 0)
+
+        help_text = Gtk.Label(
+            label="↑/↓로 이동하고 Enter를 누르면 선택한 세션으로 들어갑니다."
+        )
+        help_text.set_xalign(0)
+        content.pack_start(help_text, False, False, 0)
+
+        self.model = Gtk.ListStore(str, str)
+        preferred_path = None
+        for index, session in enumerate(sessions):
+            self.model.append((session.get("name", ""), session["thread_id"]))
+            if session["thread_id"] == preferred_thread_id:
+                preferred_path = Gtk.TreePath.new_from_indices([index])
+
+        self.tree = Gtk.TreeView(model=self.model)
+        self.tree.set_headers_visible(True)
+        self.tree.set_activate_on_single_click(False)
+        self.tree.append_column(
+            Gtk.TreeViewColumn(
+                "만든 시각",
+                Gtk.CellRendererText(),
+                text=0,
+            )
+        )
+        id_renderer = Gtk.CellRendererText()
+        id_renderer.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        self.tree.append_column(
+            Gtk.TreeViewColumn("세션 ID", id_renderer, text=1)
+        )
+        self.tree.connect("row-activated", self._row_activated)
+        self.tree.connect("key-press-event", self._key_pressed)
+        selection = self.tree.get_selection()
+        selection.set_mode(Gtk.SelectionMode.SINGLE)
+        selection.connect("changed", self._selection_changed)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.tree)
+        content.pack_start(scroller, True, True, 0)
+
+        self.empty_label = Gtk.Label(
+            label="저장된 면접 세션이 없습니다. ‘새 세션’을 눌러 만드세요."
+        )
+        self.empty_label.set_xalign(0)
+        content.pack_start(self.empty_label, False, False, 0)
+        self.empty_label.set_visible(len(self.model) == 0)
+
+        if len(self.model):
+            selection.select_path(preferred_path or Gtk.TreePath.new_first())
+        else:
+            self._selection_changed(selection)
+
+        self.show_all()
+        self.empty_label.set_visible(len(self.model) == 0)
+        self.tree.grab_focus()
+
+    def selected_session(self):
+        model, tree_iter = self.tree.get_selection().get_selected()
+        if tree_iter is None:
+            return None
+        return {
+            "name": model[tree_iter][0],
+            "thread_id": model[tree_iter][1],
+        }
+
+    def _row_activated(self, *_args):
+        self.response(Gtk.ResponseType.OK)
+
+    def _key_pressed(self, _widget, event):
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if self.selected_session() is not None:
+                self.response(Gtk.ResponseType.OK)
+                return True
+        return False
+
+    def _selection_changed(self, selection):
+        has_selection = selection.get_selected()[1] is not None
+        self.open_button.set_sensitive(has_selection)
+        self.archive_button.set_sensitive(has_selection)
+
+
+def _new_codex_client():
+    return CodexAppServerClient(
+        model=CODEX_MODEL,
+        effort=CODEX_REASONING,
+        cwd=APP_DIR,
+        developer_instructions=CODEX_DEVELOPER_INSTRUCTIONS,
+        timeout_seconds=CODEX_TIMEOUT_SECONDS,
+    )
+
+
+def create_persisted_codex_session():
+    client = _new_codex_client()
+    try:
+        result = client.start(ephemeral=False)
+        client.inject_items([{
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": SESSION_INITIALIZATION_TEXT,
+            }],
+        }])
+        return result
+    finally:
+        client.stop()
+
+
+def archive_persisted_codex_session(thread_id):
+    client = _new_codex_client()
+    try:
+        client.connect()
+        client.archive_thread(thread_id)
+    finally:
+        client.stop()
+
+
+def _show_session_error(error):
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.CLOSE,
+        text="세션 작업을 완료하지 못했습니다.",
+    )
+    dialog.format_secondary_text(str(error))
+    dialog.run()
+    dialog.destroy()
+
+
+def _confirm_archive(session):
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.QUESTION,
+        buttons=Gtk.ButtonsType.NONE,
+        text="선택한 세션을 보관함으로 옮길까요?",
+    )
+    dialog.format_secondary_text(
+        f"{session['name']}\n{session['thread_id']}\n\n나중에 복구할 수 있습니다."
+    )
+    dialog.add_button("취소", Gtk.ResponseType.CANCEL)
+    dialog.add_button("보관함으로 이동", Gtk.ResponseType.OK)
+    response = dialog.run()
+    dialog.destroy()
+    return response == Gtk.ResponseType.OK
+
+
+def choose_interview_session(store):
+    preferred_thread_id = None
+    while True:
+        dialog = SessionChooserDialog(
+            store.active(),
+            preferred_thread_id=preferred_thread_id,
+        )
+        response = dialog.run()
+        selected = dialog.selected_session()
+        dialog.destroy()
+
+        if response == SESSION_RESPONSE_NEW:
+            try:
+                result = create_persisted_codex_session()
+                created = datetime.now().astimezone()
+                thread_id = result["thread_id"]
+                store.add(
+                    thread_id,
+                    created.strftime("%Y-%m-%d %H:%M"),
+                    created.isoformat(timespec="seconds"),
+                )
+                preferred_thread_id = thread_id
+            except Exception as error:
+                _show_session_error(error)
+            continue
+
+        if response == SESSION_RESPONSE_ARCHIVE and selected is not None:
+            if _confirm_archive(selected):
+                try:
+                    archive_persisted_codex_session(selected["thread_id"])
+                    store.mark_archived(selected["thread_id"])
+                    preferred_thread_id = None
+                except Exception as error:
+                    if isinstance(error, CodexAppServerError) and (
+                        "no rollout found" in str(error).lower()
+                    ):
+                        store.mark_archived(selected["thread_id"])
+                        preferred_thread_id = None
+                    else:
+                        _show_session_error(error)
+            continue
+
+        if response == Gtk.ResponseType.OK and selected is not None:
+            store.mark_used(selected["thread_id"])
+            return selected["thread_id"]
+
+        return None
+
+
+CHAT_RESPONSE_BACK = 10
+CHAT_RESPONSE_START_INTERVIEW = 11
+CHAT_HISTORY_PAGE_TURNS = 50
+
+
+class PreparationChatDialog(Gtk.Dialog):
+    """Chat with the selected Codex thread before starting audio capture."""
+
+    def __init__(self, thread_id):
+        super().__init__(title="Interview Preparation")
+        self.thread_id = thread_id
+        self.worker = None
+        self.ready = False
+        self.busy = False
+        self.active = False
+        self.stream_started = False
+        self.history_turns = []
+        self.history_start = 0
+        self.set_default_size(820, 640)
+        self.set_border_width(12)
+        self.set_modal(False)
+
+        self.back_button = self.add_button("뒤로가기", CHAT_RESPONSE_BACK)
+        self.start_button = self.add_button(
+            "면접 시작",
+            CHAT_RESPONSE_START_INTERVIEW,
+        )
+        self.start_button.get_style_context().add_class("suggested-action")
+        self.start_button.set_sensitive(False)
+
+        content = self.get_content_area()
+        content.set_spacing(10)
+        heading = Gtk.Label()
+        heading.set_markup("<b>면접 준비 채팅</b>")
+        heading.set_xalign(0)
+        content.pack_start(heading, False, False, 0)
+
+        session_label = Gtk.Label(label=f"세션 ID: {thread_id}")
+        session_label.set_xalign(0)
+        session_label.set_selectable(True)
+        content.pack_start(session_label, False, False, 0)
+
+        self.history = Gtk.TextView()
+        self.history.set_editable(False)
+        self.history.set_cursor_visible(False)
+        self.history.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.history.set_left_margin(14)
+        self.history.set_right_margin(14)
+        self.history.set_top_margin(12)
+        self.history.set_bottom_margin(12)
+        self.history_buffer = self.history.get_buffer()
+        self.user_tag = self.history_buffer.create_tag(
+            "chat-user",
+            foreground="#8ec8ff",
+            weight=Pango.Weight.BOLD,
+        )
+        self.codex_tag = self.history_buffer.create_tag(
+            "chat-codex",
+            foreground="#ffc75c",
+            weight=Pango.Weight.BOLD,
+        )
+        self.body_tag = self.history_buffer.create_tag(
+            "chat-body",
+            foreground="#f2f4f7",
+        )
+        self.error_tag = self.history_buffer.create_tag(
+            "chat-error",
+            foreground="#ff8f8f",
+        )
+
+        self.history_scroller = Gtk.ScrolledWindow()
+        self.history_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        self.history_scroller.set_shadow_type(Gtk.ShadowType.IN)
+        self.history_scroller.add(self.history)
+        self.history_scroller.get_vadjustment().connect(
+            "value-changed",
+            self._history_scrolled,
+        )
+        content.pack_start(self.history_scroller, True, True, 0)
+
+        self.status = Gtk.Label(label="Codex 세션에 연결 중…")
+        self.status.set_xalign(0)
+        content.pack_start(self.status, False, False, 0)
+
+        input_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        input_scroller = Gtk.ScrolledWindow()
+        input_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        input_scroller.set_size_request(-1, 92)
+        self.input = Gtk.TextView()
+        self.input.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.input.set_left_margin(10)
+        self.input.set_right_margin(10)
+        self.input.set_top_margin(8)
+        self.input.set_bottom_margin(8)
+        self.input.connect("key-press-event", self._input_key_pressed)
+        input_scroller.add(self.input)
+        input_row.pack_start(input_scroller, True, True, 0)
+
+        self.send_button = Gtk.Button(label="전송")
+        self.send_button.set_sensitive(False)
+        self.send_button.connect("clicked", self._send)
+        input_row.pack_end(self.send_button, False, False, 0)
+        content.pack_start(input_row, False, False, 0)
+
+        self.connect("delete-event", self._delete)
+        self.show_all()
+
+    def run_session(self):
+        self.active = True
+        self.ready = False
+        self._set_busy(False)
+        self.status.set_text("Codex 세션에 연결 중…")
+        self.worker = CodexWorker(self._codex_ready, thread_id=self.thread_id)
+        response = self.run()
+        self.hide()
+        self.active = False
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker = None
+        return response
+
+    def _codex_ready(self, result, error):
+        if not self.active or self.worker is None:
+            return False
+        if error:
+            self.status.set_text(f"Codex 연결 오류: {error}")
+            self._append_status(f"Codex 연결 오류: {error}")
+            return False
+        self.ready = True
+        self.history_turns = CodexAppServerClient.conversation_turns(
+            result.get("thread", {})
+        )
+        self.history_start = max(
+            0,
+            len(self.history_turns) - CHAT_HISTORY_PAGE_TURNS,
+        )
+        self._render_history()
+        self.status.set_text("준비 내용을 입력하세요. Enter 전송 · Shift+Enter 줄바꿈")
+        self._set_busy(False)
+        self.input.grab_focus()
+        return False
+
+    def _render_history(self):
+        self.history_buffer.set_text("")
+        for turn in self.history_turns[self.history_start:]:
+            for message in turn:
+                self._append_message(message["role"], message["text"])
+        GLib.idle_add(self._scroll_to_bottom)
+
+    def _append_message(self, role, text):
+        if not text:
+            return
+        end = self.history_buffer.get_end_iter()
+        if self.history_buffer.get_char_count():
+            self.history_buffer.insert(end, "\n")
+            end = self.history_buffer.get_end_iter()
+        if role == "user":
+            self.history_buffer.insert_with_tags(end, "YOU\n", self.user_tag)
+        else:
+            self.history_buffer.insert_with_tags(end, "CODEX\n", self.codex_tag)
+        end = self.history_buffer.get_end_iter()
+        self.history_buffer.insert_with_tags(end, text, self.body_tag)
+
+    def _append_status(self, text):
+        end = self.history_buffer.get_end_iter()
+        if self.history_buffer.get_char_count():
+            self.history_buffer.insert(end, "\n\n")
+            end = self.history_buffer.get_end_iter()
+        self.history_buffer.insert_with_tags(end, text, self.error_tag)
+        GLib.idle_add(self._scroll_to_bottom)
+
+    def _start_codex_stream(self, delta):
+        self.stream_started = True
+        end = self.history_buffer.get_end_iter()
+        self.history_buffer.insert(end, "\n\n")
+        end = self.history_buffer.get_end_iter()
+        self.history_buffer.insert_with_tags(end, "CODEX\n", self.codex_tag)
+        end = self.history_buffer.get_end_iter()
+        self.history_buffer.insert_with_tags(end, delta, self.body_tag)
+        GLib.idle_add(self._scroll_to_bottom)
+
+    def _append_codex_stream(self, delta):
+        end = self.history_buffer.get_end_iter()
+        self.history_buffer.insert_with_tags(end, delta, self.body_tag)
+        GLib.idle_add(self._scroll_to_bottom)
+
+    def _send(self, *_args):
+        if not self.ready or self.busy or self.worker is None:
+            return
+        buffer = self.input.get_buffer()
+        text = buffer.get_text(
+            buffer.get_start_iter(),
+            buffer.get_end_iter(),
+            True,
+        ).strip()
+        if not text:
+            return
+        buffer.set_text("")
+        self._append_message("user", text)
+        self.stream_started = False
+        self._set_busy(True)
+        self.status.set_text("Codex가 답변을 작성 중입니다…")
+        GLib.idle_add(self._scroll_to_bottom)
+
+        def streamed(delta, _elapsed):
+            if not self.active:
+                return False
+            if self.stream_started:
+                self._append_codex_stream(delta)
+            else:
+                self._start_codex_stream(delta)
+            return False
+
+        def finished(result, error):
+            if not self.active:
+                return False
+            turn_messages = [{"role": "user", "text": text}]
+            if error:
+                self._append_status(f"Codex 오류: {error}")
+            else:
+                turn_messages.append({
+                    "role": "assistant",
+                    "text": result["text"],
+                })
+                if not self.stream_started:
+                    self._append_message("assistant", result["text"])
+            self.history_turns.append(turn_messages)
+            self.status.set_text(
+                "준비 내용을 입력하세요. Enter 전송 · Shift+Enter 줄바꿈"
+            )
+            self._set_busy(False)
+            self.input.grab_focus()
+            return False
+
+        self.worker.submit(
+            text,
+            finished,
+            streamed,
+            interactive=True,
+            on_approval=self._approve_tool,
+        )
+
+    def _approve_tool(self, method, params):
+        is_command = method == "item/commandExecution/requestApproval"
+        title = "명령 실행을 허용할까요?" if is_command else "파일 변경을 허용할까요?"
+        detail = params.get("reason") or "Codex가 작업 승인을 요청했습니다."
+        if is_command and params.get("command"):
+            command = params["command"]
+            if isinstance(command, list):
+                command = " ".join(str(part) for part in command)
+            detail = f"{detail}\n\n{command}"
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=title,
+        )
+        dialog.format_secondary_text(detail)
+        dialog.add_button("거부", Gtk.ResponseType.CANCEL)
+        dialog.add_button("허용", Gtk.ResponseType.OK)
+        response = dialog.run()
+        dialog.destroy()
+        return "accept" if response == Gtk.ResponseType.OK else "decline"
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        enabled = self.ready and not busy
+        self.send_button.set_sensitive(enabled)
+        self.start_button.set_sensitive(enabled)
+        self.input.set_sensitive(enabled)
+
+    def _input_key_pressed(self, _widget, event):
+        if event.keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            return False
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            return False
+        self._send()
+        return True
+
+    def _history_scrolled(self, adjustment):
+        if adjustment.get_value() > 1 or self.history_start == 0:
+            return
+        self.history_start = max(0, self.history_start - CHAT_HISTORY_PAGE_TURNS)
+        self._render_history()
+
+    def _scroll_to_bottom(self):
+        adjustment = self.history_scroller.get_vadjustment()
+        adjustment.set_value(
+            max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size())
+        )
+        return False
+
+    def _delete(self, *_args):
+        self.response(Gtk.ResponseType.DELETE_EVENT)
+        return True
+
+
+class InterviewControlWindow(Gtk.Window):
+    """One draggable control surface for interview navigation and exit."""
+
+    def __init__(self, position, on_back, on_close):
+        super().__init__(title="INTERVIEW CONTROLS")
+        self.on_close = on_close
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_skip_taskbar_hint(False)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.stick()
+        self.set_size_request(132, 44)
+        self.move(*position)
+        self.connect("delete-event", self._delete)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.set_border_width(4)
+
+        drag_handle = Gtk.EventBox()
+        drag_handle.set_visible_window(False)
+        drag_handle.set_tooltip_text("드래그해서 제어창 이동")
+        drag_handle.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        drag_handle.connect("button-press-event", self._drag)
+        drag_label = Gtk.Label(label="⠿")
+        drag_label.get_style_context().add_class("control-drag")
+        drag_handle.add(drag_label)
+        row.pack_start(drag_handle, True, True, 0)
+
+        back_button = Gtk.Button(label="←")
+        back_button.set_tooltip_text("준비 채팅으로 돌아가기")
+        back_button.get_style_context().add_class("control-button")
+        back_button.connect("clicked", lambda _button: on_back())
+        row.pack_start(back_button, False, False, 0)
+
+        close_button = Gtk.Button(label="×")
+        close_button.set_tooltip_text("앱 종료")
+        close_button.get_style_context().add_class("close-button")
+        close_button.connect("clicked", lambda _button: on_close())
+        row.pack_start(close_button, False, False, 0)
+
+        self.add(row)
+        self.get_style_context().add_class("control")
+
+    def _drag(self, _widget, event):
+        if event.button == 1:
+            self.begin_move_drag(
+                event.button,
+                int(event.x_root),
+                int(event.y_root),
+                event.time,
+            )
+            return True
+        return False
+
+    def _delete(self, *_args):
+        self.on_close()
+        return True
 
 
 class TranscriptWindow(Gtk.Window):
@@ -610,11 +1376,15 @@ class TranscriptWindow(Gtk.Window):
         position,
         on_close,
         focus_mode=False,
+        on_back=None,
+        show_close=True,
     ):
         super().__init__(title=title)
         self.role = role
         self.on_close = on_close
         self.focus_mode = focus_mode
+        self.on_back = on_back
+        self.show_close = show_close
         self.last_focus_scroll_at = None
         self.smooth_scroll_delta = 0.0
         self.set_default_size(width, height)
@@ -639,15 +1409,18 @@ class TranscriptWindow(Gtk.Window):
         heading = Gtk.Label(label=title)
         heading.set_xalign(0)
         heading.get_style_context().add_class("heading")
-        close_button = Gtk.Button(label="×")
-        close_button.set_relief(Gtk.ReliefStyle.NONE)
-        close_button.set_can_focus(False)
-        close_button.set_tooltip_text("Close")
-        close_button.get_style_context().add_class("close-button")
-        close_button.connect("clicked", lambda _button: self.on_close())
+        close_button = None
+        if self.show_close:
+            close_button = Gtk.Button(label="×")
+            close_button.set_relief(Gtk.ReliefStyle.NONE)
+            close_button.set_can_focus(False)
+            close_button.set_tooltip_text("Close")
+            close_button.get_style_context().add_class("close-button")
+            close_button.connect("clicked", lambda _button: self.on_close())
         if not self.focus_mode:
             header.pack_start(heading, True, True, 0)
-            header.pack_end(close_button, False, False, 0)
+            if close_button is not None:
+                header.pack_end(close_button, False, False, 0)
 
         if self.focus_mode:
             self.text = Gtk.TextView()
@@ -692,11 +1465,24 @@ class TranscriptWindow(Gtk.Window):
             answer_overlay.add_overlay(self.position_guide)
             answer_overlay.set_overlay_pass_through(self.position_guide, True)
 
-            close_button.set_halign(Gtk.Align.END)
-            close_button.set_valign(Gtk.Align.START)
-            close_button.set_margin_top(2)
-            close_button.set_margin_end(2)
-            answer_overlay.add_overlay(close_button)
+            if close_button is not None:
+                close_button.set_halign(Gtk.Align.END)
+                close_button.set_valign(Gtk.Align.START)
+                close_button.set_margin_top(2)
+                close_button.set_margin_end(2)
+                answer_overlay.add_overlay(close_button)
+            if self.on_back is not None:
+                back_button = Gtk.Button(label="←")
+                back_button.set_tooltip_text("준비 채팅으로 돌아가기")
+                back_button.set_halign(Gtk.Align.START)
+                back_button.set_valign(Gtk.Align.START)
+                back_button.set_margin_top(2)
+                back_button.set_margin_start(2)
+                back_button.connect(
+                    "clicked",
+                    lambda _button: self.on_back(),
+                )
+                answer_overlay.add_overlay(back_button)
             box.pack_start(answer_overlay, True, True, 0)
 
             for widget in (self, answer_overlay, scroller, self.text):
@@ -755,6 +1541,35 @@ class TranscriptWindow(Gtk.Window):
             GLib.idle_add(self._reset_focus_scroll)
         else:
             self.text.set_text(text)
+
+    def start_stream(self, text):
+        if not self.focus_mode:
+            self.text.set_text(text)
+            return
+        self.text.get_buffer().set_text(text)
+        GLib.idle_add(self._reset_focus_scroll)
+
+    def append_stream(self, text):
+        if not text:
+            return
+        if not self.focus_mode:
+            self.text.set_text(f"{self.text.get_text()}{text}")
+            return
+        buffer = self.text.get_buffer()
+        buffer.insert(buffer.get_end_iter(), text)
+
+    def finish_stream(self, text):
+        if not self.focus_mode:
+            self.set_text(text)
+            return
+        buffer = self.text.get_buffer()
+        current = buffer.get_text(
+            buffer.get_start_iter(),
+            buffer.get_end_iter(),
+            True,
+        )
+        if current != text:
+            buffer.set_text(text)
 
     def _reset_focus_scroll(self):
         self.focus_scroller.get_vadjustment().set_value(0)
@@ -847,16 +1662,19 @@ class TranscriptWindow(Gtk.Window):
 
 
 class InterviewApp:
-    def __init__(self):
+    def __init__(self, codex_thread_id):
         self.session_dir, self.log_path = create_app_session()
+        self.codex_thread_id = codex_thread_id
+        self.exit_action = None
         self.running = True
-        self.preview_pending = {"INTERVIEWER": False, "ME": False}
-        self.utterance_counts = {"INTERVIEWER": 0, "ME": 0}
+        self.preview_pending = False
+        self.interviewer_utterance_count = 0
         self.question_count = 0
         self.codex_request_count = 0
         self.remote_utterances = []
         self.pending_questions = []
-        self.conversation_context = deque(maxlen=CONTEXT_ITEMS)
+        self.conversation_context = []
+        self.codex_context_cursor = 0
         self.transcript_lock = threading.Lock()
         self.last_f8_at = None
         self.socket_thread = None
@@ -866,7 +1684,6 @@ class InterviewApp:
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         geometry = monitor.get_geometry()
         screen_width = geometry.width
-        screen_height = geometry.height
 
         remote_default = (
             geometry.x + (screen_width - 720) // 2,
@@ -874,21 +1691,21 @@ class InterviewApp:
             720,
             170,
         )
-        me_default = (
-            geometry.x + screen_width - 550,
-            geometry.y + screen_height - 210,
-            520,
-            160,
-        )
         answer_default = (
             geometry.x + (screen_width - 720) // 2,
             geometry.y + 230,
             720,
             300,
         )
+        control_default = (
+            answer_default[0],
+            max(geometry.y + 8, answer_default[1] - 54),
+            132,
+            44,
+        )
         remote_state = self.window_state.get("INTERVIEWER", remote_default)
-        me_state = self.window_state.get("ME", me_default)
         answer_state = self.window_state.get("ANSWER", answer_default)
+        control_state = self.window_state.get("CONTROL", control_default)
         self.remote_window = TranscriptWindow(
             "INTERVIEWER",
             "INTERVIEWER",
@@ -896,9 +1713,7 @@ class InterviewApp:
             remote_state[3],
             remote_state[:2],
             self.shutdown,
-        )
-        self.me_window = TranscriptWindow(
-            "ME", "ME", me_state[2], me_state[3], me_state[:2], self.shutdown
+            show_close=False,
         )
         self.answer_window = TranscriptWindow(
             "ANSWER",
@@ -908,31 +1723,42 @@ class InterviewApp:
             answer_state[:2],
             self.shutdown,
             focus_mode=True,
+            show_close=False,
+        )
+        self.control_window = InterviewControlWindow(
+            control_state[:2],
+            self.back_to_chat,
+            self.shutdown,
         )
         self.answer_window.set_status("Waiting for F8…")
-        for window in (self.remote_window, self.me_window, self.answer_window):
+        for window in (self.remote_window, self.answer_window):
             window.connect("key-press-event", self._key_pressed)
 
         self._install_css()
         self.remote_window.show_all()
-        self.me_window.show_all()
         self.answer_window.show_all()
+        self.control_window.show_all()
         self._start_trigger_listener()
         hotkey_status = self._install_global_f8()
 
-        remote_source, mic_source = get_audio_sources()
+        remote_source = get_interviewer_audio_source()
         append_log(self.log_path, {
             "event": "app_session_start",
             "app_version": APP_VERSION,
             "remote_source": remote_source,
-            "microphone_source": mic_source,
+            "microphone_capture": False,
             "whisper_model": WHISPER_MODEL,
             "language": LANGUAGE,
             "codex_enabled": True,
             "codex_model": CODEX_MODEL,
             "codex_reasoning_effort": CODEX_REASONING,
             "codex_fast_mode": CODEX_FAST_MODE,
+            "codex_transport": "app_server_stdio",
+            "codex_session_scope": "persistent_selected_thread",
+            "codex_thread_id": self.codex_thread_id,
+            "candidate_response_source": "codex_answer_assumed_spoken",
             "question_transcript_mode": "reuse_interviewer_utterance",
+            "preview_transcription": "cancelable_small_process",
             "global_f8": hotkey_status,
             "test_label": TEST_LABEL,
         })
@@ -940,23 +1766,23 @@ class InterviewApp:
             "INTERVIEWER", remote_source,
             self._preview_audio, self._final_audio, self._audio_error,
         )
-        self.me_audio = AudioStream(
-            "ME", mic_source,
-            self._preview_audio, self._final_audio, self._audio_error,
+        self.preview_worker = PreviewWhisperWorker(
+            self._preview_whisper_ready,
         )
         self.worker = WhisperWorker(self._whisper_ready)
-        self.codex_worker = CodexWorker()
+        self.codex_worker = CodexWorker(
+            self._codex_ready,
+            thread_id=self.codex_thread_id,
+        )
         self.remote_audio.start()
-        self.me_audio.start()
 
     def _install_css(self):
         css = b"""
         window { background-color: rgba(18, 20, 24, 0.94); border-radius: 14px; }
         window.interviewer { border: 2px solid rgba(95, 176, 255, 0.85); }
-        window.me { border: 2px solid rgba(116, 220, 158, 0.75); }
         window.answer { border: 2px solid rgba(255, 195, 92, 0.82); }
+        window.control { border: 2px solid rgba(255, 195, 92, 0.82); }
         .heading { color: #8ec8ff; font: bold 12px Sans; letter-spacing: 1px; }
-        window.me .heading { color: #80dfa6; }
         window.answer .heading { color: #ffc75c; }
         .position-guide { border: 2px solid rgba(255, 195, 92, 0.75); background: transparent; }
         .focus-transcript { color: #fff5d9; background: transparent; font: bold 22px Sans; }
@@ -964,6 +1790,8 @@ class InterviewApp:
         .transcript { color: #ffffff; font: 20px Sans; }
         .close-button { color: #d8dde5; font: bold 18px Sans; padding: 0 4px; }
         .close-button:hover { color: #ffffff; background: rgba(255, 90, 90, 0.55); }
+        .control-button { color: #fff5d9; font: bold 18px Sans; padding: 2px 8px; }
+        .control-drag { color: #aeb5bf; font: 18px Sans; padding: 0 4px; }
         .resize-handle { background: rgba(139, 146, 157, 0.16); }
         .resize-handle:hover { background: rgba(142, 200, 255, 0.55); }
         .resize-corner { color: #aeb5bf; font: 12px Sans; }
@@ -987,8 +1815,8 @@ class InterviewApp:
         state = {}
         for role, window in (
             ("INTERVIEWER", self.remote_window),
-            ("ME", self.me_window),
             ("ANSWER", self.answer_window),
+            ("CONTROL", self.control_window),
         ):
             x, y = window.get_position()
             width, height = window.get_size()
@@ -1070,27 +1898,47 @@ class InterviewApp:
             return True
         return False
 
-    def _whisper_ready(self, error):
+    def _whisper_ready(self, result, error):
         if error:
             message = f"Whisper error: {error}"
             self.remote_window.set_status(message)
-            self.me_window.set_status(message)
             append_log(self.log_path, {"event": "whisper_error", "error": str(error)})
         else:
+            self.remote_window.set_status("Preparing live preview…")
+            append_log(self.log_path, {
+                "event": "whisper_ready",
+                "load_seconds": round(result["load_seconds"], 3),
+                "warmup_seconds": round(result["warmup_seconds"], 3),
+                "startup_seconds": round(result["startup_seconds"], 3),
+            })
+            self.preview_worker.start()
+        return False
+
+    def _preview_whisper_ready(self, result, error):
+        if not self.running:
+            return False
+        if error:
+            self.remote_window.set_status("Listening… (preview unavailable)")
+            append_log(self.log_path, {
+                "event": "preview_whisper_error",
+                "error": str(error),
+            })
+        else:
             self.remote_window.set_status("Listening…")
-            self.me_window.set_status("Listening…")
+            append_log(self.log_path, {
+                "event": "preview_whisper_ready",
+                "load_seconds": round(result["load_seconds"], 3),
+                "warmup_seconds": round(result["warmup_seconds"], 3),
+                "startup_seconds": round(result["startup_seconds"], 3),
+            })
         return False
 
     def _preview_audio(self, role, pcm_audio):
-        if self.preview_pending[role]:
+        if self.preview_pending:
             return
-        self.preview_pending[role] = True
 
-        def processor(model):
-            return transcribe_pcm(model, pcm_audio)
-
-        def finished(text, error):
-            self.preview_pending[role] = False
+        def finished(text, error, elapsed):
+            self.preview_pending = False
             if error:
                 append_log(self.log_path, {
                     "event": "preview_error", "role": role, "error": str(error),
@@ -1099,11 +1947,14 @@ class InterviewApp:
                 self._window(role).set_text(text)
             return False
 
-        self.worker.submit(2, processor, finished)
+        self.preview_pending = self.preview_worker.submit(
+            pcm_audio,
+            finished,
+        )
 
     def _final_audio(self, role, pcm_audio, start, end, vad_details):
-        self.utterance_counts[role] += 1
-        utterance = self.utterance_counts[role]
+        self.interviewer_utterance_count += 1
+        utterance = self.interviewer_utterance_count
         audio_file = None
         if self.session_dir:
             audio_file = f"{role.lower()}_{utterance:03d}.wav"
@@ -1130,36 +1981,52 @@ class InterviewApp:
 
         def processor(model):
             started = time.perf_counter()
-            marker = None
-            if state is not None:
-                with self.transcript_lock:
-                    if state["questions"]:
-                        marker = state["questions"][0]
-            if marker is None:
-                text = transcribe_pcm(model, pcm_audio)
-                details = {}
-            else:
-                relative_trigger = max(0, marker["trigger"] - start)
-                text, _boundary, details = transcribe_question(
-                    model,
-                    pcm_audio,
-                    relative_trigger,
-                    silence_padding_ms=TRANSCRIPTION_PADDING_MS,
-                )
-            return {
-                "text": text,
-                "elapsed": time.perf_counter() - started,
-                "details": details,
-            }
-
-        def finished(result, error):
-            if error:
+            try:
+                marker = None
+                if state is not None:
+                    with self.transcript_lock:
+                        if state["questions"]:
+                            marker = state["questions"][0]
+                if marker is None:
+                    text = transcribe_pcm(model, pcm_audio)
+                    details = {}
+                else:
+                    relative_trigger = max(0, marker["trigger"] - start)
+                    text, _boundary, details = transcribe_question(
+                        model,
+                        pcm_audio,
+                        relative_trigger,
+                        silence_padding_ms=TRANSCRIPTION_PADDING_MS,
+                    )
+            except Exception as error:
                 append_log(self.log_path, {
                     "event": "utterance_error",
                     "role": role,
                     "utterance": utterance,
                     "error": str(error),
                 })
+                raise
+            result = {
+                "text": text,
+                "elapsed": time.perf_counter() - started,
+                "details": details,
+            }
+            append_log(self.log_path, {
+                "event": "utterance",
+                "role": role,
+                "utterance": utterance,
+                "audio_file": audio_file,
+                "start_absolute_seconds": round(start / BYTES_PER_SECOND, 3),
+                "end_absolute_seconds": round(end / BYTES_PER_SECOND, 3),
+                "text": result["text"],
+                "stt_seconds": round(result["elapsed"], 3),
+                **vad_details,
+                **result["details"],
+            })
+            return result
+
+        def finished(result, error):
+            if error:
                 if state is not None:
                     with self.transcript_lock:
                         state["error"] = error
@@ -1170,18 +2037,6 @@ class InterviewApp:
                 if state is not None:
                     with self.transcript_lock:
                         state["result"] = result
-                append_log(self.log_path, {
-                    "event": "utterance",
-                    "role": role,
-                    "utterance": utterance,
-                    "audio_file": audio_file,
-                    "start_absolute_seconds": round(start / BYTES_PER_SECOND, 3),
-                    "end_absolute_seconds": round(end / BYTES_PER_SECOND, 3),
-                    "text": result["text"],
-                    "stt_seconds": round(result["elapsed"], 3),
-                    **vad_details,
-                    **result["details"],
-                })
                 if result["text"]:
                     self._window(role).set_text(result["text"])
                     self.conversation_context.append((role, result["text"]))
@@ -1217,6 +2072,7 @@ class InterviewApp:
                 "source_utterance": state["utterance"],
                 "error": str(error),
             })
+            self._restart_preview_worker()
             return
         append_log(self.log_path, {
             "event": "question",
@@ -1232,22 +2088,25 @@ class InterviewApp:
         if result["text"]:
             self.remote_window.set_text(result["text"])
             self._request_codex_answer(marker["question"], result["text"])
+        self._restart_preview_worker()
+
+    def _restart_preview_worker(self):
+        if self.running and self.preview_worker.start():
+            append_log(self.log_path, {
+                "event": "preview_whisper_restart",
+            })
 
     def _request_codex_answer(self, question_number, question_text):
-        context = list(self.conversation_context)
+        context_end = len(self.conversation_context)
+        context = self.conversation_context[self.codex_context_cursor:context_end]
+        self.codex_context_cursor = context_end
         if context and context[-1] == ("INTERVIEWER", question_text):
             context = context[:-1]
         context_text = "\n".join(
             f"{role}: {text}"
             for role, text in context
         ) or "(none)"
-        prompt = f"""You assist a job candidate during a live interview.
-Use only the supplied transcript and do not use tools or browse the web.
-Write only a concise, immediately speakable answer draft in the same language as the question, using 3-5 short sentences.
-Do not add headings, follow-up questions, key-points sections, or commentary.
-Do not invent specific personal facts; use broadly adaptable wording when details are missing.
-
-RECENT CONVERSATION:
+        prompt = f"""NEW CONVERSATION SINCE THE PREVIOUS REQUEST:
 {context_text}
 
 CURRENT INTERVIEWER QUESTION:
@@ -1255,6 +2114,7 @@ CURRENT INTERVIEWER QUESTION:
 """
         self.codex_request_count += 1
         request_number = self.codex_request_count
+        stream_started = False
         self.answer_window.set_status("Thinking…")
         append_log(self.log_path, {
             "event": "codex_request",
@@ -1265,6 +2125,23 @@ CURRENT INTERVIEWER QUESTION:
             "fast_mode": CODEX_FAST_MODE,
             "context_items": len(context),
         })
+
+        def streamed(delta, elapsed):
+            nonlocal stream_started
+            if not self.running:
+                return False
+            if stream_started:
+                self.answer_window.append_stream(delta)
+            else:
+                stream_started = True
+                self.answer_window.start_stream(delta)
+                append_log(self.log_path, {
+                    "event": "codex_stream_start",
+                    "request": request_number,
+                    "question": question_number,
+                    "elapsed_seconds": round(elapsed, 3),
+                })
+            return False
 
         def finished(result, error):
             if not self.running:
@@ -1278,17 +2155,50 @@ CURRENT INTERVIEWER QUESTION:
                     "error": str(error),
                 })
             else:
-                self.answer_window.set_text(result["text"])
+                if stream_started:
+                    self.answer_window.finish_stream(result["text"])
+                else:
+                    self.answer_window.set_text(result["text"])
                 append_log(self.log_path, {
                     "event": "codex_response",
                     "request": request_number,
                     "question": question_number,
                     "text": result["text"],
                     "elapsed_seconds": round(result["elapsed"], 3),
+                    "first_token_seconds": (
+                        round(result["first_token_seconds"], 3)
+                        if result["first_token_seconds"] is not None
+                        else None
+                    ),
+                    "first_visible_seconds": (
+                        round(result["first_visible_seconds"], 3)
+                        if result["first_visible_seconds"] is not None
+                        else None
+                    ),
+                    "stream_delta_count": result["stream_delta_count"],
+                    "thread_id": result["thread_id"],
+                    "turn_id": result["turn_id"],
                 })
             return False
 
-        self.codex_worker.submit(prompt, finished)
+        self.codex_worker.submit(prompt, finished, streamed)
+
+    def _codex_ready(self, result, error):
+        if not self.running:
+            return False
+        if error:
+            self.answer_window.set_status(f"Codex startup error: {error}")
+            append_log(self.log_path, {
+                "event": "codex_app_server_error",
+                "error": str(error),
+            })
+        else:
+            append_log(self.log_path, {
+                "event": "codex_app_server_ready",
+                "thread_id": result["thread_id"],
+                "startup_seconds": round(result["startup_seconds"], 3),
+            })
+        return False
 
     def _on_f8(self):
         now = time.perf_counter()
@@ -1303,6 +2213,8 @@ CURRENT INTERVIEWER QUESTION:
         self.question_count += 1
         question_number = self.question_count
         marker = self.remote_audio.capture_question_marker()
+        preview_cancel_seconds = self.preview_worker.cancel()
+        self.preview_pending = False
         marker["question"] = question_number
         marker["committed"] = False
         append_log(self.log_path, {
@@ -1312,6 +2224,7 @@ CURRENT INTERVIEWER QUESTION:
                 marker["trigger"] / BYTES_PER_SECOND, 3
             ),
             "utterance_state": marker["source"],
+            "preview_cancel_seconds": round(preview_cancel_seconds, 3),
         })
         matched_state = None
         matched_result = None
@@ -1339,15 +2252,22 @@ CURRENT INTERVIEWER QUESTION:
         GLib.idle_add(self._window(role).set_status, f"Audio error: {error}")
 
     def _window(self, role):
-        return self.remote_window if role == "INTERVIEWER" else self.me_window
+        return self.remote_window
+
+    def back_to_chat(self, *_args):
+        return self._stop("back")
 
     def shutdown(self, *_args):
+        return self._stop("quit")
+
+    def _stop(self, exit_action):
         if not self.running:
             return False
         self.running = False
+        self.exit_action = exit_action
         self._save_window_state()
         self.remote_audio.stop()
-        self.me_audio.stop()
+        self.preview_worker.stop()
         self.worker.stop()
         self.codex_worker.stop()
         if self.trigger_socket is not None:
@@ -1355,19 +2275,49 @@ CURRENT INTERVIEWER QUESTION:
         TRIGGER_SOCKET.unlink(missing_ok=True)
         append_log(self.log_path, {
             "event": "app_session_end",
+            "exit_action": exit_action,
             "questions": self.question_count,
-            "interviewer_utterances": self.utterance_counts["INTERVIEWER"],
-            "me_utterances": self.utterance_counts["ME"],
+            "interviewer_utterances": self.interviewer_utterance_count,
             "codex_requests": self.codex_request_count,
         })
+        for window in (
+            self.remote_window,
+            self.answer_window,
+            self.control_window,
+        ):
+            window.hide()
         Gtk.main_quit()
         return False
 
 
 def main():
-    app = InterviewApp()
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, app.shutdown)
-    Gtk.main()
+    store = SessionStore(SESSION_STORE_PATH)
+    while True:
+        thread_id = choose_interview_session(store)
+        if thread_id is None:
+            return
+        chat = PreparationChatDialog(thread_id)
+        while True:
+            response = chat.run_session()
+            if response == CHAT_RESPONSE_BACK:
+                chat.destroy()
+                break
+            if response != CHAT_RESPONSE_START_INTERVIEW:
+                chat.destroy()
+                return
+
+            app = InterviewApp(thread_id)
+            signal_source = GLib.unix_signal_add(
+                GLib.PRIORITY_DEFAULT,
+                signal.SIGINT,
+                app.shutdown,
+            )
+            Gtk.main()
+            GLib.source_remove(signal_source)
+            if app.exit_action == "back":
+                continue
+            chat.destroy()
+            return
 
 
 if __name__ == "__main__":

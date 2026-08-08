@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-08","event":"benchmark_start","model":"gpt-5.6-sol","reasoning_effort":"low","fast_mode":false,"transport":"app_server_stdio","thread_scope":"single_ephemeral_thread","purpose":"same-session integration smoke test"}
+{"event":"app_server_ready","thread_id":"019fdd70-d7cc-7433-a1fc-d147f36ce74d","startup_seconds":0.704}
+{"event":"turn_result","test":1,"thread_id":"019fdd70-d7cc-7433-a1fc-d147f36ce74d","turn_id":"019fdd70-d807-7771-ae2e-8dedbad2e8e4","first_token_seconds":5.390,"elapsed_seconds":5.648,"prompt":"Remember the codeword ORCHID for this conversation. Reply exactly: READY","answer":"READY"}
+{"event":"turn_result","test":2,"thread_id":"019fdd70-d7cc-7433-a1fc-d147f36ce74d","turn_id":"019fdd70-ee17-7990-acd2-f040a050bf99","first_token_seconds":4.622,"elapsed_seconds":4.910,"prompt":"What codeword did I give you in the previous turn? Reply with only that word.","answer":"ORCHID"}
+{"event":"benchmark_summary","same_thread":true,"memory_check_passed":true,"average_turn_seconds":5.279,"comparison_controlled":false,"comparison_note":"This validates persistent process and thread memory; it is not a v0/v1 latency A/B benchmark."}
