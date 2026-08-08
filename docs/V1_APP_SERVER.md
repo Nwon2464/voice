@@ -1,6 +1,6 @@
 # v1 App Server scope
 
-v1의 첫 비교 단계에서는 v0의 오디오 캡처, Whisper, F8 경계, UI와 요청 대기열을 변경하지 않는다. Codex 전송 계층만 다음과 같이 교체한다.
+v1의 첫 비교 단계에서는 v0의 오디오 캡처, Whisper, F8 경계, UI와 요청 대기열을 유지하고 Codex 전송 계층을 다음과 같이 교체했다.
 
 ```text
 v0: F8 -> 새 codex exec 프로세스
@@ -17,6 +17,9 @@ v1: F8 -> 상주 codex app-server의 동일 thread에서 새 turn
 - 마지막 요청 이후 새로 전사된 대화만 다음 turn에 전달
 - X 버튼 종료 시 App Server 프로세스 종료
 - App Server 준비시간, 첫 토큰과 전체 응답시간 기록
+- `final_answer` delta를 Answer 창에 도착 즉시 표시
+- 앱 시작 시 Whisper 1초 무음 추론을 실행해 모델 워밍업
+- Whisper 로드·워밍업·준비시간과 첫 화면 표시시간 기록
 
 ## 후속 개선으로 보류
 
@@ -24,7 +27,6 @@ v1: F8 -> 상주 codex app-server의 동일 thread에서 새 turn
 - 연속 질문을 하나의 복합 질문으로 자동 병합
 - 앱 장애 후 저장된 thread resume
 - 면접 전 이력서·말투·답변 스타일 입력 화면
-- 답변 delta를 Answer 창에 실시간 스트리밍
 
 현재는 새 F8이 들어와도 기존 답변을 중단하지 않는다. 질문 음성은 즉시 캡처하고 기존 대기열에 저장한 뒤, 앞선 Codex turn이 완료되면 같은 thread에 순서대로 전달한다.
 

@@ -106,7 +106,7 @@ class CodexAppServerClient:
             "startup_seconds": time.perf_counter() - started,
         }
 
-    def run_turn(self, prompt):
+    def run_turn(self, prompt, on_delta=None):
         self._ensure_running()
         started = time.perf_counter()
         response = self._request(
@@ -127,8 +127,11 @@ class CodexAppServerClient:
 
         deadline = started + self.timeout_seconds
         first_token_seconds = None
+        first_visible_seconds = None
+        stream_delta_count = 0
         delta_text = {}
         completed_messages = []
+        agent_message_phases = {}
 
         while True:
             remaining = deadline - time.perf_counter()
@@ -146,13 +149,24 @@ class CodexAppServerClient:
             if message_turn_id != turn_id:
                 continue
 
-            if method == "item/agentMessage/delta":
+            if method == "item/started":
+                item = params.get("item", {})
+                if item.get("type") == "agentMessage":
+                    agent_message_phases[item.get("id", "")] = item.get("phase")
+            elif method == "item/agentMessage/delta":
                 delta = params.get("delta", "")
                 if delta:
                     if first_token_seconds is None:
                         first_token_seconds = time.perf_counter() - started
                     item_id = params.get("itemId", "")
                     delta_text[item_id] = delta_text.get(item_id, "") + delta
+                    phase = params.get("phase") or agent_message_phases.get(item_id)
+                    if on_delta is not None and phase != "commentary":
+                        visible_seconds = time.perf_counter() - started
+                        if first_visible_seconds is None:
+                            first_visible_seconds = visible_seconds
+                        stream_delta_count += 1
+                        on_delta(delta, visible_seconds)
             elif method == "item/completed":
                 item = params.get("item", {})
                 if item.get("type") == "agentMessage" and item.get("text", "").strip():
@@ -173,6 +187,8 @@ class CodexAppServerClient:
             "text": answer,
             "elapsed": time.perf_counter() - started,
             "first_token_seconds": first_token_seconds,
+            "first_visible_seconds": first_visible_seconds,
+            "stream_delta_count": stream_delta_count,
             "thread_id": self.thread_id,
             "turn_id": turn_id,
         }

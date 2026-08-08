@@ -101,6 +101,7 @@ PRE_ROLL_MS = 300
 MAX_UTTERANCE_SECONDS = 60
 HISTORY_SECONDS = 180
 ENTER_DEBOUNCE_MS = 300
+WHISPER_WARMUP_SECONDS = 1
 VAD_RMS = int(os.environ.get("INTERVIEW_VAD_RMS", "250"))
 MIC_VAD_CHECK_MS = 500
 MIC_VAD_OPTIONS = VadOptions(
@@ -480,12 +481,33 @@ class WhisperWorker:
         self.thread.join()
 
     def _run(self):
+        startup_started = time.perf_counter()
         try:
+            load_started = time.perf_counter()
             model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            load_seconds = time.perf_counter() - load_started
+            warmup_started = time.perf_counter()
+            warmup_audio = np.zeros(
+                SAMPLE_RATE * WHISPER_WARMUP_SECONDS,
+                dtype=np.float32,
+            )
+            segments, _ = model.transcribe(
+                warmup_audio,
+                language=LANGUAGE,
+                vad_filter=False,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+            )
+            list(segments)
+            warmup_seconds = time.perf_counter() - warmup_started
         except Exception as error:
-            GLib.idle_add(self.on_ready, error)
+            GLib.idle_add(self.on_ready, None, error)
             return
-        GLib.idle_add(self.on_ready, None)
+        GLib.idle_add(self.on_ready, {
+            "load_seconds": load_seconds,
+            "warmup_seconds": warmup_seconds,
+            "startup_seconds": time.perf_counter() - startup_started,
+        }, None)
 
         while True:
             _, _, processor, callback = self.jobs.get()
@@ -512,9 +534,9 @@ class CodexWorker:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def submit(self, prompt, callback):
+    def submit(self, prompt, callback, on_delta=None):
         if self.accepting:
-            self.jobs.put((prompt, callback))
+            self.jobs.put((prompt, callback, on_delta))
 
     def stop(self):
         self.accepting = False
@@ -552,13 +574,18 @@ class CodexWorker:
             job = self.jobs.get()
             if job is None:
                 return
-            prompt, callback = job
+            prompt, callback, on_delta = job
             if startup_error is not None:
                 result = None
                 error = startup_error
             else:
                 try:
-                    result = client.run_turn(prompt)
+                    stream_callback = None
+                    if on_delta is not None:
+                        stream_callback = lambda delta, elapsed: GLib.idle_add(
+                            on_delta, delta, elapsed
+                        )
+                    result = client.run_turn(prompt, on_delta=stream_callback)
                     error = None
                 except Exception as caught:
                     result = None
@@ -721,6 +748,35 @@ class TranscriptWindow(Gtk.Window):
             GLib.idle_add(self._reset_focus_scroll)
         else:
             self.text.set_text(text)
+
+    def start_stream(self, text):
+        if not self.focus_mode:
+            self.text.set_text(text)
+            return
+        self.text.get_buffer().set_text(text)
+        GLib.idle_add(self._reset_focus_scroll)
+
+    def append_stream(self, text):
+        if not text:
+            return
+        if not self.focus_mode:
+            self.text.set_text(f"{self.text.get_text()}{text}")
+            return
+        buffer = self.text.get_buffer()
+        buffer.insert(buffer.get_end_iter(), text)
+
+    def finish_stream(self, text):
+        if not self.focus_mode:
+            self.set_text(text)
+            return
+        buffer = self.text.get_buffer()
+        current = buffer.get_text(
+            buffer.get_start_iter(),
+            buffer.get_end_iter(),
+            True,
+        )
+        if current != text:
+            buffer.set_text(text)
 
     def _reset_focus_scroll(self):
         self.focus_scroller.get_vadjustment().set_value(0)
@@ -1039,7 +1095,7 @@ class InterviewApp:
             return True
         return False
 
-    def _whisper_ready(self, error):
+    def _whisper_ready(self, result, error):
         if error:
             message = f"Whisper error: {error}"
             self.remote_window.set_status(message)
@@ -1048,6 +1104,12 @@ class InterviewApp:
         else:
             self.remote_window.set_status("Listening…")
             self.me_window.set_status("Listening…")
+            append_log(self.log_path, {
+                "event": "whisper_ready",
+                "load_seconds": round(result["load_seconds"], 3),
+                "warmup_seconds": round(result["warmup_seconds"], 3),
+                "startup_seconds": round(result["startup_seconds"], 3),
+            })
         return False
 
     def _preview_audio(self, role, pcm_audio):
@@ -1220,6 +1282,7 @@ CURRENT INTERVIEWER QUESTION:
 """
         self.codex_request_count += 1
         request_number = self.codex_request_count
+        stream_started = False
         self.answer_window.set_status("Thinking…")
         append_log(self.log_path, {
             "event": "codex_request",
@@ -1230,6 +1293,23 @@ CURRENT INTERVIEWER QUESTION:
             "fast_mode": CODEX_FAST_MODE,
             "context_items": len(context),
         })
+
+        def streamed(delta, elapsed):
+            nonlocal stream_started
+            if not self.running:
+                return False
+            if stream_started:
+                self.answer_window.append_stream(delta)
+            else:
+                stream_started = True
+                self.answer_window.start_stream(delta)
+                append_log(self.log_path, {
+                    "event": "codex_stream_start",
+                    "request": request_number,
+                    "question": question_number,
+                    "elapsed_seconds": round(elapsed, 3),
+                })
+            return False
 
         def finished(result, error):
             if not self.running:
@@ -1243,7 +1323,10 @@ CURRENT INTERVIEWER QUESTION:
                     "error": str(error),
                 })
             else:
-                self.answer_window.set_text(result["text"])
+                if stream_started:
+                    self.answer_window.finish_stream(result["text"])
+                else:
+                    self.answer_window.set_text(result["text"])
                 append_log(self.log_path, {
                     "event": "codex_response",
                     "request": request_number,
@@ -1255,12 +1338,18 @@ CURRENT INTERVIEWER QUESTION:
                         if result["first_token_seconds"] is not None
                         else None
                     ),
+                    "first_visible_seconds": (
+                        round(result["first_visible_seconds"], 3)
+                        if result["first_visible_seconds"] is not None
+                        else None
+                    ),
+                    "stream_delta_count": result["stream_delta_count"],
                     "thread_id": result["thread_id"],
                     "turn_id": result["turn_id"],
                 })
             return False
 
-        self.codex_worker.submit(prompt, finished)
+        self.codex_worker.submit(prompt, finished, streamed)
 
     def _codex_ready(self, result, error):
         if not self.running:
