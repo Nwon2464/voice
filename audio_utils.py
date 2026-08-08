@@ -70,6 +70,7 @@ def transcribe_question(
     pcm_audio,
     trigger_bytes,
     silence_padding_ms=SILENCE_PADDING_MS,
+    language="en",
 ):
     samples = np.frombuffer(pcm_audio, dtype=np.int16).astype(np.float32) / 32768.0
     silence_samples = int(SAMPLE_RATE * silence_padding_ms / 1000)
@@ -78,7 +79,7 @@ def transcribe_question(
 
     segments, info = model.transcribe(
         samples,
-        language="en",
+        language=language,
         vad_filter=True,
         word_timestamps=True,
         condition_on_previous_text=False,

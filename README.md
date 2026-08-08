@@ -2,6 +2,12 @@
 
 Linux GNOME에서 웹 화상면접의 상대방 음성을 실시간으로 전사하고, F8을 누른 시점의 질문을 Codex에 보내 말하기 쉬운 답변 초안을 표시하는 로컬 데스크톱 도구입니다.
 
+`windows-port` 브랜치에는 Linux 진입점의 동작을 유지하면서 WSL에서
+PySide6·Whisper·Codex를 실행하고, 최소 Windows helper가 네이티브 WASAPI
+캡처와 전역 F8만 담당하는 하이브리드 구현이 포함됩니다. 전체 앱보다 먼저
+Windows bridge 오디오/F8 probe와 Whisper 측정을 실행하십시오. 설치 절차는
+[`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)에 있습니다.
+
 `v0` 태그와 `main` 브랜치는 질문마다 독립적인 `codex exec` 프로세스를 실행하는 검증 기준입니다. 현재 `v1-app-server` 브랜치는 앱 전용 영속 세션을 만들거나 선택하고, 하나의 Codex App Server thread를 면접 동안 유지하는 방식을 실험합니다.
 
 `v1-app-server` 브랜치의 현재 범위와 보류 항목은 [`docs/V1_APP_SERVER.md`](docs/V1_APP_SERVER.md)에 기록합니다.
@@ -173,6 +179,11 @@ codex_app_server.py     상주 App Server와 단일 thread의 stdio 클라이언
 session_store.py        이 앱이 만든 Codex thread id와 최근 사용 순서 저장
 start_interview_app.sh  백그라운드 실행 진입점
 requirements.txt        직접 사용하는 Python 패키지
+audio_stream.py         플랫폼 중립 PCM VAD·발화·F8 marker 처리
+transcription.py        플랫폼 중립 Whisper 로드·전사 도우미
+windows_port/           WSL PySide6 앱과 Windows WASAPI/F8 stdio bridge
+windows_bridge_helper.py Windows Python helper 진입점
+start_wsl_windows_app.sh WSL 하이브리드 앱 진입점
 benchmarks/             v0 모델·Fast mode 응답시간 기록
 docs/                   v1 범위와 후속 개선 기록
 README.md               설치와 운용 문서
@@ -195,7 +206,7 @@ README.md               설치와 운용 문서
 - `v0` 태그: 현재 검증된 `codex exec` 기준 버전
 - `v1-app-server` 브랜치: App Server 상주 프로세스와 단일 thread를 먼저 검증한 뒤 스트리밍과 장애 복구 실험
 - 최종 Linux 버전 선정: 동일한 테스트 질문과 로그 지표로 v0/v1 비교
-- Windows 포팅: Linux 최종 버전을 확정한 뒤 Windows 오디오 캡처·전역 단축키·UI에 맞게 별도 개발
+- `windows-port` 브랜치: WSL의 Whisper·Codex·세션과 최소 Windows WASAPI/F8 helper를 결합한 PySide6 하이브리드 구현 검증
 
 v0와 v1 비교 시에는 질문 경계 정확도, F8부터 첫 글자까지의 시간, 전체 답변 완료시간, 대화 일관성, 장애 복구 여부를 동일한 조건에서 기록합니다.
 

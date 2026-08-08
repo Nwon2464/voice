@@ -7,8 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 HAS_FASTER_WHISPER = importlib.util.find_spec("faster_whisper") is not None
+HAS_INTERVIEW_APP_DEPS = False
 if HAS_FASTER_WHISPER:
-    import interview_app
+    try:
+        import interview_app
+        HAS_INTERVIEW_APP_DEPS = True
+    except (ModuleNotFoundError, ValueError):
+        interview_app = None
 
 
 class _Segment:
@@ -24,8 +29,8 @@ class _FakeWhisperModel:
 
 
 @unittest.skipUnless(
-    HAS_FASTER_WHISPER,
-    "faster_whisper is available in the application virtualenv",
+    HAS_INTERVIEW_APP_DEPS,
+    "faster_whisper and GTK are available in the application environment",
 )
 class InterviewAppShutdownTest(unittest.TestCase):
     def test_pending_utterance_is_logged_before_worker_stops(self):
