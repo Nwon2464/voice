@@ -1,8 +1,10 @@
 """Minimal persistent Codex App Server client over stdio JSONL."""
 
 import json
+import os
 import queue
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -11,6 +13,18 @@ from collections import deque
 
 class CodexAppServerError(RuntimeError):
     """Raised when the App Server protocol or process fails."""
+
+
+class CodexAppServerRecoverableError(CodexAppServerError):
+    """Raised when restarting the App Server may recover the thread."""
+
+
+class CodexAppServerTransportError(CodexAppServerRecoverableError):
+    """Raised for process exit, EOF, broken pipe, or stdio failure."""
+
+
+class CodexAppServerTimeoutError(CodexAppServerRecoverableError):
+    """Raised when the App Server transport or turn stops responding."""
 
 
 class CodexAppServerClient:
@@ -32,6 +46,7 @@ class CodexAppServerClient:
         self.timeout_seconds = timeout_seconds
         self.codex_path = codex_path or shutil.which("codex")
         self.process = None
+        self._process_group_id = None
         self.thread_id = None
         self._request_id = 0
         self._messages = queue.Queue()
@@ -57,15 +72,22 @@ class CodexAppServerClient:
             "--disable", "fast_mode",
             "--config", f'model_reasoning_effort="{self.effort}"',
         ]
-        self.process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            cwd=self.cwd,
-        )
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=self.cwd,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise CodexAppServerTransportError(
+                f"Could not start Codex App Server: {error}"
+            ) from error
+        self._process_group_id = self.process.pid
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
 
@@ -117,6 +139,7 @@ class CodexAppServerClient:
             "thread_id": self.thread_id,
             "thread": response.get("thread", {}),
             "startup_seconds": time.perf_counter() - started,
+            "process_id": getattr(self.process, "pid", None),
         }
 
     def archive_thread(self, thread_id):
@@ -188,7 +211,7 @@ class CodexAppServerClient:
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 self._terminate_after_timeout()
-                raise CodexAppServerError(
+                raise CodexAppServerTimeoutError(
                     f"Codex did not respond within {self.timeout_seconds} seconds"
                 )
             if self._interrupt_requested.is_set() and not interrupt_sent:
@@ -262,16 +285,23 @@ class CodexAppServerClient:
         """Ask the active run_turn loop to cancel its current turn."""
         self._interrupt_requested.set()
 
+    def clear_interrupt_request(self):
+        """Discard an interrupt that targeted a turn which already ended."""
+        self._interrupt_requested.clear()
+
     def stop(self):
         self._stopped = True
         process = self.process
-        if process is None or process.poll() is not None:
+        if process is None:
             return
-        process.terminate()
+        self._signal_process_group(signal.SIGTERM)
         try:
-            process.wait(timeout=3)
+            if process.poll() is None:
+                process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            process.kill()
+            pass
+        self._signal_process_group(signal.SIGKILL)
+        if process.poll() is None:
             process.wait(timeout=2)
 
     @staticmethod
@@ -350,7 +380,9 @@ class CodexAppServerClient:
             while True:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
-                    raise CodexAppServerError(f"Timed out waiting for {method}")
+                    raise CodexAppServerTimeoutError(
+                        f"Timed out waiting for {method}"
+                    )
                 message = self._next_raw_message(remaining)
                 if message.get("id") != request_id:
                     deferred.append(message)
@@ -371,7 +403,9 @@ class CodexAppServerClient:
                 self.process.stdin.write(payload + "\n")
                 self.process.stdin.flush()
             except (BrokenPipeError, OSError) as error:
-                raise CodexAppServerError(f"Could not write to Codex App Server: {error}")
+                raise CodexAppServerTransportError(
+                    f"Could not write to Codex App Server: {error}"
+                ) from error
 
     def _next_notification(self, timeout):
         if self._notifications:
@@ -391,7 +425,9 @@ class CodexAppServerClient:
         try:
             message = self._messages.get(timeout=timeout)
         except queue.Empty:
-            raise CodexAppServerError("Timed out waiting for Codex App Server")
+            raise CodexAppServerTimeoutError(
+                "Timed out waiting for Codex App Server"
+            )
         return self._check_transport_message(message)
 
     def _check_transport_message(self, message):
@@ -400,7 +436,9 @@ class CodexAppServerClient:
             if not detail:
                 code = None if self.process is None else self.process.poll()
                 detail = f"process exited with status {code}"
-            raise CodexAppServerError(f"Codex App Server stopped: {detail}")
+            raise CodexAppServerTransportError(
+                f"Codex App Server stopped: {detail}"
+            )
         return message
 
     def _read_stdout(self):
@@ -431,11 +469,18 @@ class CodexAppServerClient:
         if code is not None:
             detail = "\n".join(self._stderr).strip()
             suffix = f": {detail}" if detail else ""
-            raise CodexAppServerError(
+            raise CodexAppServerTransportError(
                 f"Codex App Server exited with status {code}{suffix}"
             )
 
     def _terminate_after_timeout(self):
-        process = self.process
-        if process is not None and process.poll() is None:
-            process.terminate()
+        self._signal_process_group(signal.SIGTERM)
+
+    def _signal_process_group(self, signal_number):
+        group_id = self._process_group_id
+        if group_id is None:
+            return
+        try:
+            os.killpg(group_id, signal_number)
+        except ProcessLookupError:
+            pass

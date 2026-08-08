@@ -32,15 +32,20 @@ v1: F8 -> 상주 codex app-server의 동일 thread에서 새 turn
 - 미리보기 프로세스 통신에 Pipe를 사용해 반복 종료 시 semaphore 누적 방지
 - 질문 확정 후 미리보기 프로세스를 자동 재시작하고 준비·취소시간을 세션 로그에 기록
 - 종료 신호를 최종 전사 큐 뒤에 배치하고 작업 스레드에서 즉시 발화 로그를 기록해 마지막 WAV와 이벤트 수 일치
+- 비어 있지 않은 최신 질문 STT가 확정되면 실행 중인 이전 Codex turn을 중단하고 대기 요청을 최신 하나로 압축
+- superseded generation의 늦은 stream·완료 callback을 무시하고 해당 답변을 `NOT SPOKEN`으로 기록
+- timeout·프로세스 종료·EOF·broken pipe 발생 시 App Server를 정리하고 같은 persistent thread를 resume한 뒤 최신 질문을 1회 재시도
+- recovery 재시도도 실패하면 Codex만 unavailable로 표시하고 오디오·Whisper·F8 처리는 계속 유지
 - 이동 가능한 면접 통합 제어창의 뒤로가기로 오디오를 정리하고 준비 채팅 복귀
 
 ## 후속 개선으로 보류
 
-- Codex 답변 생성 중 새 F8이 들어왔을 때 기존 turn 중단
 - 연속 질문을 하나의 복합 질문으로 자동 병합
 - GTK가 초기화된 부모에서 미리보기 spawn을 반복하면 프로세스당 semaphore 하나가 종료 시점까지 추적되는 `resource_tracker` 경고가 발생한다. 일반적인 개인 면접에서는 기능 장애가 없고 앱 완전 종료 시 정리되므로 현재 구조를 유지하되, 배포 전에는 `multiprocessing` 대신 stdin/stdout 기반 일반 subprocess로 교체할지 검토한다.
 
-현재는 새 F8이 들어와도 기존 답변을 중단하지 않는다. 질문 음성은 즉시 캡처하고 기존 대기열에 저장한 뒤, 앞선 Codex turn이 완료되면 같은 thread에 순서대로 전달한다.
+질문 음성과 interviewer transcript는 모두 보존한다. 다만 비어 있지 않은 최신 질문의 최종 STT가 확정되면 이전 Codex 답변을 `superseded / NOT SPOKEN`으로 표시하고 실행 중인 turn을 중단한다. 대기 중인 질문이 여러 개면 가장 최신 generation 하나만 같은 thread에서 이어서 실행한다.
+
+Codex stdio transport가 끊기거나 turn이 timeout되면 현재 App Server 프로세스를 종료하고 선택된 persistent `thread_id`로 새 App Server를 resume한다. 실패한 최신 질문은 부분 출력이 실제 발화되지 않았다는 recovery 지시와 함께 최대 한 번만 다시 보낸다. 두 번째 시도도 실패하면 `Codex unavailable`을 표시하지만 앱과 음성 처리는 종료하지 않으며, 다음 valid 질문에서 새 복구를 다시 시도할 수 있다.
 
 ## 구현 검증 기록
 

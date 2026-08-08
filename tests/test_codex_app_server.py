@@ -1,7 +1,13 @@
+import signal
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 
-from codex_app_server import CodexAppServerClient, CodexAppServerError
+from codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    CodexAppServerTimeoutError,
+    CodexAppServerTransportError,
+)
 
 
 class CodexAppServerClientTest(unittest.TestCase):
@@ -325,6 +331,66 @@ class CodexAppServerClientTest(unittest.TestCase):
             "turn/interrupt",
             {"threadId": "thread-1", "turnId": "turn-1"},
         ))
+
+    def test_clear_interrupt_request_discards_stale_signal(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd="/workspace",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.request_interrupt()
+
+        client.clear_interrupt_request()
+
+        self.assertFalse(client._interrupt_requested.is_set())
+
+    def test_transport_eof_is_recoverable(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd="/workspace",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = -9
+
+        with self.assertRaises(CodexAppServerTransportError):
+            client._check_transport_message({"_transport_eof": True})
+
+    def test_raw_message_timeout_is_recoverable(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd="/workspace",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+
+        with self.assertRaises(CodexAppServerTimeoutError):
+            client._next_raw_message(0.001)
+
+    def test_stop_terminates_the_whole_app_server_process_group(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd="/workspace",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.side_effect = [None, -15]
+        client._process_group_id = 4321
+
+        with patch("codex_app_server.os.killpg") as killpg:
+            client.stop()
+
+        self.assertEqual(killpg.call_args_list, [
+            call(4321, signal.SIGTERM),
+            call(4321, signal.SIGKILL),
+        ])
 
 
 if __name__ == "__main__":

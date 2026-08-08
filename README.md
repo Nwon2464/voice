@@ -1,6 +1,6 @@
 # Interview Assistant v1 App Server
 
-Linux GNOME에서 웹 화상면접의 상대방 음성을 실시간으로 전사하고, F8을 누른 시점의 질문을 Codex에 보내 말하기 쉬운 답변 초안을 표시하는 로컬 데스크톱 도구입니다.
+웹 화상면접의 상대방 음성을 실시간으로 전사하고, F8을 누른 시점의 질문을 Codex에 보내 말하기 쉬운 답변 초안을 표시하는 로컬 데스크톱 도구입니다. 현재 검증된 버전은 Linux GNOME에서 실행되며, Windows 포팅은 WSL을 주 실행환경으로 사용하는 구조로 진행합니다.
 
 `v0` 태그와 `main` 브랜치는 질문마다 독립적인 `codex exec` 프로세스를 실행하는 검증 기준입니다. 현재 `v1-app-server` 브랜치는 앱 전용 영속 세션을 만들거나 선택하고, 하나의 Codex App Server thread를 면접 동안 유지하는 방식을 실험합니다.
 
@@ -40,6 +40,36 @@ Linux GNOME에서 웹 화상면접의 상대방 음성을 실시간으로 전사
 | Fast mode | 끔 |
 | Codex 세션 | 시작 화면에서 선택한 앱 전용 영속 App Server thread |
 | 테스트 기록 | 기본값 끔 |
+
+## Windows 포팅 방향
+
+Windows 버전은 네이티브 Windows 앱으로 전체를 다시 구현하지 않습니다. **WSL이 주 실행환경**이며, Windows에는 운영체제 기능에 직접 접근해야 하는 **최소 헬퍼**만 둡니다.
+
+```text
+Windows 브라우저·Zoom·Teams 출력
+        │
+        ▼
+최소 Windows 헬퍼
+  - WASAPI loopback 음성 캡처
+  - Windows 전역 F8 감지
+        │ PCM 음성 + F8 이벤트
+        ▼
+WSL 주 애플리케이션
+  - Whisper small 미리보기·최종 전사
+  - 질문 경계 처리와 테스트 로그
+  - Codex App Server와 영속 세션
+  - 준비 채팅, INTERVIEWER·Answer UI
+```
+
+책임 경계는 다음과 같습니다.
+
+- Windows 헬퍼는 시스템 출력 캡처와 전역 단축키 전달만 담당합니다.
+- Whisper 모델, Codex 통신, 세션 저장, 질문 처리와 답변 생성은 WSL에서 실행합니다.
+- UI는 WSLg를 통해 WSL 애플리케이션이 표시하는 방향을 기본으로 합니다.
+- Windows와 WSL 사이에는 PCM 음성과 F8 같은 최소 제어 이벤트만 전달합니다.
+- Linux의 핵심 처리 흐름을 공통 기준으로 유지하고, 오디오 입력과 단축키 부분만 플랫폼별 어댑터로 분리합니다.
+
+이 구조를 선택한 목적은 Linux에서 검증한 Whisper·Codex·세션 로직을 그대로 재사용하고, Windows 전용 코드와 설치 범위를 작게 유지하는 것입니다. 현재 Windows 포팅은 진행 중이므로 헬퍼 실행 및 설치 명령은 구현이 확정된 뒤 추가합니다.
 
 ## 필요한 프로그램
 
@@ -95,6 +125,10 @@ python3 -m venv --system-site-packages .venv
 
 면접관이 말하는 동안에는 별도 `small` 프로세스가 INTERVIEWER 창에 미리보기 문장을 표시합니다. F8을 누르면 이 프로세스를 즉시 종료하고, 준비된 최종 `small` 모델이 질문을 전사합니다. 질문 확정 후 미리보기 프로세스는 자동으로 다시 준비되므로 사용자가 추가로 조작할 것은 없습니다. 프로세스 통신은 semaphore를 사용하지 않는 Pipe로 처리하며, 종료 시에는 대기 중인 최종 전사와 로그 기록을 마친 뒤 작업자를 정리합니다.
 
+Codex 답변 생성은 최신 질문 우선입니다. 새 F8의 최종 STT가 비어 있지 않게 확정되면 이전 답변 생성을 중단하고, 대기 중인 이전 질문도 건너뛰어 가장 최신 질문만 처리합니다. interviewer 전사 기록은 삭제하지 않으며, 중단된 Codex 답변은 사용자가 실제로 말한 답변으로 취급하지 않습니다.
+
+Codex App Server가 timeout되거나 프로세스·stdio 연결이 끊기면 앱이 서버를 자동 재시작하고 선택한 persistent thread를 resume합니다. 최신 질문은 한 번만 다시 시도하며, 복구까지 실패하면 `Codex unavailable`을 표시하되 Whisper·오디오·F8 기능은 계속 실행됩니다.
+
 종료는 별도 스크립트 없이 면접 통합 제어창의 `×` 버튼을 누릅니다.
 
 ## 창 사용법
@@ -121,6 +155,7 @@ Codex의 답변 초안을 표시합니다. 면접 중에는 이 초안을 사용
 | `INTERVIEW_LANGUAGE` | `en` | 전사 언어 |
 | `INTERVIEW_CODEX_MODEL` | `gpt-5.6-sol` | Codex 모델 |
 | `INTERVIEW_CODEX_REASONING` | `low` | 추론 강도 |
+| `INTERVIEW_DISABLE_CODEX` | `0` | `1`이면 세션 연결과 F8 Codex 전송을 생략하는 오디오 테스트 모드 |
 | `INTERVIEW_VAD_RMS` | `250` | 상대방 출력 음성 감지 민감도 |
 | `INTERVIEW_TEST_LOG` | `0` | `1`이면 테스트 음성·JSONL 저장 |
 | `INTERVIEW_TEST_LABEL` | 없음 | 테스트 세션 라벨 |
@@ -183,6 +218,8 @@ README.md               설치와 운용 문서
 ## 알려진 제약
 
 - v0는 Linux GNOME/X11 전용입니다.
+- Windows 포팅은 WSLg와 최소 Windows 헬퍼를 전제로 하며 아직 완성된 배포 버전이 아닙니다.
+- Windows 헬퍼가 종료되면 시스템 출력 음성과 전역 F8이 WSL 앱에 전달되지 않습니다.
 - Wayland 또는 다른 데스크톱의 전역 F8은 보장하지 않습니다.
 - 브라우저별 음성이 아니라 시스템 기본 출력 전체를 캡처합니다.
 - Whisper 전사는 로컬이지만 질문과 최근 대화 문맥은 Codex 응답 생성을 위해 OpenAI 서비스로 전달됩니다.
@@ -195,7 +232,7 @@ README.md               설치와 운용 문서
 - `v0` 태그: 현재 검증된 `codex exec` 기준 버전
 - `v1-app-server` 브랜치: App Server 상주 프로세스와 단일 thread를 먼저 검증한 뒤 스트리밍과 장애 복구 실험
 - 최종 Linux 버전 선정: 동일한 테스트 질문과 로그 지표로 v0/v1 비교
-- Windows 포팅: Linux 최종 버전을 확정한 뒤 Windows 오디오 캡처·전역 단축키·UI에 맞게 별도 개발
+- Windows 포팅: WSL을 주 실행환경으로 유지하고 WASAPI 출력 캡처와 전역 F8만 최소 Windows 헬퍼로 제공
 
 v0와 v1 비교 시에는 질문 경계 정확도, F8부터 첫 글자까지의 시간, 전체 답변 완료시간, 대화 일관성, 장애 복구 여부를 동일한 조건에서 기록합니다.
 

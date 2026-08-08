@@ -58,7 +58,12 @@ from audio_utils import (
     append_log,
     transcribe_question,
 )
-from codex_app_server import CodexAppServerClient, CodexAppServerError
+from codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    CodexAppServerRecoverableError,
+    CodexAppServerTransportError,
+)
 from session_store import SessionStore
 
 
@@ -81,6 +86,7 @@ LANGUAGE = os.environ.get("INTERVIEW_LANGUAGE", "en")
 CODEX_MODEL = os.environ.get("INTERVIEW_CODEX_MODEL", "gpt-5.6-sol")
 CODEX_REASONING = os.environ.get("INTERVIEW_CODEX_REASONING", "low")
 CODEX_FAST_MODE = False
+CODEX_ENABLED = os.environ.get("INTERVIEW_DISABLE_CODEX", "0") == "0"
 CODEX_TIMEOUT_SECONDS = 60
 CODEX_DEVELOPER_INSTRUCTIONS = """You assist a job candidate with interview preparation and live answers.
 Follow the candidate's preferences, background, speaking style, and answer format established in the conversation.
@@ -206,6 +212,11 @@ class AudioStream:
         self.utterance_start = 0
         self.last_completed_span = None
         self.question_finalize_at = None
+        self.awaiting_question_boundary = False
+        self.awaiting_question_end = None
+        self.deferred_audio = bytearray()
+        self.replay_audio = bytearray()
+        self.replay_start = 0
         self.speech_run_ms = 0
         self.silence_ms = 0
         self.last_preview_bytes = 0
@@ -277,12 +288,114 @@ class AudioStream:
             del self.history[:remove]
             self.history_start += remove
 
-    def _start_utterance(self):
+    def _start_utterance(self, absolute_end):
         self.utterance = bytearray().join(self.pre_roll)
-        self.utterance_start = self.total_bytes - len(self.utterance)
+        self.utterance_start = absolute_end - len(self.utterance)
         self.active = True
         self.silence_ms = 0
         self.last_preview_bytes = len(self.utterance)
+
+    def requeue_question_remainder(
+        self,
+        pcm_remainder,
+        remainder_start,
+        source_end,
+    ):
+        """Replay the post-boundary PCM before audio captured after it."""
+        with self.condition:
+            if (
+                not self.awaiting_question_boundary
+                or self.awaiting_question_end != source_end
+            ):
+                return False
+            self.replay_audio = bytearray(pcm_remainder)
+            self.replay_audio.extend(self.deferred_audio)
+            self.replay_start = remainder_start
+            self.deferred_audio.clear()
+            self.awaiting_question_boundary = False
+            self.awaiting_question_end = None
+            self.pre_roll.clear()
+            self.pre_roll_bytes = 0
+            self.speech_run_ms = 0
+            self.silence_ms = 0
+            self.last_preview_bytes = 0
+            self.condition.notify_all()
+        return True
+
+    def _process_detection_chunk(self, data, absolute_end):
+        chunk_ms = len(data) * 1000 / BYTES_PER_SECOND
+        rms = self._rms(data)
+        loud = rms >= VAD_RMS
+        self._append_pre_roll(data)
+
+        if not self.active:
+            self.speech_run_ms = (
+                self.speech_run_ms + chunk_ms if loud else 0
+            )
+            if self.speech_run_ms >= 50:
+                self._start_utterance(absolute_end)
+            return None, None
+
+        self.utterance.extend(data)
+        self.silence_ms = 0 if loud else self.silence_ms + chunk_ms
+        utterance_bytes = len(self.utterance)
+        should_preview = (
+            utterance_bytes >= BYTES_PER_SECOND * 0.6
+            and utterance_bytes - self.last_preview_bytes
+            >= BYTES_PER_SECOND * PREVIEW_INTERVAL_MS / 1000
+        )
+        should_finish = (
+            self.silence_ms >= SILENCE_END_MS
+            or (
+                self.question_finalize_at is not None
+                and absolute_end >= self.question_finalize_at
+            )
+            or utterance_bytes >= BYTES_PER_SECOND * MAX_UTTERANCE_SECONDS
+        )
+        if should_preview:
+            preview_size = BYTES_PER_SECOND * PREVIEW_WINDOW_SECONDS
+            preview = bytes(self.utterance[-preview_size:])
+            self.last_preview_bytes = utterance_bytes
+        else:
+            preview = None
+        if not should_finish:
+            return preview, None
+
+        final = (
+            bytes(self.utterance),
+            self.utterance_start,
+            self.utterance_start + len(self.utterance),
+            {
+                "vad_method": "rms",
+                "vad_threshold_rms": VAD_RMS,
+            },
+        )
+        self.last_completed_span = (final[1], final[2])
+        if self.question_finalize_at is not None:
+            self.awaiting_question_boundary = True
+            self.awaiting_question_end = final[2]
+            self.deferred_audio.clear()
+        self.active = False
+        self.utterance.clear()
+        self.speech_run_ms = 0
+        self.silence_ms = 0
+        self.last_preview_bytes = 0
+        self.question_finalize_at = None
+        return preview, final
+
+    def _process_replay(self):
+        if not self.replay_audio:
+            return []
+        replay = bytes(self.replay_audio)
+        cursor = self.replay_start
+        self.replay_audio.clear()
+        events = []
+        for offset in range(0, len(replay), 320):
+            chunk = replay[offset:offset + 320]
+            cursor += len(chunk)
+            preview, final = self._process_detection_chunk(chunk, cursor)
+            events.append((preview, final))
+        return events
 
     def _read_loop(self):
         try:
@@ -290,71 +403,24 @@ class AudioStream:
                 data = self.process.stdout.read(320)
                 if not data:
                     break
-                chunk_ms = len(data) * 1000 / BYTES_PER_SECOND
-                rms = self._rms(data)
-                loud = rms >= VAD_RMS
 
                 with self.condition:
                     self._append_history(data)
-                    self._append_pre_roll(data)
-
-                    if not self.active:
-                        self.speech_run_ms = (
-                            self.speech_run_ms + chunk_ms if loud else 0
-                        )
-                        if self.speech_run_ms >= 50:
-                            self._start_utterance()
+                    if self.awaiting_question_boundary:
+                        self.deferred_audio.extend(data)
                         self.condition.notify_all()
                         continue
-
-                    self.utterance.extend(data)
-                    self.silence_ms = 0 if loud else self.silence_ms + chunk_ms
-                    utterance_bytes = len(self.utterance)
-                    should_preview = (
-                        utterance_bytes >= BYTES_PER_SECOND * 0.6
-                        and utterance_bytes - self.last_preview_bytes
-                        >= BYTES_PER_SECOND * PREVIEW_INTERVAL_MS / 1000
+                    events = self._process_replay()
+                    events.append(
+                        self._process_detection_chunk(data, self.total_bytes)
                     )
-                    should_finish = (
-                        self.silence_ms >= SILENCE_END_MS
-                        or (
-                            self.question_finalize_at is not None
-                            and self.total_bytes >= self.question_finalize_at
-                        )
-                        or utterance_bytes
-                        >= BYTES_PER_SECOND * MAX_UTTERANCE_SECONDS
-                    )
-                    if should_preview:
-                        preview_size = BYTES_PER_SECOND * PREVIEW_WINDOW_SECONDS
-                        preview = bytes(self.utterance[-preview_size:])
-                        self.last_preview_bytes = utterance_bytes
-                    else:
-                        preview = None
-                    if should_finish:
-                        final = (
-                            bytes(self.utterance),
-                            self.utterance_start,
-                            self.utterance_start + len(self.utterance),
-                            {
-                                "vad_method": "rms",
-                                "vad_threshold_rms": VAD_RMS,
-                            },
-                        )
-                        self.last_completed_span = (final[1], final[2])
-                        self.active = False
-                        self.utterance.clear()
-                        self.speech_run_ms = 0
-                        self.silence_ms = 0
-                        self.last_preview_bytes = 0
-                        self.question_finalize_at = None
-                    else:
-                        final = None
                     self.condition.notify_all()
 
-                if preview is not None:
-                    self.on_preview(self.role, preview)
-                if final is not None:
-                    self.on_utterance(self.role, *final)
+                for preview, final in events:
+                    if preview is not None:
+                        self.on_preview(self.role, preview)
+                    if final is not None:
+                        self.on_utterance(self.role, *final)
         except Exception as error:
             self.on_error(self.role, error)
 
@@ -664,6 +730,8 @@ class PreviewWhisperWorker:
 class CodexWorker:
     """Run queued turns on one persistent App Server thread."""
 
+    _LATEST_JOB = object()
+
     def __init__(self, on_ready, thread_id=None):
         self.jobs = queue.Queue()
         self.accepting = True
@@ -672,6 +740,10 @@ class CodexWorker:
         self.client = None
         self.client_lock = threading.Lock()
         self.turn_active = threading.Event()
+        self.latest_lock = threading.Lock()
+        self.latest_job = None
+        self.latest_token_queued = False
+        self.active_latest_generation = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -682,14 +754,66 @@ class CodexWorker:
         on_delta=None,
         interactive=False,
         on_approval=None,
+        on_start=None,
     ):
         if self.accepting:
             self.jobs.put(
-                (prompt, callback, on_delta, interactive, on_approval)
+                (
+                    prompt,
+                    callback,
+                    on_delta,
+                    interactive,
+                    on_approval,
+                    on_start,
+                    None,
+                    None,
+                )
             )
+
+    def submit_latest(
+        self,
+        generation,
+        prompt,
+        callback,
+        on_delta=None,
+        on_start=None,
+        on_recovery=None,
+    ):
+        """Keep only the newest live turn and interrupt the active one."""
+        if not self.accepting:
+            return False
+        job = (
+            prompt,
+            callback,
+            on_delta,
+            False,
+            None,
+            on_start,
+            on_recovery,
+            generation,
+        )
+        interrupt_active = False
+        with self.latest_lock:
+            self.latest_job = job
+            if not self.latest_token_queued:
+                self.latest_token_queued = True
+                self.jobs.put(self._LATEST_JOB)
+            interrupt_active = (
+                self.active_latest_generation is not None
+                and self.active_latest_generation != generation
+            )
+        if interrupt_active:
+            with self.client_lock:
+                client = self.client
+            if client is not None:
+                client.request_interrupt()
+        return True
 
     def stop(self):
         self.accepting = False
+        with self.latest_lock:
+            self.latest_job = None
+            self.latest_token_queued = False
         with self.client_lock:
             client = self.client
         while True:
@@ -708,19 +832,7 @@ class CodexWorker:
 
     def _run(self):
         try:
-            client = CodexAppServerClient(
-                model=CODEX_MODEL,
-                effort=CODEX_REASONING,
-                cwd=APP_DIR,
-                developer_instructions=CODEX_DEVELOPER_INSTRUCTIONS,
-                timeout_seconds=CODEX_TIMEOUT_SECONDS,
-            )
-            with self.client_lock:
-                self.client = client
-            ready = client.start(
-                thread_id=self.thread_id,
-                ephemeral=self.thread_id is None,
-            )
+            _client, ready = self._start_client(self.thread_id)
             startup_error = None
         except Exception as caught:
             ready = None
@@ -731,37 +843,224 @@ class CodexWorker:
             job = self.jobs.get()
             if job is None:
                 return
-            prompt, callback, on_delta, interactive, on_approval = job
-            if startup_error is not None:
-                result = None
-                error = startup_error
+            if job is self._LATEST_JOB:
+                with self.latest_lock:
+                    job = self.latest_job
+                    self.latest_job = None
+                    self.latest_token_queued = False
+                    if job is not None:
+                        self.active_latest_generation = job[-1]
+                if job is None:
+                    continue
+            (
+                prompt,
+                callback,
+                on_delta,
+                interactive,
+                on_approval,
+                on_start,
+                on_recovery,
+                generation,
+            ) = job
+            result, error = self._run_job(
+                prompt,
+                on_delta,
+                interactive,
+                on_approval,
+                on_start,
+                on_recovery,
+                generation,
+                startup_error,
+            )
+            if result is not None:
+                startup_error = None
+            if generation is not None:
+                with self.latest_lock:
+                    if self.active_latest_generation == generation:
+                        self.active_latest_generation = None
+                    if self.client is not None:
+                        self.client.clear_interrupt_request()
+            GLib.idle_add(callback, result, error)
+
+    def _run_job(
+        self,
+        prompt,
+        on_delta,
+        interactive,
+        on_approval,
+        on_start,
+        on_recovery,
+        generation,
+        startup_error,
+    ):
+        stream_callback = None
+        if on_delta is not None:
+            stream_callback = lambda delta, elapsed: GLib.idle_add(
+                on_delta, delta, elapsed
+            )
+        approval_callback = None
+        if on_approval is not None:
+            approval_callback = lambda method, params: self._request_approval(
+                on_approval,
+                method,
+                params,
+            )
+
+        recovery_attempts = 0
+        started = False
+        current_prompt = prompt
+        while True:
+            with self.client_lock:
+                client = self.client
+            if client is None:
+                caught = startup_error or CodexAppServerTransportError(
+                    "Codex App Server is unavailable"
+                )
             else:
                 try:
-                    stream_callback = None
-                    if on_delta is not None:
-                        stream_callback = lambda delta, elapsed: GLib.idle_add(
-                            on_delta, delta, elapsed
-                        )
-                    approval_callback = None
-                    if on_approval is not None:
-                        approval_callback = lambda method, params: (
-                            self._request_approval(on_approval, method, params)
-                        )
+                    if not started and on_start is not None:
+                        on_start()
+                    started = True
                     self.turn_active.set()
                     try:
                         result = client.run_turn(
-                            prompt,
+                            current_prompt,
                             on_delta=stream_callback,
                             interactive=interactive,
                             on_approval=approval_callback,
                         )
-                        error = None
                     finally:
                         self.turn_active.clear()
-                except Exception as caught:
-                    result = None
-                    error = caught
-            GLib.idle_add(callback, result, error)
+                    result["recovery_attempts"] = recovery_attempts
+                    return result, None
+                except Exception as error:
+                    caught = error
+
+            can_recover = (
+                generation is not None
+                and recovery_attempts == 0
+                and self.accepting
+                and isinstance(caught, CodexAppServerRecoverableError)
+                and self._generation_is_current(generation)
+            )
+            if not can_recover:
+                if recovery_attempts:
+                    stage = (
+                        "failed"
+                        if self._generation_is_current(generation)
+                        else "superseded"
+                    )
+                    self._notify_recovery(on_recovery, stage, {
+                        "attempt": recovery_attempts,
+                        "error": str(caught),
+                        "thread_id": self.thread_id,
+                    })
+                    if isinstance(caught, CodexAppServerRecoverableError):
+                        self._discard_client(client)
+                return None, caught
+
+            recovery_attempts = 1
+            self._notify_recovery(on_recovery, "started", {
+                "attempt": recovery_attempts,
+                "error": str(caught),
+                "thread_id": self.thread_id,
+            })
+            try:
+                _client, ready = self._restart_client()
+            except Exception as recovery_error:
+                self._notify_recovery(on_recovery, "failed", {
+                    "attempt": recovery_attempts,
+                    "error": str(recovery_error),
+                    "thread_id": self.thread_id,
+                })
+                return None, recovery_error
+
+            if not self._generation_is_current(generation):
+                self._notify_recovery(on_recovery, "superseded", {
+                    "attempt": recovery_attempts,
+                    "thread_id": ready["thread_id"],
+                })
+                return None, caught
+
+            self._notify_recovery(on_recovery, "resumed", {
+                "attempt": recovery_attempts,
+                "thread_id": ready["thread_id"],
+                "startup_seconds": ready["startup_seconds"],
+                "process_id": ready.get("process_id"),
+            })
+            current_prompt = f"""LIVE RECOVERY RETRY:
+The previous attempt ended because the Codex transport failed. Any partial assistant output from that failed attempt was NOT SPOKEN by the candidate. Answer the current interviewer question again.
+
+{prompt}"""
+            startup_error = None
+
+    def _start_client(self, thread_id):
+        client = CodexAppServerClient(
+            model=CODEX_MODEL,
+            effort=CODEX_REASONING,
+            cwd=APP_DIR,
+            developer_instructions=CODEX_DEVELOPER_INSTRUCTIONS,
+            timeout_seconds=CODEX_TIMEOUT_SECONDS,
+        )
+        with self.client_lock:
+            self.client = client
+        try:
+            ready = client.start(
+                thread_id=thread_id,
+                ephemeral=thread_id is None,
+            )
+        except Exception:
+            with self.client_lock:
+                if self.client is client:
+                    self.client = None
+            client.stop()
+            raise
+        self.thread_id = ready["thread_id"]
+        return client, ready
+
+    def _restart_client(self):
+        thread_id = self.thread_id
+        if not thread_id:
+            raise CodexAppServerError(
+                "Cannot recover Codex without a persistent thread id"
+            )
+        with self.client_lock:
+            old_client = self.client
+            self.client = None
+        if old_client is not None:
+            old_client.stop()
+        client, ready = self._start_client(thread_id)
+        if ready["thread_id"] != thread_id:
+            client.stop()
+            with self.client_lock:
+                if self.client is client:
+                    self.client = None
+            raise CodexAppServerError(
+                "Codex resumed a different thread during recovery"
+            )
+        return client, ready
+
+    def _discard_client(self, client):
+        if client is None:
+            return
+        with self.client_lock:
+            if self.client is client:
+                self.client = None
+        client.stop()
+
+    def _generation_is_current(self, generation):
+        with self.latest_lock:
+            if self.active_latest_generation != generation:
+                return False
+            return (
+                self.latest_job is None
+                or self.latest_job[-1] <= generation
+            )
+
+    @staticmethod
+    def _notify_recovery(callback, stage, details):
+        if callback is not None:
+            GLib.idle_add(callback, stage, details)
 
     @staticmethod
     def _request_approval(callback, method, params):
@@ -1665,16 +1964,20 @@ class InterviewApp:
     def __init__(self, codex_thread_id):
         self.session_dir, self.log_path = create_app_session()
         self.codex_thread_id = codex_thread_id
+        self.codex_enabled = CODEX_ENABLED
         self.exit_action = None
         self.running = True
         self.preview_pending = False
         self.interviewer_utterance_count = 0
         self.question_count = 0
         self.codex_request_count = 0
+        self.active_codex_generation = 0
+        self.codex_request_states = {}
         self.remote_utterances = []
         self.pending_questions = []
         self.conversation_context = []
         self.codex_context_cursor = 0
+        self.codex_state_lock = threading.Lock()
         self.transcript_lock = threading.Lock()
         self.last_f8_at = None
         self.socket_thread = None
@@ -1730,7 +2033,10 @@ class InterviewApp:
             self.back_to_chat,
             self.shutdown,
         )
-        self.answer_window.set_status("Waiting for F8…")
+        if self.codex_enabled:
+            self.answer_window.set_status("Waiting for F8…")
+        else:
+            self.answer_window.set_status("Codex disabled · Waiting for F8…")
         for window in (self.remote_window, self.answer_window):
             window.connect("key-press-event", self._key_pressed)
 
@@ -1749,14 +2055,17 @@ class InterviewApp:
             "microphone_capture": False,
             "whisper_model": WHISPER_MODEL,
             "language": LANGUAGE,
-            "codex_enabled": True,
+            "codex_enabled": self.codex_enabled,
             "codex_model": CODEX_MODEL,
             "codex_reasoning_effort": CODEX_REASONING,
             "codex_fast_mode": CODEX_FAST_MODE,
             "codex_transport": "app_server_stdio",
             "codex_session_scope": "persistent_selected_thread",
             "codex_thread_id": self.codex_thread_id,
-            "candidate_response_source": "codex_answer_assumed_spoken",
+            "candidate_response_source": (
+                "completed_codex_answer_assumed_spoken_"
+                "superseded_answer_not_spoken"
+            ),
             "question_transcript_mode": "reuse_interviewer_utterance",
             "preview_transcription": "cancelable_small_process",
             "global_f8": hotkey_status,
@@ -1770,10 +2079,12 @@ class InterviewApp:
             self._preview_whisper_ready,
         )
         self.worker = WhisperWorker(self._whisper_ready)
-        self.codex_worker = CodexWorker(
-            self._codex_ready,
-            thread_id=self.codex_thread_id,
-        )
+        self.codex_worker = None
+        if self.codex_enabled:
+            self.codex_worker = CodexWorker(
+                self._codex_ready,
+                thread_id=self.codex_thread_id,
+            )
         self.remote_audio.start()
 
     def _install_css(self):
@@ -1981,8 +2292,9 @@ class InterviewApp:
 
         def processor(model):
             started = time.perf_counter()
+            marker = None
+            relative_trigger = None
             try:
-                marker = None
                 if state is not None:
                     with self.transcript_lock:
                         if state["questions"]:
@@ -1992,13 +2304,37 @@ class InterviewApp:
                     details = {}
                 else:
                     relative_trigger = max(0, marker["trigger"] - start)
-                    text, _boundary, details = transcribe_question(
+                    (
+                        text,
+                        boundary_bytes,
+                        replay_start_bytes,
+                        details,
+                    ) = transcribe_question(
                         model,
                         pcm_audio,
                         relative_trigger,
                         silence_padding_ms=TRANSCRIPTION_PADDING_MS,
+                        replay_vad_rms=VAD_RMS,
                     )
+                    remainder = pcm_audio[replay_start_bytes:]
+                    requeued = self.remote_audio.requeue_question_remainder(
+                        remainder,
+                        start + replay_start_bytes,
+                        end,
+                    )
+                    details["requeued_audio_seconds"] = round(
+                        len(remainder) / BYTES_PER_SECOND,
+                        3,
+                    ) if requeued else 0
             except Exception as error:
+                if marker is not None and relative_trigger is not None:
+                    fallback_boundary = min(relative_trigger, len(pcm_audio))
+                    fallback_boundary -= fallback_boundary % SAMPLE_WIDTH
+                    self.remote_audio.requeue_question_remainder(
+                        pcm_audio[fallback_boundary:],
+                        start + fallback_boundary,
+                        end,
+                    )
                 append_log(self.log_path, {
                     "event": "utterance_error",
                     "role": role,
@@ -2087,7 +2423,20 @@ class InterviewApp:
         })
         if result["text"]:
             self.remote_window.set_text(result["text"])
-            self._request_codex_answer(marker["question"], result["text"])
+            if self.codex_enabled:
+                self._request_codex_answer(
+                    marker["question"],
+                    result["text"],
+                )
+            else:
+                self.answer_window.set_status(
+                    "Codex disabled · question logged only"
+                )
+                append_log(self.log_path, {
+                    "event": "codex_request_skipped",
+                    "question": marker["question"],
+                    "reason": "disabled_for_audio_test",
+                })
         self._restart_preview_worker()
 
     def _restart_preview_worker(self):
@@ -2097,9 +2446,11 @@ class InterviewApp:
             })
 
     def _request_codex_answer(self, question_number, question_text):
-        context_end = len(self.conversation_context)
-        context = self.conversation_context[self.codex_context_cursor:context_end]
-        self.codex_context_cursor = context_end
+        with self.codex_state_lock:
+            context_end = len(self.conversation_context)
+            context = self.conversation_context[
+                self.codex_context_cursor:context_end
+            ]
         if context and context[-1] == ("INTERVIEWER", question_text):
             context = context[:-1]
         context_text = "\n".join(
@@ -2114,21 +2465,94 @@ CURRENT INTERVIEWER QUESTION:
 """
         self.codex_request_count += 1
         request_number = self.codex_request_count
+        generation = request_number
         stream_started = False
+        stale_stream_logged = False
+        recovery_failed = False
+        superseded = []
+        with self.codex_state_lock:
+            for old_generation, state in self.codex_request_states.items():
+                if state["status"] in {"pending", "running", "recovering"}:
+                    state["status"] = "superseded"
+                    state["spoken"] = False
+                    superseded.append({
+                        "generation": old_generation,
+                        "request": state["request"],
+                        "question": state["question"],
+                    })
+            self.active_codex_generation = generation
+            self.codex_request_states[generation] = {
+                "request": request_number,
+                "question": question_number,
+                "status": "pending",
+                "spoken": None,
+            }
+        for old in superseded:
+            append_log(self.log_path, {
+                "event": "codex_request_superseded",
+                **old,
+                "superseded_by_generation": generation,
+                "superseded_by_question": question_number,
+                "spoken": False,
+            })
+        if superseded:
+            superseded_questions = ", ".join(
+                str(item["question"]) for item in superseded
+            )
+            prompt = f"""LIVE TURN CONTROL:
+Codex answer generation for earlier live question(s) {superseded_questions} was superseded. Any partial assistant output from those interrupted turns was NOT SPOKEN by the candidate. Do not treat it as a candidate statement.
+
+{prompt}"""
         self.answer_window.set_status("Thinking…")
+        if superseded:
+            self.answer_window.set_text("")
         append_log(self.log_path, {
             "event": "codex_request",
             "request": request_number,
             "question": question_number,
+            "generation": generation,
             "model": CODEX_MODEL,
             "reasoning_effort": CODEX_REASONING,
             "fast_mode": CODEX_FAST_MODE,
             "context_items": len(context),
+            "superseded_requests": len(superseded),
         })
 
+        def started():
+            with self.codex_state_lock:
+                state = self.codex_request_states[generation]
+                if state["status"] == "pending":
+                    state["status"] = "running"
+                self.codex_context_cursor = max(
+                    self.codex_context_cursor,
+                    context_end,
+                )
+            append_log(self.log_path, {
+                "event": "codex_turn_start",
+                "request": request_number,
+                "question": question_number,
+                "generation": generation,
+            })
+
         def streamed(delta, elapsed):
-            nonlocal stream_started
+            nonlocal stream_started, stale_stream_logged
             if not self.running:
+                return False
+            with self.codex_state_lock:
+                is_current = (
+                    generation == self.active_codex_generation
+                    and self.codex_request_states[generation]["status"]
+                    != "superseded"
+                )
+            if not is_current:
+                if not stale_stream_logged:
+                    stale_stream_logged = True
+                    append_log(self.log_path, {
+                        "event": "codex_stale_stream_ignored",
+                        "request": request_number,
+                        "question": question_number,
+                        "generation": generation,
+                    })
                 return False
             if stream_started:
                 self.answer_window.append_stream(delta)
@@ -2139,20 +2563,91 @@ CURRENT INTERVIEWER QUESTION:
                     "event": "codex_stream_start",
                     "request": request_number,
                     "question": question_number,
+                    "generation": generation,
                     "elapsed_seconds": round(elapsed, 3),
                 })
+            return False
+
+        def recovery(stage, details):
+            nonlocal stream_started, recovery_failed
+            if not self.running:
+                return False
+            with self.codex_state_lock:
+                state = self.codex_request_states[generation]
+                is_current = (
+                    generation == self.active_codex_generation
+                    and state["status"] != "superseded"
+                )
+                if stage == "started" and is_current:
+                    state["status"] = "recovering"
+                elif stage == "resumed" and is_current:
+                    state["status"] = "running"
+                elif stage == "failed" and is_current:
+                    state["status"] = "unavailable"
+                    state["spoken"] = False
+                    recovery_failed = True
+            append_log(self.log_path, {
+                "event": f"codex_recovery_{stage}",
+                "request": request_number,
+                "question": question_number,
+                "generation": generation,
+                **details,
+            })
+            if not is_current:
+                return False
+            if stage == "started":
+                stream_started = False
+                self.answer_window.set_text("")
+                self.answer_window.set_status("Reconnecting Codex…")
+            elif stage == "resumed":
+                self.answer_window.set_status("Thinking… (retry 1/1)")
+            elif stage == "failed":
+                self.answer_window.set_status("Codex unavailable")
             return False
 
         def finished(result, error):
             if not self.running:
                 return False
+            with self.codex_state_lock:
+                state = self.codex_request_states[generation]
+                is_current = (
+                    generation == self.active_codex_generation
+                    and state["status"] != "superseded"
+                )
+                if not is_current:
+                    state["status"] = "superseded_finished"
+                    state["spoken"] = False
+                elif error:
+                    state["status"] = (
+                        "unavailable" if recovery_failed else "failed"
+                    )
+                    state["spoken"] = False
+                else:
+                    state["status"] = "completed"
+                    state["spoken"] = True
+            if not is_current:
+                append_log(self.log_path, {
+                    "event": "codex_superseded_finished",
+                    "request": request_number,
+                    "question": question_number,
+                    "generation": generation,
+                    "spoken": False,
+                    "error": str(error) if error else None,
+                })
+                return False
             if error:
-                self.answer_window.set_status(f"Codex error: {error}")
+                self.answer_window.set_status(
+                    "Codex unavailable"
+                    if recovery_failed
+                    else f"Codex error: {error}"
+                )
                 append_log(self.log_path, {
                     "event": "codex_error",
                     "request": request_number,
                     "question": question_number,
+                    "generation": generation,
                     "error": str(error),
+                    "recovery_failed": recovery_failed,
                 })
             else:
                 if stream_started:
@@ -2163,6 +2658,7 @@ CURRENT INTERVIEWER QUESTION:
                     "event": "codex_response",
                     "request": request_number,
                     "question": question_number,
+                    "generation": generation,
                     "text": result["text"],
                     "elapsed_seconds": round(result["elapsed"], 3),
                     "first_token_seconds": (
@@ -2178,10 +2674,19 @@ CURRENT INTERVIEWER QUESTION:
                     "stream_delta_count": result["stream_delta_count"],
                     "thread_id": result["thread_id"],
                     "turn_id": result["turn_id"],
+                    "spoken": True,
+                    "recovery_attempts": result.get("recovery_attempts", 0),
                 })
             return False
 
-        self.codex_worker.submit(prompt, finished, streamed)
+        self.codex_worker.submit_latest(
+            generation,
+            prompt,
+            finished,
+            streamed,
+            started,
+            recovery,
+        )
 
     def _codex_ready(self, result, error):
         if not self.running:
@@ -2197,6 +2702,7 @@ CURRENT INTERVIEWER QUESTION:
                 "event": "codex_app_server_ready",
                 "thread_id": result["thread_id"],
                 "startup_seconds": round(result["startup_seconds"], 3),
+                "process_id": result.get("process_id"),
             })
         return False
 
@@ -2269,7 +2775,8 @@ CURRENT INTERVIEWER QUESTION:
         self.remote_audio.stop()
         self.preview_worker.stop()
         self.worker.stop()
-        self.codex_worker.stop()
+        if self.codex_worker is not None:
+            self.codex_worker.stop()
         if self.trigger_socket is not None:
             self.trigger_socket.close()
         TRIGGER_SOCKET.unlink(missing_ok=True)
@@ -2291,6 +2798,16 @@ CURRENT INTERVIEWER QUESTION:
 
 
 def main():
+    if not CODEX_ENABLED:
+        app = InterviewApp(None)
+        GLib.unix_signal_add(
+            GLib.PRIORITY_DEFAULT,
+            signal.SIGINT,
+            app.shutdown,
+        )
+        Gtk.main()
+        return
+
     store = SessionStore(SESSION_STORE_PATH)
     while True:
         thread_id = choose_interview_session(store)
