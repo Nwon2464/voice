@@ -39,8 +39,10 @@ class CodexAppServerClient:
         self._stderr = deque(maxlen=40)
         self._write_lock = threading.Lock()
         self._stopped = False
+        self._interrupt_requested = threading.Event()
 
-    def start(self):
+    def connect(self):
+        """Start and initialize App Server without opening a thread."""
         if self._stopped:
             raise CodexAppServerError("Codex App Server is stopping")
         if not self.codex_path:
@@ -48,7 +50,6 @@ class CodexAppServerClient:
         if self.process is not None:
             raise CodexAppServerError("Codex App Server is already running")
 
-        started = time.perf_counter()
         command = [
             self.codex_path,
             "app-server",
@@ -81,19 +82,30 @@ class CodexAppServerClient:
                 timeout=15,
             )
             self._send({"method": "initialized", "params": {}})
-            response = self._request(
-                "thread/start",
-                {
-                    "model": self.model,
-                    "cwd": self.cwd,
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "developerInstructions": self.developer_instructions,
-                    "ephemeral": True,
-                    "serviceName": "interview_assistant",
-                },
-                timeout=15,
-            )
+        except Exception:
+            self.stop()
+            raise
+
+    def start(self, thread_id=None, ephemeral=True):
+        """Connect and either create a thread or resume a persisted one."""
+        started = time.perf_counter()
+        self.connect()
+        params = {
+            "model": self.model,
+            "cwd": self.cwd,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "developerInstructions": self.developer_instructions,
+        }
+        if thread_id:
+            method = "thread/resume"
+            params["threadId"] = thread_id
+        else:
+            method = "thread/start"
+            params["ephemeral"] = ephemeral
+            params["serviceName"] = "interview_assistant"
+        try:
+            response = self._request(method, params, timeout=15)
         except Exception:
             self.stop()
             raise
@@ -103,10 +115,40 @@ class CodexAppServerClient:
             raise CodexAppServerError("Codex App Server returned no thread id")
         return {
             "thread_id": self.thread_id,
+            "thread": response.get("thread", {}),
             "startup_seconds": time.perf_counter() - started,
         }
 
-    def run_turn(self, prompt, on_delta=None):
+    def archive_thread(self, thread_id):
+        """Move a persisted thread into Codex's archived session store."""
+        self._ensure_running()
+        self._request(
+            "thread/archive",
+            {"threadId": thread_id},
+            timeout=15,
+        )
+
+    def inject_items(self, items):
+        """Persist model-visible history items without starting a turn."""
+        self._ensure_running()
+        if not self.thread_id:
+            raise CodexAppServerError("Codex thread has not started")
+        self._request(
+            "thread/inject_items",
+            {
+                "threadId": self.thread_id,
+                "items": items,
+            },
+            timeout=15,
+        )
+
+    def run_turn(
+        self,
+        prompt,
+        on_delta=None,
+        interactive=False,
+        on_approval=None,
+    ):
         self._ensure_running()
         started = time.perf_counter()
         response = self._request(
@@ -116,8 +158,16 @@ class CodexAppServerClient:
                 "input": [{"type": "text", "text": prompt}],
                 "model": self.model,
                 "effort": self.effort,
-                "approvalPolicy": "never",
-                "sandboxPolicy": {"type": "readOnly"},
+                "approvalPolicy": "on-request" if interactive else "never",
+                "sandboxPolicy": (
+                    {
+                        "type": "workspaceWrite",
+                        "writableRoots": [self.cwd],
+                        "networkAccess": False,
+                    }
+                    if interactive
+                    else {"type": "readOnly"}
+                ),
             },
             timeout=15,
         )
@@ -132,6 +182,7 @@ class CodexAppServerClient:
         delta_text = {}
         completed_messages = []
         agent_message_phases = {}
+        interrupt_sent = False
 
         while True:
             remaining = deadline - time.perf_counter()
@@ -140,9 +191,22 @@ class CodexAppServerClient:
                 raise CodexAppServerError(
                     f"Codex did not respond within {self.timeout_seconds} seconds"
                 )
-            message = self._next_notification(remaining)
+            if self._interrupt_requested.is_set() and not interrupt_sent:
+                self._request(
+                    "turn/interrupt",
+                    {"threadId": self.thread_id, "turnId": turn_id},
+                    timeout=15,
+                )
+                interrupt_sent = True
+                self._interrupt_requested.clear()
+            message = self._poll_notification(min(remaining, 0.25))
+            if message is None:
+                continue
             method = message.get("method")
             params = message.get("params", {})
+            if message.get("id") is not None and method:
+                self._handle_server_request(message, on_approval)
+                continue
             if params.get("threadId") != self.thread_id:
                 continue
             message_turn_id = params.get("turnId") or params.get("turn", {}).get("id")
@@ -174,6 +238,7 @@ class CodexAppServerClient:
             elif method == "turn/completed":
                 turn = params.get("turn", {})
                 status = turn.get("status")
+                self._interrupt_requested.clear()
                 if status != "completed":
                     error = turn.get("error") or {}
                     detail = error.get("message") or f"turn ended with status {status}"
@@ -192,6 +257,10 @@ class CodexAppServerClient:
             "thread_id": self.thread_id,
             "turn_id": turn_id,
         }
+
+    def request_interrupt(self):
+        """Ask the active run_turn loop to cancel its current turn."""
+        self._interrupt_requested.set()
 
     def stop(self):
         self._stopped = True
@@ -217,6 +286,59 @@ class CodexAppServerClient:
         if completed_messages:
             return completed_messages[-1].get("text", "").strip()
         return "".join(delta_text.values()).strip()
+
+    @staticmethod
+    def conversation_turns(thread):
+        """Extract displayable user/final-answer text grouped by turn."""
+        displayed = []
+        for turn in thread.get("turns", []):
+            messages = []
+            for item in turn.get("items", []):
+                item_type = item.get("type")
+                if item_type == "userMessage":
+                    text = CodexAppServerClient._content_text(item.get("content", []))
+                    if text:
+                        messages.append({"role": "user", "text": text})
+                elif item_type == "agentMessage":
+                    phase = item.get("phase")
+                    text = item.get("text", "").strip()
+                    if text and phase != "commentary":
+                        messages.append({"role": "assistant", "text": text})
+            if messages:
+                displayed.append(messages)
+        return displayed
+
+    @staticmethod
+    def _content_text(content):
+        return "\n".join(
+            part.get("text", "").strip()
+            for part in content
+            if part.get("type") in ("text", "input_text", "output_text")
+            and part.get("text", "").strip()
+        )
+
+    def _handle_server_request(self, message, on_approval):
+        method = message.get("method", "")
+        params = message.get("params", {})
+        if method in (
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ):
+            decision = "decline"
+            if on_approval is not None:
+                decision = on_approval(method, params)
+            self._send({
+                "id": message["id"],
+                "result": {"decision": decision},
+            })
+            return
+        self._send({
+            "id": message["id"],
+            "error": {
+                "code": -32601,
+                "message": f"Unsupported server request: {method}",
+            },
+        })
 
     def _request(self, method, params, timeout):
         self._request_id += 1
@@ -256,11 +378,23 @@ class CodexAppServerClient:
             return self._notifications.popleft()
         return self._next_raw_message(timeout)
 
+    def _poll_notification(self, timeout):
+        if self._notifications:
+            return self._notifications.popleft()
+        try:
+            message = self._messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        return self._check_transport_message(message)
+
     def _next_raw_message(self, timeout):
         try:
             message = self._messages.get(timeout=timeout)
         except queue.Empty:
             raise CodexAppServerError("Timed out waiting for Codex App Server")
+        return self._check_transport_message(message)
+
+    def _check_transport_message(self, message):
         if message.get("_transport_eof"):
             detail = "\n".join(self._stderr).strip()
             if not detail:

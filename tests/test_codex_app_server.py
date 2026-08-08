@@ -32,6 +32,120 @@ class CodexAppServerClientTest(unittest.TestCase):
         with self.assertRaisesRegex(CodexAppServerError, "has not started"):
             client.run_turn("test")
 
+    def test_start_resumes_requested_thread(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.connect = Mock()
+        client._request = Mock(
+            return_value={"thread": {"id": "thread-existing"}}
+        )
+
+        result = client.start(thread_id="thread-existing")
+
+        method, params = client._request.call_args.args[:2]
+        self.assertEqual(method, "thread/resume")
+        self.assertEqual(params["threadId"], "thread-existing")
+        self.assertNotIn("serviceName", params)
+        self.assertEqual(result["thread_id"], "thread-existing")
+        self.assertEqual(result["thread"]["id"], "thread-existing")
+
+    def test_start_can_create_persisted_thread(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.connect = Mock()
+        client._request = Mock(return_value={"thread": {"id": "thread-new"}})
+
+        client.start(ephemeral=False)
+
+        method, params = client._request.call_args.args[:2]
+        self.assertEqual(method, "thread/start")
+        self.assertFalse(params["ephemeral"])
+
+    def test_archive_thread_uses_app_server_archive(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = None
+        client._request = Mock(return_value={})
+
+        client.archive_thread("thread-old")
+
+        client._request.assert_called_once_with(
+            "thread/archive",
+            {"threadId": "thread-old"},
+            timeout=15,
+        )
+
+    def test_inject_items_persists_items_without_turn(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = None
+        client.thread_id = "thread-new"
+        client._request = Mock(return_value={})
+        items = [{"type": "message", "role": "developer", "content": []}]
+
+        client.inject_items(items)
+
+        client._request.assert_called_once_with(
+            "thread/inject_items",
+            {"threadId": "thread-new", "items": items},
+            timeout=15,
+        )
+
+    def test_conversation_turns_keeps_full_user_text_and_final_answers(self):
+        thread = {
+            "turns": [{
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "content": [{
+                            "type": "text",
+                            "text": "RECENT CONTEXT:\nME: full transcript",
+                        }],
+                    },
+                    {
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "Thinking",
+                    },
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "Full answer",
+                    },
+                ]
+            }]
+        }
+
+        self.assertEqual(
+            CodexAppServerClient.conversation_turns(thread),
+            [[
+                {"role": "user", "text": "RECENT CONTEXT:\nME: full transcript"},
+                {"role": "assistant", "text": "Full answer"},
+            ]],
+        )
+
     def test_streams_final_answer_but_hides_commentary(self):
         client = CodexAppServerClient(
             model="test-model",
@@ -108,7 +222,7 @@ class CodexAppServerClientTest(unittest.TestCase):
                 },
             },
         ])
-        client._next_notification = Mock(side_effect=lambda _timeout: next(notifications))
+        client._poll_notification = Mock(side_effect=lambda _timeout: next(notifications))
         streamed = []
 
         result = client.run_turn(
@@ -120,6 +234,97 @@ class CodexAppServerClientTest(unittest.TestCase):
         self.assertEqual(result["text"], "Speakable answer.")
         self.assertEqual(result["stream_delta_count"], 1)
         self.assertIsNotNone(result["first_visible_seconds"])
+
+    def test_interactive_turn_handles_command_approval(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd="/workspace",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = None
+        client.thread_id = "thread-1"
+        client._request = Mock(return_value={"turn": {"id": "turn-1"}})
+        client._send = Mock()
+        notifications = iter([
+            {
+                "id": 99,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "command": ["touch", "example"],
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "Done",
+                    },
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            },
+        ])
+        client._poll_notification = Mock(side_effect=lambda _timeout: next(notifications))
+
+        client.run_turn(
+            "edit",
+            interactive=True,
+            on_approval=lambda _method, _params: "accept",
+        )
+
+        turn_params = client._request.call_args.args[1]
+        self.assertEqual(turn_params["approvalPolicy"], "on-request")
+        self.assertEqual(turn_params["sandboxPolicy"]["type"], "workspaceWrite")
+        client._send.assert_called_once_with({
+            "id": 99,
+            "result": {"decision": "accept"},
+        })
+
+    def test_turn_interrupt_is_sent_from_active_loop(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd="/workspace",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = None
+        client.thread_id = "thread-1"
+        client._request = Mock(side_effect=[
+            {"turn": {"id": "turn-1"}},
+            {},
+        ])
+        client._poll_notification = Mock(return_value={
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "interrupted"},
+            },
+        })
+        client.request_interrupt()
+
+        with self.assertRaisesRegex(CodexAppServerError, "interrupted"):
+            client.run_turn("cancel me")
+
+        self.assertEqual(client._request.call_args_list[1].args[:2], (
+            "turn/interrupt",
+            {"threadId": "thread-1", "turnId": "turn-1"},
+        ))
 
 
 if __name__ == "__main__":
