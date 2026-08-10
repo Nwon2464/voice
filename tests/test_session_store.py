@@ -62,6 +62,7 @@ class SessionStoreTest(unittest.TestCase):
             "codex_model": "gpt-5.6-sol",
             "codex_reasoning_effort": "low",
             "codex_fast_mode": False,
+            "stt_language": "en",
         })
 
     def test_codex_settings_and_fast_mode_persist_per_session(self):
@@ -78,6 +79,7 @@ class SessionStoreTest(unittest.TestCase):
             "codex_model": "gpt-5.6-terra",
             "codex_reasoning_effort": "high",
             "codex_fast_mode": True,
+            "stt_language": "en",
         })
 
         self.assertTrue(self.store.update_settings("thread-a", {
@@ -87,6 +89,18 @@ class SessionStoreTest(unittest.TestCase):
         self.assertFalse(
             SessionStore(self.path).active()[0]["settings"]["codex_fast_mode"]
         )
+
+    def test_japanese_stt_language_persists_per_session(self):
+        self.store.add("thread-a", "A", "2026-08-08T10:00:00+09:00")
+
+        settings = self.store.active()[0]["settings"]
+        self.assertTrue(self.store.update_settings("thread-a", {
+            **settings,
+            "stt_language": "ja",
+        }))
+
+        reloaded = SessionStore(self.path).active()[0]["settings"]
+        self.assertEqual(reloaded["stt_language"], "ja")
 
 
 if __name__ == "__main__":

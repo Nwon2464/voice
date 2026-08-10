@@ -72,7 +72,6 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 
 APP_VERSION = "moonshine-small-streaming-dev"
-LANGUAGE = os.environ.get("INTERVIEW_LANGUAGE", "en")
 CODEX_MODEL = os.environ.get("INTERVIEW_CODEX_MODEL", DEFAULT_CODEX_MODEL)
 CODEX_REASONING = os.environ.get(
     "INTERVIEW_CODEX_REASONING",
@@ -681,6 +680,14 @@ SESSION_RESPONSE_NEW = 1
 SESSION_RESPONSE_ARCHIVE = 2
 
 
+def moonshine_asr_backend(language):
+    return (
+        "moonshine-base-ja"
+        if language == "ja"
+        else "moonshine-small-streaming"
+    )
+
+
 def session_list_row(session):
     settings = normalize_codex_settings(session.get("settings"))
     created = session.get("created_at") or session.get("name", "")
@@ -689,6 +696,7 @@ def session_list_row(session):
     return (
         created,
         session["thread_id"],
+        "Japanese" if settings["stt_language"] == "ja" else "English",
         settings["codex_model"],
         settings["codex_reasoning_effort"],
     )
@@ -754,7 +762,7 @@ class SessionChooserDialog(Gtk.Dialog):
         self.sessions_by_thread_id = {
             session["thread_id"]: session for session in sessions
         }
-        self.model = Gtk.ListStore(str, str, str, str)
+        self.model = Gtk.ListStore(str, str, str, str, str)
         preferred_path = None
         for index, session in enumerate(sessions):
             self.model.append(session_list_row(session))
@@ -777,10 +785,13 @@ class SessionChooserDialog(Gtk.Dialog):
             Gtk.TreeViewColumn("세션 ID", id_renderer, text=1)
         )
         self.tree.append_column(
-            Gtk.TreeViewColumn("Model", Gtk.CellRendererText(), text=2)
+            Gtk.TreeViewColumn("Language", Gtk.CellRendererText(), text=2)
         )
         self.tree.append_column(
-            Gtk.TreeViewColumn("Effort", Gtk.CellRendererText(), text=3)
+            Gtk.TreeViewColumn("Model", Gtk.CellRendererText(), text=3)
+        )
+        self.tree.append_column(
+            Gtk.TreeViewColumn("Effort", Gtk.CellRendererText(), text=4)
         )
         self.tree.connect("row-activated", self._row_activated)
         self.tree.connect("key-press-event", self._key_pressed)
@@ -1070,6 +1081,23 @@ class PreparationChatDialog(Gtk.Dialog):
         self.fast_combo.append("on", "On")
         settings_row.pack_start(self.fast_combo, False, False, 0)
         content.pack_start(settings_row, False, False, 0)
+
+        stt_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+        stt_row.pack_start(Gtk.Label(label="STT Language:"), False, False, 0)
+        self.stt_language_combo = CompactMenuSelector(
+            self._stt_language_changed
+        )
+        self.stt_language_combo.set_size_request(140, -1)
+        self.stt_language_combo.append("en", "English")
+        self.stt_language_combo.append("ja", "Japanese")
+        self.stt_language_combo.set_active_id(
+            self.codex_settings["stt_language"]
+        )
+        stt_row.pack_start(self.stt_language_combo, False, False, 0)
+        content.pack_start(stt_row, False, False, 0)
         self._set_model_catalog(self.codex_models, persist=False)
         self._set_settings_sensitive(False)
 
@@ -1210,6 +1238,7 @@ class PreparationChatDialog(Gtk.Dialog):
         self.model_combo.set_sensitive(sensitive)
         self.reasoning_combo.set_sensitive(sensitive)
         self.fast_combo.set_sensitive(sensitive)
+        self.stt_language_combo.set_sensitive(sensitive)
 
     def _set_model_catalog(self, models, persist):
         visible = [model for model in models if not model.get("hidden", False)]
@@ -1311,6 +1340,15 @@ class PreparationChatDialog(Gtk.Dialog):
             self._updating_settings_ui = True
             combo.set_active_id("off")
             self._updating_settings_ui = False
+        self._persist_settings()
+
+    def _stt_language_changed(self, combo):
+        if self._updating_settings_ui:
+            return
+        language = combo.get_active_id()
+        if language not in {"en", "ja"}:
+            return
+        self.codex_settings["stt_language"] = language
         self._persist_settings()
 
     def _persist_settings(self):
@@ -1922,6 +1960,7 @@ class InterviewApp:
             "codex_reasoning_effort"
         ]
         self.codex_fast_mode = live_codex_settings["codex_fast_mode"]
+        self.stt_language = live_codex_settings["stt_language"]
         self.codex_enabled = CODEX_ENABLED
         self.exit_action = None
         self.running = True
@@ -2009,10 +2048,10 @@ class InterviewApp:
             "app_version": APP_VERSION,
             "remote_source": remote_source,
             "microphone_capture": False,
-            "asr_backend": "moonshine-small-streaming",
+            "asr_backend": moonshine_asr_backend(self.stt_language),
             "moonshine_update_interval_ms": 500,
             "moonshine_word_timestamps": False,
-            "language": LANGUAGE,
+            "language": self.stt_language,
             "codex_enabled": self.codex_enabled,
             "codex_model": self.codex_model,
             "codex_reasoning_effort": self.codex_reasoning_effort,
@@ -2042,7 +2081,7 @@ class InterviewApp:
             self._moonshine_error,
             on_auto_commit=self._moonshine_auto_commit,
             dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
-            language=LANGUAGE,
+            language=self.stt_language,
         )
         self.codex_worker = None
         if self.codex_enabled:
@@ -2051,7 +2090,10 @@ class InterviewApp:
                 self.codex_thread_id,
                 live_codex_settings,
             )
-        self.remote_window.set_status("Moonshine Small loading…")
+        model_label = (
+            "Moonshine Small" if self.stt_language == "en" else "Moonshine Base JA"
+        )
+        self.remote_window.set_status(f"{model_label} loading…")
         self.asr_worker.start()
 
     def _install_css(self):
@@ -2306,7 +2348,9 @@ class InterviewApp:
             "commit_source": commit_source,
             "text": question_text,
             "stt_seconds": round(elapsed, 3),
-            "asr_backend": "moonshine-small-streaming",
+            "asr_backend": moonshine_asr_backend(
+                getattr(self, "stt_language", "en")
+            ),
             "transcript_lines": result["lines"],
             "captured_sample_cursor": result["captured_sample_cursor"],
             "target_sample_cursor": result["target_sample_cursor"],
@@ -2459,7 +2503,9 @@ class InterviewApp:
             "previous_target_sample_cursor": base["target_sample_cursor"],
             "stt_seconds": round(elapsed, 3),
             "f9_to_question_ms": round(elapsed * 1000, 1),
-            "asr_backend": "moonshine-small-streaming",
+            "asr_backend": moonshine_asr_backend(
+                getattr(self, "stt_language", "en")
+            ),
             "transcript_lines": result["lines"],
             "captured_sample_cursor": result["captured_sample_cursor"],
             "target_sample_cursor": result["target_sample_cursor"],
@@ -2874,7 +2920,9 @@ PREVIOUS INCOMPLETE QUESTION:
             "question": question_number,
             "target_sample_cursor": target_cursor,
             "trigger_absolute_seconds": round(target_cursor / SAMPLE_RATE, 3),
-            "asr_backend": "moonshine-small-streaming",
+            "asr_backend": moonshine_asr_backend(
+                getattr(self, "stt_language", "en")
+            ),
         })
         self.answer_window.set_status("Transcribing question…")
         return False
@@ -2933,7 +2981,9 @@ PREVIOUS INCOMPLETE QUESTION:
             "previous_target_sample_cursor": base["target_sample_cursor"],
             "target_sample_cursor": target_cursor,
             "trigger_absolute_seconds": round(target_cursor / SAMPLE_RATE, 3),
-            "asr_backend": "moonshine-small-streaming",
+            "asr_backend": moonshine_asr_backend(
+                getattr(self, "stt_language", "en")
+            ),
         })
         self.answer_window.set_status("Transcribing continuation…")
         return False

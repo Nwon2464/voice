@@ -13,6 +13,10 @@ import numpy as np
 
 SAMPLE_RATE = 16_000
 UPDATE_INTERVAL_SECONDS = 0.5
+MOONSHINE_MODEL_BY_LANGUAGE = {
+    "en": ("small-streaming-en", "SMALL_STREAMING"),
+    "ja": ("base-ja", "BASE"),
+}
 AUTO_SILENCE_MS = int(os.environ.get("INTERVIEW_AUTO_SILENCE_MS", "1500"))
 AUTO_SILENCE_RMS_THRESHOLD = int(
     os.environ.get("INTERVIEW_AUTO_SILENCE_RMS_THRESHOLD", "250")
@@ -67,6 +71,8 @@ class MoonshineStreamingWorker:
         self.engine_factory = engine_factory
         self.force_update_flag = force_update_flag
         self.language = language
+        if language not in MOONSHINE_MODEL_BY_LANGUAGE:
+            raise ValueError(f"unsupported Moonshine language: {language}")
         self.auto_silence_samples = int(SAMPLE_RATE * auto_silence_ms / 1000)
         self.auto_silence_rms_threshold = auto_silence_rms_threshold
         if self.auto_silence_samples <= 0:
@@ -170,7 +176,8 @@ class MoonshineStreamingWorker:
         from moonshine_voice import ModelArch, Transcriber, get_model_for_language
         from moonshine_voice.transcriber import MOONSHINE_FLAG_FORCE_UPDATE
 
-        arch = ModelArch.SMALL_STREAMING
+        _model_name, arch_name = MOONSHINE_MODEL_BY_LANGUAGE[self.language]
+        arch = getattr(ModelArch, arch_name)
         model_path, returned_arch = get_model_for_language(self.language, arch)
         if returned_arch != arch:
             raise RuntimeError(
@@ -341,8 +348,9 @@ class MoonshineStreamingWorker:
                 preview_lines.clear()
                 stream = self._new_stream(transcriber, listener)
 
+            model_name, _arch_name = MOONSHINE_MODEL_BY_LANGUAGE[self.language]
             self.dispatch(self.on_ready, {
-                "model": "small-streaming",
+                "model": model_name,
                 "language": self.language,
                 "load_seconds": time.perf_counter() - load_started,
                 "update_interval_ms": round(UPDATE_INTERVAL_SECONDS * 1000),

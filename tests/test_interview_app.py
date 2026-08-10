@@ -274,19 +274,21 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertEqual(captured["effort"], "high")
         self.assertTrue(captured["fast_mode"])
 
-    def test_session_list_row_displays_created_model_and_effort(self):
+    def test_session_list_row_displays_language_model_and_effort(self):
         row = interview_app.session_list_row({
             "thread_id": "thread-123",
             "created_at": "2026-08-10T17:30:45+09:00",
             "settings": {
                 "codex_model": "gpt-5.6-luna",
                 "codex_reasoning_effort": "medium",
+                "stt_language": "ja",
             },
         })
 
         self.assertEqual(row, (
             "2026-08-10 17:30",
             "thread-123",
+            "Japanese",
             "gpt-5.6-luna",
             "medium",
         ))
@@ -298,18 +300,21 @@ class CodexLatestOnlyTest(unittest.TestCase):
         dialog.model_combo = _FakeSensitiveWidget()
         dialog.reasoning_combo = _FakeSensitiveWidget()
         dialog.fast_combo = _FakeSensitiveWidget()
+        dialog.stt_language_combo = _FakeSensitiveWidget()
 
         dialog._set_settings_sensitive(False)
 
         self.assertFalse(dialog.model_combo.sensitive)
         self.assertFalse(dialog.reasoning_combo.sensitive)
         self.assertFalse(dialog.fast_combo.sensitive)
+        self.assertFalse(dialog.stt_language_combo.sensitive)
 
         dialog._set_settings_sensitive(True)
 
         self.assertTrue(dialog.model_combo.sensitive)
         self.assertTrue(dialog.reasoning_combo.sensitive)
         self.assertTrue(dialog.fast_combo.sensitive)
+        self.assertTrue(dialog.stt_language_combo.sensitive)
 
     def test_unsupported_model_cannot_reach_live_snapshot_with_fast_enabled(self):
         dialog = interview_app.PreparationChatDialog.__new__(
@@ -324,6 +329,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
             "codex_model": "gpt-5.2",
             "codex_reasoning_effort": "low",
             "codex_fast_mode": True,
+            "stt_language": "en",
         }
 
         snapshot = dialog.settings_snapshot()
@@ -794,6 +800,44 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         ])
         self.assertEqual(app.last_commit_state["question_number"], 1)
         self.assertEqual(app.question_count, 1)
+
+    def test_japanese_question_f8_and_f9_logs_use_base_ja_backend(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            log_path = Path(directory) / "session.jsonl"
+            app = self._app(log_path=log_path)
+            app.stt_language = "ja"
+            self._commit(app, 1, "質問です", 10_000, "f8")
+            self._continue(app, "続きです", 20_000)
+            app.last_f8_at = None
+            app.last_f9_at = None
+            app.moonshine_ready = True
+            app.audio_started = True
+            app.asr_worker = SimpleNamespace(
+                request_snapshot=lambda _cursor, _callback: True,
+            )
+            cursors = iter((30_000, 40_000))
+            app.remote_audio = SimpleNamespace(
+                capture_sample_cursor_and=lambda enqueue: (
+                    lambda cursor: (cursor, enqueue(cursor))
+                )(next(cursors))
+            )
+
+            app._on_f8()
+            app._on_f9()
+
+            events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            asr_events = [
+                event for event in events
+                if event["event"] in {"question", "f8_trigger", "f9_trigger"}
+            ]
+            self.assertEqual(len(asr_events), 4)
+            self.assertEqual(
+                {event["asr_backend"] for event in asr_events},
+                {"moonshine-base-ja"},
+            )
 
     def test_silence_a_then_f8_b_stays_as_two_questions(self):
         app = self._app()

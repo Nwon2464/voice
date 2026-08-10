@@ -7,11 +7,16 @@ from pathlib import Path
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "low"
+DEFAULT_STT_LANGUAGE = "en"
+SUPPORTED_STT_LANGUAGES = {"en", "ja"}
 
 
 def normalize_codex_settings(settings=None):
-    """Return the supported per-session Codex settings with safe defaults."""
+    """Return supported per-session settings with safe legacy defaults."""
     settings = settings if isinstance(settings, dict) else {}
+    stt_language = settings.get("stt_language")
+    if stt_language not in SUPPORTED_STT_LANGUAGES:
+        stt_language = DEFAULT_STT_LANGUAGE
     return {
         "codex_model": settings.get("codex_model") or DEFAULT_CODEX_MODEL,
         "codex_reasoning_effort": (
@@ -19,6 +24,7 @@ def normalize_codex_settings(settings=None):
             or DEFAULT_CODEX_REASONING_EFFORT
         ),
         "codex_fast_mode": settings.get("codex_fast_mode") is True,
+        "stt_language": stt_language,
     }
 
 

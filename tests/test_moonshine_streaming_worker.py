@@ -1,7 +1,10 @@
+import sys
 import threading
 import time
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from moonshine_streaming_worker import (
     MoonshineStreamingWorker,
@@ -104,6 +107,60 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
         lines = [{"text": "one"}, {"text": "two"}]
         self.assertEqual(lines_display_text(lines), "one\ntwo")
         self.assertEqual(lines_question_text(lines), "one two")
+
+    def test_default_english_uses_small_streaming_model_arch(self):
+        self._assert_default_model_selection(
+            language="en",
+            arch_name="SMALL_STREAMING",
+        )
+
+    def test_japanese_uses_base_model_arch(self):
+        self._assert_default_model_selection(
+            language="ja",
+            arch_name="BASE",
+        )
+
+    def _assert_default_model_selection(self, language, arch_name):
+        selected = {}
+        model_arch = SimpleNamespace(
+            SMALL_STREAMING=object(),
+            BASE=object(),
+        )
+
+        def get_model_for_language(selected_language, selected_arch):
+            selected["language"] = selected_language
+            selected["arch"] = selected_arch
+            return "/models/test", selected_arch
+
+        class Transcriber:
+            def __init__(self, **kwargs):
+                selected["transcriber"] = kwargs
+
+        moonshine_module = SimpleNamespace(
+            ModelArch=model_arch,
+            Transcriber=Transcriber,
+            get_model_for_language=get_model_for_language,
+        )
+        transcriber_module = SimpleNamespace(MOONSHINE_FLAG_FORCE_UPDATE=99)
+        worker = MoonshineStreamingWorker(
+            lambda *_args: None,
+            lambda *_args: None,
+            lambda *_args: None,
+            language=language,
+        )
+
+        with patch.dict(sys.modules, {
+            "moonshine_voice": moonshine_module,
+            "moonshine_voice.transcriber": transcriber_module,
+        }):
+            _transcriber, force_flag = worker._default_engine_factory()
+
+        expected_arch = getattr(model_arch, arch_name)
+        self.assertEqual(selected["language"], language)
+        self.assertIs(selected["arch"], expected_arch)
+        self.assertIs(selected["transcriber"]["model_arch"], expected_arch)
+        self.assertEqual(selected["transcriber"]["model_path"], "/models/test")
+        self.assertEqual(force_flag, 99)
 
     def test_pcm_barrier_force_snapshot_and_stream_reset(self):
         transcriber = _Transcriber()
