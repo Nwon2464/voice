@@ -5,6 +5,23 @@ from datetime import datetime
 from pathlib import Path
 
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_REASONING_EFFORT = "low"
+
+
+def normalize_codex_settings(settings=None):
+    """Return the supported per-session Codex settings with safe defaults."""
+    settings = settings if isinstance(settings, dict) else {}
+    return {
+        "codex_model": settings.get("codex_model") or DEFAULT_CODEX_MODEL,
+        "codex_reasoning_effort": (
+            settings.get("codex_reasoning_effort")
+            or DEFAULT_CODEX_REASONING_EFFORT
+        ),
+        "codex_fast_mode": settings.get("codex_fast_mode") is True,
+    }
+
+
 class SessionStore:
     """Persist the app-owned thread ids shown by the session chooser."""
 
@@ -13,7 +30,7 @@ class SessionStore:
 
     def active(self):
         sessions = [
-            session
+            self._with_settings(session)
             for session in self._load()
             if not session.get("archived_at")
         ]
@@ -23,7 +40,7 @@ class SessionStore:
             reverse=True,
         )
 
-    def add(self, thread_id, name, timestamp=None):
+    def add(self, thread_id, name, timestamp=None, settings=None):
         now = timestamp or self._now()
         sessions = self._load()
         sessions = [
@@ -35,8 +52,16 @@ class SessionStore:
             "created_at": now,
             "last_used_at": now,
             "archived_at": None,
+            "settings": normalize_codex_settings(settings),
         })
         self._save(sessions)
+
+    def update_settings(self, thread_id, settings):
+        return self._update(
+            thread_id,
+            "settings",
+            normalize_codex_settings(settings),
+        )
 
     def mark_used(self, thread_id, timestamp=None):
         return self._update(
@@ -71,6 +96,14 @@ class SessionStore:
             return []
         sessions = payload.get("sessions", []) if isinstance(payload, dict) else []
         return [session for session in sessions if isinstance(session, dict)]
+
+    @staticmethod
+    def _with_settings(session):
+        normalized = dict(session)
+        normalized["settings"] = normalize_codex_settings(
+            normalized.get("settings")
+        )
+        return normalized
 
     def _save(self, sessions):
         self.path.parent.mkdir(parents=True, exist_ok=True)

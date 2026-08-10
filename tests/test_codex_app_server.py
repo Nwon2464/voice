@@ -11,6 +11,29 @@ from codex_app_server import (
 
 
 class CodexAppServerClientTest(unittest.TestCase):
+    def test_fast_feature_flag_is_selected_at_app_server_startup(self):
+        off = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/usr/bin/codex",
+            fast_mode=False,
+        )
+        on = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/usr/bin/codex",
+            fast_mode=True,
+        )
+
+        self.assertIn(["--disable", "fast_mode"], [off._command()[i:i + 2]
+                      for i in range(len(off._command()) - 1)])
+        self.assertIn(["--enable", "fast_mode"], [on._command()[i:i + 2]
+                      for i in range(len(on._command()) - 1)])
+
     def test_final_answer_is_preferred_over_commentary(self):
         messages = [
             {"phase": "commentary", "text": "Working..."},
@@ -116,6 +139,33 @@ class CodexAppServerClientTest(unittest.TestCase):
         client._request.assert_called_once_with(
             "thread/inject_items",
             {"threadId": "thread-new", "items": items},
+            timeout=15,
+        )
+
+    def test_list_models_requests_visible_catalog_and_filters_hidden_rows(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = None
+        client._request = Mock(return_value={
+            "data": [
+                {"model": "visible", "hidden": False},
+                {"model": "hidden", "hidden": True},
+            ],
+            "nextCursor": None,
+        })
+
+        self.assertEqual(client.list_models(), [
+            {"model": "visible", "hidden": False},
+        ])
+        client._request.assert_called_once_with(
+            "model/list",
+            {"includeHidden": False},
             timeout=15,
         )
 

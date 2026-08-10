@@ -1,2 +1,2 @@
-faster-whisper==1.2.1
+moonshine-voice==0.0.69
 numpy==2.2.6

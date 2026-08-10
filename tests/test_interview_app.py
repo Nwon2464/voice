@@ -1,48 +1,14 @@
-import importlib.util
+import io
 import json
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-import numpy as np
-
-HAS_FASTER_WHISPER = importlib.util.find_spec("faster_whisper") is not None
-if HAS_FASTER_WHISPER:
-    import interview_app
-
-
-class _Segment:
-    text = "final utterance before shutdown"
-    words = []
-
-
-class _FakeInfo:
-    language = "en"
-
-
-class _FakeWhisperModel:
-    def __init__(self, *_args, **_kwargs):
-        pass
-
-    def transcribe(self, *_args, **_kwargs):
-        return iter([_Segment()]), _FakeInfo()
-
-
-class _FakeRemoteAudio:
-    def __init__(self):
-        self.requeued = []
-
-    def requeue_question_remainder(
-        self,
-        pcm_remainder,
-        remainder_start,
-        source_end,
-    ):
-        self.requeued.append((pcm_remainder, remainder_start, source_end))
-        return True
+import interview_app
 
 
 class _LatestOnlyCodexClient:
@@ -161,6 +127,8 @@ class _CaptureLatestWorker:
 class _FakeAnswerWindow:
     def __init__(self):
         self.status = None
+        self.boundary_status = None
+        self.response_status = None
         self.text = None
         self.stream = ""
 
@@ -170,6 +138,12 @@ class _FakeAnswerWindow:
     def set_text(self, text):
         self.text = text
         self.stream = text
+
+    def set_boundary_status(self, status):
+        self.boundary_status = status
+
+    def set_response_status(self, status):
+        self.response_status = status
 
     def start_stream(self, text):
         self.stream = text
@@ -181,9 +155,36 @@ class _FakeAnswerWindow:
         self.stream = text
 
 
-class _FakePreviewWorker:
-    def start(self):
-        return False
+class _FakeVisibleWindow:
+    def __init__(self, text, position, size, scroll):
+        self.visible = True
+        self.text = text
+        self.position = position
+        self.size = size
+        self.scroll = scroll
+
+    def hide(self):
+        self.visible = False
+
+    def show(self):
+        self.visible = True
+
+
+class _FakeControlWindow:
+    def __init__(self):
+        self.visible = True
+        self.live_windows_hidden = None
+
+    def set_live_windows_hidden(self, hidden):
+        self.live_windows_hidden = hidden
+
+
+class _FakeSensitiveWidget:
+    def __init__(self):
+        self.sensitive = None
+
+    def set_sensitive(self, sensitive):
+        self.sensitive = sensitive
 
 
 def _wait_until(predicate, timeout=2):
@@ -195,10 +196,6 @@ def _wait_until(predicate, timeout=2):
     return False
 
 
-@unittest.skipUnless(
-    HAS_FASTER_WHISPER,
-    "faster_whisper is available in the application virtualenv",
-)
 class CodexLatestOnlyTest(unittest.TestCase):
     def setUp(self):
         _LatestOnlyCodexClient.instances.clear()
@@ -245,6 +242,96 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertGreaterEqual(client.interrupt_calls, 1)
         self.assertEqual(len(callbacks), 1)
         self.assertIsNotNone(callbacks[0][1])
+
+    def test_live_worker_receives_selected_model_and_effort_snapshot(self):
+        captured = {}
+
+        class FakeWorker:
+            def __init__(self, on_ready, thread_id=None, **kwargs):
+                captured.update({
+                    "on_ready": on_ready,
+                    "thread_id": thread_id,
+                    **kwargs,
+                })
+
+        callback = lambda *_args: False
+        settings = {
+            "codex_model": "gpt-5.6-terra",
+            "codex_reasoning_effort": "high",
+            "codex_fast_mode": True,
+        }
+        with patch.object(interview_app, "CodexWorker", FakeWorker):
+            worker = interview_app.create_live_codex_worker(
+                callback,
+                "thread-existing",
+                dict(settings),
+            )
+
+        settings["codex_model"] = "gpt-5.6-luna"
+        self.assertIsInstance(worker, FakeWorker)
+        self.assertEqual(captured["thread_id"], "thread-existing")
+        self.assertEqual(captured["model"], "gpt-5.6-terra")
+        self.assertEqual(captured["effort"], "high")
+        self.assertTrue(captured["fast_mode"])
+
+    def test_session_list_row_displays_created_model_and_effort(self):
+        row = interview_app.session_list_row({
+            "thread_id": "thread-123",
+            "created_at": "2026-08-10T17:30:45+09:00",
+            "settings": {
+                "codex_model": "gpt-5.6-luna",
+                "codex_reasoning_effort": "medium",
+            },
+        })
+
+        self.assertEqual(row, (
+            "2026-08-10 17:30",
+            "thread-123",
+            "gpt-5.6-luna",
+            "medium",
+        ))
+
+    def test_preparation_settings_wait_for_catalog_before_enabling(self):
+        dialog = interview_app.PreparationChatDialog.__new__(
+            interview_app.PreparationChatDialog
+        )
+        dialog.model_combo = _FakeSensitiveWidget()
+        dialog.reasoning_combo = _FakeSensitiveWidget()
+        dialog.fast_combo = _FakeSensitiveWidget()
+
+        dialog._set_settings_sensitive(False)
+
+        self.assertFalse(dialog.model_combo.sensitive)
+        self.assertFalse(dialog.reasoning_combo.sensitive)
+        self.assertFalse(dialog.fast_combo.sensitive)
+
+        dialog._set_settings_sensitive(True)
+
+        self.assertTrue(dialog.model_combo.sensitive)
+        self.assertTrue(dialog.reasoning_combo.sensitive)
+        self.assertTrue(dialog.fast_combo.sensitive)
+
+    def test_unsupported_model_cannot_reach_live_snapshot_with_fast_enabled(self):
+        dialog = interview_app.PreparationChatDialog.__new__(
+            interview_app.PreparationChatDialog
+        )
+        dialog.codex_models = [{
+            "model": "gpt-5.2",
+            "additionalSpeedTiers": [],
+            "serviceTiers": [],
+        }]
+        dialog.codex_settings = {
+            "codex_model": "gpt-5.2",
+            "codex_reasoning_effort": "low",
+            "codex_fast_mode": True,
+        }
+
+        snapshot = dialog.settings_snapshot()
+
+        self.assertFalse(snapshot["codex_fast_mode"])
+        self.assertFalse(interview_app.model_supports_fast(
+            dialog.codex_models[0]
+        ))
 
     def test_superseded_stream_is_hidden_and_pending_context_is_preserved(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -298,40 +385,32 @@ class CodexLatestOnlyTest(unittest.TestCase):
             self.assertEqual(q2["generation"], 2)
             self.assertEqual(q3["generation"], 3)
 
-    def test_empty_final_transcript_does_not_replace_codex_turn(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            app = interview_app.InterviewApp.__new__(
-                interview_app.InterviewApp
-            )
-            app.log_path = Path(directory) / "session.jsonl"
-            app.running = True
-            app.codex_enabled = True
-            app.codex_request_count = 1
-            app.active_codex_generation = 1
-            app.codex_request_states = {
-                1: {
-                    "request": 1,
-                    "question": 1,
-                    "status": "running",
-                    "spoken": None,
-                }
-            }
-            app.answer_window = _FakeAnswerWindow()
-            app.remote_window = _FakeAnswerWindow()
-            app.preview_worker = _FakePreviewWorker()
-            app.codex_worker = _CaptureLatestWorker()
-            marker = {"question": 2, "committed": False}
-            state = {"utterance": 2, "audio_file": "interviewer_002.wav"}
-            result = {"text": "", "elapsed": 0.1, "details": {}}
+    def test_normal_request_is_thinking_until_current_first_visible(self):
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.log_path = None
+        app.running = True
+        app.codex_request_count = 0
+        app.active_codex_generation = 0
+        app.codex_request_states = {}
+        app.codex_state_lock = threading.Lock()
+        app.codex_context_cursor = 0
+        app.conversation_context = [("INTERVIEWER", "Why this role?")]
+        app.answer_window = _FakeAnswerWindow()
+        app.codex_worker = _CaptureLatestWorker()
 
-            app._commit_question(marker, state, result, None)
+        app._request_codex_answer(1, "Why this role?")
 
-            self.assertEqual(app.codex_worker.jobs, [])
-            self.assertEqual(app.active_codex_generation, 1)
-            self.assertEqual(
-                app.codex_request_states[1]["status"],
-                "running",
-            )
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_THINKING,
+        )
+        job = app.codex_worker.jobs[0]
+        job["on_start"]()
+        job["on_delta"]("Current answer", 0.1)
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_READY,
+        )
 
     def test_recovery_failure_marks_codex_unavailable_but_keeps_app_running(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -490,172 +569,474 @@ class CodexLatestOnlyTest(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(
-    HAS_FASTER_WHISPER,
-    "faster_whisper is available in the application virtualenv",
-)
-class InterviewAppShutdownTest(unittest.TestCase):
-    def test_pending_utterance_is_logged_before_worker_stops(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            root = Path(directory)
-            app = interview_app.InterviewApp.__new__(
-                interview_app.InterviewApp
-            )
-            app.session_dir = root
-            app.log_path = root / "session.jsonl"
-            app.interviewer_utterance_count = 0
-            app.remote_utterances = []
-            app.pending_questions = []
-            app.transcript_lock = threading.Lock()
+class MoonshineAppIntegrationTest(unittest.TestCase):
+    @staticmethod
+    def _result(text, cursor):
+        return {
+            "text": text,
+            "display_text": text,
+            "lines": [{"text": text}] if text else [],
+            "committed": True,
+            "captured_sample_cursor": cursor,
+            "target_sample_cursor": cursor,
+            "queued_sample_cursor": cursor,
+            "consumed_sample_cursor": cursor,
+            "cursor_complete": True,
+            "audio_drop_samples": 0,
+            "max_backlog_ms": 20.0,
+            "barrier_wait_ms": 5.0,
+            "force_update_ms": 2.0,
+        }
 
-            with patch.object(
-                interview_app,
-                "WhisperModel",
-                _FakeWhisperModel,
-            ):
-                app.worker = interview_app.WhisperWorker(
-                    lambda *_args: False
-                )
-                pcm_audio = bytes(32_000)
-                app._final_audio(
-                    "INTERVIEWER",
-                    pcm_audio,
-                    0,
-                    len(pcm_audio),
-                    {"vad_method": "test"},
-                )
-                app.worker.stop()
+    @staticmethod
+    def _app(codex_enabled=False, log_path=None):
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.running = True
+        app.log_path = log_path
+        app.codex_enabled = codex_enabled
+        app.question_count = 0
+        app.remote_window = _FakeAnswerWindow()
+        app.answer_window = _FakeAnswerWindow()
+        app.conversation_context = []
+        app.last_commit_state = None
+        if codex_enabled:
+            app.codex_request_count = 0
+            app.active_codex_generation = 0
+            app.codex_request_states = {}
+            app.codex_state_lock = threading.Lock()
+            app.codex_context_cursor = 0
+            app.codex_worker = _CaptureLatestWorker()
+        return app
+
+    def _commit(self, app, number, text, cursor, source):
+        app.question_count = max(app.question_count, number)
+        app._moonshine_question_ready(
+            number,
+            time.perf_counter(),
+            self._result(text, cursor),
+            None,
+            commit_source=source,
+        )
+
+    def _continue(self, app, text, cursor):
+        base = dict(app.last_commit_state)
+        app._moonshine_continuation_ready(
+            base,
+            time.perf_counter(),
+            self._result(text, cursor),
+            None,
+        )
+
+    def test_f8_snapshot_commits_one_question_and_one_codex_request(self):
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.running = True
+        app.log_path = None
+        app.codex_enabled = True
+        app.remote_window = _FakeAnswerWindow()
+        app.answer_window = _FakeAnswerWindow()
+        app.conversation_context = []
+        requests = []
+        app._request_codex_answer = lambda number, text: requests.append(
+            (number, text)
+        )
+        result = {
+            "text": "Why this role?",
+            "display_text": "Why this role?",
+            "lines": [{"text": "Why this role?"}],
+            "captured_sample_cursor": 16_000,
+            "target_sample_cursor": 16_000,
+            "queued_sample_cursor": 16_000,
+            "consumed_sample_cursor": 16_000,
+            "cursor_complete": True,
+            "audio_drop_samples": 0,
+            "max_backlog_ms": 20.0,
+            "barrier_wait_ms": 5.0,
+            "force_update_ms": 2.0,
+        }
+
+        app._moonshine_question_ready(
+            1,
+            time.perf_counter(),
+            result,
+            None,
+        )
+
+        self.assertEqual(
+            app.conversation_context,
+            [("INTERVIEWER", "Why this role?")],
+        )
+        self.assertEqual(requests, [(1, "Why this role?")])
+        self.assertEqual(app.remote_window.text, "Why this role?")
+        self.assertEqual(
+            app.remote_window.boundary_status,
+            interview_app.BOUNDARY_STATUS_F8,
+        )
+
+    def test_moonshine_ready_sets_listening_boundary_status(self):
+        app = self._app()
+        app.moonshine_ready = False
+        app.audio_started = True
+
+        app._moonshine_ready({
+            "model": "small-streaming",
+            "language": "en",
+            "load_seconds": 0.1,
+            "update_interval_ms": 500,
+        }, None)
+
+        self.assertEqual(
+            app.remote_window.boundary_status,
+            interview_app.BOUNDARY_STATUS_LISTENING,
+        )
+
+    def test_new_transcript_activity_restores_listening_boundary_status(self):
+        app = self._app()
+        app.remote_window.set_boundary_status(interview_app.BOUNDARY_STATUS_AUTO)
+
+        app._moonshine_preview({"text": "New interviewer speech", "lines": []})
+
+        self.assertEqual(
+            app.remote_window.boundary_status,
+            interview_app.BOUNDARY_STATUS_LISTENING,
+        )
+
+    def test_auto_commit_logs_silence_source_with_codex_disabled(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+            app.running = True
+            app.log_path = Path(directory) / "session.jsonl"
+            app.codex_enabled = False
+            app.question_count = 0
+            app.remote_window = _FakeAnswerWindow()
+            app.answer_window = _FakeAnswerWindow()
+            app.conversation_context = []
+            result = {
+                "text": "Why this role?",
+                "display_text": "Why this role?",
+                "lines": [{"text": "Why this role?"}],
+                "commit_requested_at": time.perf_counter(),
+                "committed": True,
+                "captured_sample_cursor": 24_000,
+                "target_sample_cursor": 24_000,
+                "queued_sample_cursor": 24_000,
+                "consumed_sample_cursor": 24_000,
+                "cursor_complete": True,
+                "audio_drop_samples": 0,
+                "max_backlog_ms": 20.0,
+                "barrier_wait_ms": 0.0,
+                "force_update_ms": 2.0,
+            }
+
+            app._moonshine_auto_commit(result, None)
 
             events = [
                 json.loads(line)
-                for line in app.log_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                for line in app.log_path.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(list(root.glob("interviewer_*.wav"))), 1)
-            self.assertEqual(len(events), 1)
-            self.assertEqual(events[0]["event"], "utterance")
+            question = next(event for event in events if event["event"] == "question")
+            self.assertEqual(question["commit_source"], "silence")
+            self.assertEqual(app.question_count, 1)
+            self.assertEqual(app.answer_window.status, "Codex disabled · question logged only")
             self.assertEqual(
-                events[0]["text"],
-                "final utterance before shutdown",
+                app.remote_window.boundary_status,
+                interview_app.BOUNDARY_STATUS_AUTO,
             )
-            self.assertFalse(app.worker.thread.is_alive())
 
-    def test_final_audio_requeues_bytes_after_returned_replay_start(self):
+    def test_silence_a_then_f9_b_replaces_a_with_combined_question(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            root = Path(directory)
-            app = interview_app.InterviewApp.__new__(
-                interview_app.InterviewApp
+            log_path = Path(directory) / "session.jsonl"
+            app = self._app(log_path=log_path)
+            self._commit(app, 1, "Tell me about a project where you", 16_000, "silence")
+
+            self._continue(
+                app,
+                "had to solve a difficult technical problem.",
+                32_000,
             )
-            app.session_dir = root
-            app.log_path = root / "session.jsonl"
-            app.interviewer_utterance_count = 0
-            app.remote_utterances = []
-            app.pending_questions = [{
-                "trigger": 16_000,
-                "suggested_start": 0,
-                "target_span": None,
-                "source": "active",
-                "question": 1,
-                "committed": False,
-            }]
-            app.transcript_lock = threading.Lock()
-            app.remote_audio = _FakeRemoteAudio()
-            pcm_audio = bytes(range(256)) * 125
 
-            with patch.object(
-                interview_app,
-                "WhisperModel",
-                _FakeWhisperModel,
-            ):
-                app.worker = interview_app.WhisperWorker(
-                    lambda *_args: False
-                )
-                app._final_audio(
-                    "INTERVIEWER",
-                    pcm_audio,
-                    0,
-                    len(pcm_audio),
-                    {"vad_method": "test"},
-                )
-                app.worker.stop()
-
-            self.assertEqual(len(app.remote_audio.requeued), 1)
-            remainder, remainder_start, source_end = (
-                app.remote_audio.requeued[0]
+            combined = (
+                "Tell me about a project where you "
+                "had to solve a difficult technical problem."
             )
-            self.assertEqual(remainder, b"")
-            self.assertEqual(remainder_start, len(pcm_audio))
-            self.assertEqual(source_end, len(pcm_audio))
+            self.assertEqual(app.conversation_context, [("INTERVIEWER", combined)])
+            self.assertEqual(app.remote_window.text, combined)
+            self.assertEqual(
+                app.last_commit_state["commit_source"],
+                "f9_continuation",
+            )
+            events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            correction = [
+                event for event in events
+                if event.get("commit_source") == "f9_continuation"
+                and event["event"] == "question"
+            ][0]
+            self.assertEqual(correction["previous_question"], 1)
+            self.assertEqual(correction["previous_target_sample_cursor"], 16_000)
+            self.assertEqual(correction["text"], combined)
+            self.assertTrue(correction["cursor_complete"])
+            self.assertEqual(correction["audio_drop_samples"], 0)
+            self.assertEqual(
+                app.remote_window.boundary_status,
+                interview_app.BOUNDARY_STATUS_F9,
+            )
 
+    def test_f8_a_then_f9_b_replaces_a_with_combined_question(self):
+        app = self._app()
+        self._commit(app, 1, "What experience do you", 10_000, "f8")
 
-@unittest.skipUnless(
-    HAS_FASTER_WHISPER,
-    "faster_whisper is available in the application virtualenv",
-)
-class AudioRemainderReplayTest(unittest.TestCase):
-    def test_empty_snapshot_remainder_and_deferred_silence_emit_no_utterance(self):
-        stream = interview_app.AudioStream(
-            "INTERVIEWER",
-            "unused",
-            lambda *_args: None,
-            lambda *_args: None,
-            lambda *_args: None,
-        )
-        deferred_silence = np.zeros(16_000, dtype=np.int16).tobytes()
-        source_end = 50_000
-        stream.awaiting_question_boundary = True
-        stream.awaiting_question_end = source_end
-        stream.deferred_audio.extend(deferred_silence)
+        self._continue(app, "have with Python?", 20_000)
 
-        requeued = stream.requeue_question_remainder(
-            b"",
-            source_end,
-            source_end,
-        )
-        events = stream._process_replay()
+        self.assertEqual(app.conversation_context, [
+            ("INTERVIEWER", "What experience do you have with Python?"),
+        ])
+        self.assertEqual(app.last_commit_state["question_number"], 1)
+        self.assertEqual(app.question_count, 1)
 
-        self.assertTrue(requeued)
-        self.assertFalse(stream.active)
-        self.assertFalse(any(final for _preview, final in events))
+    def test_silence_a_then_f8_b_stays_as_two_questions(self):
+        app = self._app()
+        self._commit(app, 1, "Why this role?", 10_000, "silence")
+        self._commit(app, 2, "What are your strengths?", 20_000, "f8")
 
-    def test_remainder_precedes_deferred_audio_without_duplication(self):
-        stream = interview_app.AudioStream(
-            "INTERVIEWER",
-            "unused",
-            lambda *_args: None,
-            lambda *_args: None,
-            lambda *_args: None,
-        )
-        speech = np.full(1_600, 1_000, dtype=np.int16).tobytes()
-        remainder_silence = np.zeros(6_400, dtype=np.int16).tobytes()
-        deferred_silence = np.zeros(9_600, dtype=np.int16).tobytes()
-        remainder = speech + remainder_silence
-        source_end = 50_000
-        remainder_start = source_end - len(remainder)
-        stream.awaiting_question_boundary = True
-        stream.awaiting_question_end = source_end
-        stream.deferred_audio.extend(deferred_silence)
+        self.assertEqual(app.conversation_context, [
+            ("INTERVIEWER", "Why this role?"),
+            ("INTERVIEWER", "What are your strengths?"),
+        ])
+        self.assertEqual(app.last_commit_state["commit_source"], "f8")
 
-        requeued = stream.requeue_question_remainder(
-            remainder,
-            remainder_start,
-            source_end,
-        )
+    def test_f8_a_then_f8_b_stays_as_two_questions(self):
+        app = self._app()
+        self._commit(app, 1, "Why this role?", 10_000, "f8")
+        self._commit(app, 2, "What are your strengths?", 20_000, "f8")
 
-        self.assertTrue(requeued)
+        self.assertEqual(len(app.conversation_context), 2)
+        self.assertEqual(app.conversation_context[0][1], "Why this role?")
+        self.assertEqual(app.conversation_context[1][1], "What are your strengths?")
+
+    def test_empty_b_on_f9_does_not_alter_a_or_send_codex(self):
+        app = self._app(codex_enabled=True)
+        self._commit(app, 1, "Why this role?", 10_000, "silence")
+        original_state = dict(app.last_commit_state)
+        original_boundary_status = app.remote_window.boundary_status
+
+        self._continue(app, "", 20_000)
+
+        self.assertEqual(app.conversation_context, [
+            ("INTERVIEWER", "Why this role?"),
+        ])
+        self.assertEqual(app.last_commit_state, original_state)
+        self.assertEqual(len(app.codex_worker.jobs), 1)
         self.assertEqual(
-            bytes(stream.replay_audio),
-            remainder + deferred_silence,
+            app.remote_window.boundary_status,
+            original_boundary_status,
         )
-        events = stream._process_replay()
-        finals = [final for _preview, final in events if final is not None]
-        self.assertEqual(len(finals), 1)
-        pcm_audio, start, end, _details = finals[0]
-        self.assertEqual(pcm_audio, remainder + deferred_silence)
-        self.assertEqual(start, remainder_start)
-        self.assertEqual(end, remainder_start + len(pcm_audio))
 
+    def test_f9_with_no_valid_previous_question_fails_before_snapshot(self):
+        app = self._app()
+        app.last_f9_at = None
+        app.moonshine_ready = True
+        app.audio_started = True
+        snapshot_calls = []
+        app.remote_audio = SimpleNamespace(
+            capture_sample_cursor_and=lambda _enqueue: snapshot_calls.append(True)
+        )
+
+        app._on_f9()
+
+        self.assertEqual(snapshot_calls, [])
+        self.assertEqual(app.conversation_context, [])
+        self.assertEqual(app.answer_window.status, "No previous question to continue")
+
+    def test_completed_codex_a_is_explicitly_superseded_by_a_plus_b(self):
+        app = self._app(codex_enabled=True)
+        self._commit(app, 1, "Tell me about a project where you", 10_000, "silence")
+        first_job = app.codex_worker.jobs[0]
+        first_job["on_start"]()
+        first_job["callback"]({
+            "text": "Old answer",
+            "elapsed": 0.1,
+            "first_token_seconds": 0.05,
+            "first_visible_seconds": 0.05,
+            "stream_delta_count": 1,
+            "thread_id": "thread-test",
+            "turn_id": "turn-a",
+        }, None)
+        self.assertEqual(app.codex_request_states[1]["status"], "completed")
+
+        self._continue(app, "had to solve a difficult problem.", 20_000)
+
+        self.assertEqual(app.codex_request_states[1]["status"], "superseded")
+        self.assertFalse(app.codex_request_states[1]["spoken"])
+        self.assertEqual(app.active_codex_generation, 2)
+        correction_prompt = app.codex_worker.jobs[1]["prompt"]
+        self.assertIn("previous interviewer question was incomplete", correction_prompt)
+        self.assertIn("previous answer was NOT SPOKEN", correction_prompt)
+        self.assertIn(
+            "Tell me about a project where you had to solve a difficult problem.",
+            correction_prompt,
+        )
+
+    def test_running_codex_a_is_superseded_and_late_output_is_hidden(self):
+        app = self._app(codex_enabled=True)
+        self._commit(app, 1, "What would you", 10_000, "f8")
+        first_job = app.codex_worker.jobs[0]
+        first_job["on_start"]()
+        first_job["on_delta"]("Old partial", 0.05)
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_READY,
+        )
+
+        self._continue(app, "do in this situation?", 20_000)
+
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_UPDATING,
+        )
+        self.assertEqual(app.codex_request_states[1]["status"], "superseded")
+        self.assertFalse(app.codex_request_states[1]["spoken"])
+        self.assertEqual(app.answer_window.text, "")
+        first_job["on_delta"](" stale tail", 0.1)
+        first_job["callback"](None, RuntimeError("interrupted"))
+        self.assertEqual(
+            app.codex_request_states[1]["status"],
+            "superseded_finished",
+        )
+        self.assertEqual(app.answer_window.text, "")
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_UPDATING,
+        )
+        self.assertEqual(app.active_codex_generation, 2)
+        corrected_job = app.codex_worker.jobs[1]
+        corrected_job["on_start"]()
+        corrected_job["on_delta"]("Corrected answer", 0.1)
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_READY,
+        )
+
+    def test_f9_uses_atomic_cursor_capture_and_worker_snapshot(self):
+        app = self._app()
+        self._commit(app, 1, "What would you", 10_000, "f8")
+        app.last_f9_at = None
+        app.moonshine_ready = True
+        app.audio_started = True
+        captured = []
+        requested = []
+        app.remote_audio = SimpleNamespace(
+            capture_sample_cursor_and=lambda enqueue: (
+                captured.append(20_000),
+                (20_000, enqueue(20_000)),
+            )[1]
+        )
+        app.asr_worker = SimpleNamespace(
+            request_snapshot=lambda cursor, callback: (
+                requested.append((cursor, callback)),
+                True,
+            )[1],
+        )
+
+        app._on_f9()
+
+        self.assertEqual(captured, [20_000])
+        self.assertEqual(requested[0][0], 20_000)
+
+
+class AudioStreamTest(unittest.TestCase):
+    def test_streaming_only_capture_forwards_each_raw_pcm_sample_once(self):
+        forwarded = []
+        stream = interview_app.AudioStream(
+            "INTERVIEWER",
+            "unused",
+            lambda pcm, start, end: forwarded.append(
+                (pcm, start, end)
+            ),
+            lambda *_args: None,
+        )
+        stream.process = SimpleNamespace(stdout=io.BytesIO(bytes(640)))
+
+        stream._read_loop()
+
+        self.assertEqual(len(forwarded), 2)
+        self.assertEqual(forwarded[0], (bytes(320), 0, 160))
+        self.assertEqual(forwarded[1], (bytes(320), 160, 320))
+        self.assertEqual(stream.total_samples, 320)
+
+    def test_f8_cursor_and_enqueue_are_atomic_under_audio_lock(self):
+        stream = interview_app.AudioStream(
+            "INTERVIEWER",
+            "unused",
+            lambda *_args: None,
+            lambda *_args: None,
+        )
+        stream.total_samples = 320
+        seen = []
+
+        cursor, accepted = stream.capture_sample_cursor_and(
+            lambda target: seen.append(target) or True
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(cursor, 320)
+        self.assertEqual(seen, [320])
+
+
+class LiveWindowVisibilityTest(unittest.TestCase):
+    def test_hide_then_restore_preserves_live_window_state(self):
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.live_windows_hidden = False
+        app.remote_window = _FakeVisibleWindow(
+            "Question transcript",
+            (100, 200),
+            (720, 170),
+            12.5,
+        )
+        app.answer_window = _FakeVisibleWindow(
+            "Current answer",
+            (100, 380),
+            (720, 300),
+            48.0,
+        )
+        app.control_window = _FakeControlWindow()
+        remote_state = vars(app.remote_window).copy()
+        answer_state = vars(app.answer_window).copy()
+
+        app.toggle_live_windows_visibility()
+
+        self.assertFalse(app.remote_window.visible)
+        self.assertFalse(app.answer_window.visible)
+        self.assertTrue(app.control_window.visible)
+        self.assertTrue(app.control_window.live_windows_hidden)
+        self.assertEqual(
+            {key: value for key, value in vars(app.remote_window).items()
+             if key != "visible"},
+            {key: value for key, value in remote_state.items()
+             if key != "visible"},
+        )
+        self.assertEqual(
+            {key: value for key, value in vars(app.answer_window).items()
+             if key != "visible"},
+            {key: value for key, value in answer_state.items()
+             if key != "visible"},
+        )
+
+        app.toggle_live_windows_visibility()
+
+        self.assertTrue(app.remote_window.visible)
+        self.assertTrue(app.answer_window.visible)
+        self.assertTrue(app.control_window.visible)
+        self.assertFalse(app.control_window.live_windows_hidden)
+        self.assertEqual(app.remote_window.text, "Question transcript")
+        self.assertEqual(app.remote_window.position, (100, 200))
+        self.assertEqual(app.remote_window.size, (720, 170))
+        self.assertEqual(app.remote_window.scroll, 12.5)
+        self.assertEqual(app.answer_window.text, "Current answer")
+        self.assertEqual(app.answer_window.position, (100, 380))
+        self.assertEqual(app.answer_window.size, (720, 300))
+        self.assertEqual(app.answer_window.scroll, 48.0)
 
 if __name__ == "__main__":
     unittest.main()

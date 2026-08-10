@@ -38,6 +38,7 @@ class CodexAppServerClient:
         developer_instructions,
         timeout_seconds=60,
         codex_path=None,
+        fast_mode=False,
     ):
         self.model = model
         self.effort = effort
@@ -45,6 +46,7 @@ class CodexAppServerClient:
         self.developer_instructions = developer_instructions
         self.timeout_seconds = timeout_seconds
         self.codex_path = codex_path or shutil.which("codex")
+        self.fast_mode = bool(fast_mode)
         self.process = None
         self._process_group_id = None
         self.thread_id = None
@@ -65,13 +67,7 @@ class CodexAppServerClient:
         if self.process is not None:
             raise CodexAppServerError("Codex App Server is already running")
 
-        command = [
-            self.codex_path,
-            "app-server",
-            "--stdio",
-            "--disable", "fast_mode",
-            "--config", f'model_reasoning_effort="{self.effort}"',
-        ]
+        command = self._command()
         try:
             self.process = subprocess.Popen(
                 command,
@@ -107,6 +103,16 @@ class CodexAppServerClient:
         except Exception:
             self.stop()
             raise
+
+    def _command(self):
+        return [
+            self.codex_path,
+            "app-server",
+            "--stdio",
+            "--enable" if self.fast_mode else "--disable",
+            "fast_mode",
+            "--config", f'model_reasoning_effort="{self.effort}"',
+        ]
 
     def start(self, thread_id=None, ephemeral=True):
         """Connect and either create a thread or resume a persisted one."""
@@ -150,6 +156,25 @@ class CodexAppServerClient:
             {"threadId": thread_id},
             timeout=15,
         )
+
+    def list_models(self):
+        """Return every list-visible model advertised by this App Server."""
+        self._ensure_running()
+        models = []
+        cursor = None
+        while True:
+            params = {"includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            response = self._request("model/list", params, timeout=15)
+            models.extend(
+                model
+                for model in response.get("data", [])
+                if isinstance(model, dict) and not model.get("hidden", False)
+            )
+            cursor = response.get("nextCursor")
+            if not cursor:
+                return models
 
     def inject_items(self, items):
         """Persist model-visible history items without starting a turn."""
