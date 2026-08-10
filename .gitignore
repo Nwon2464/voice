@@ -14,3 +14,6 @@ test_runs/
 .idea/
 .vscode/
 *~
+
+# Local development documentation (public guide: README_QUICKSTART.md)
+README.md
