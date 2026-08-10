@@ -112,15 +112,22 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
         self._assert_default_model_selection(
             language="en",
             arch_name="SMALL_STREAMING",
+            max_tokens_per_second=None,
         )
 
     def test_japanese_uses_base_model_arch(self):
         self._assert_default_model_selection(
             language="ja",
             arch_name="BASE",
+            max_tokens_per_second="13.0",
         )
 
-    def _assert_default_model_selection(self, language, arch_name):
+    def _assert_default_model_selection(
+        self,
+        language,
+        arch_name,
+        max_tokens_per_second,
+    ):
         selected = {}
         model_arch = SimpleNamespace(
             SMALL_STREAMING=object(),
@@ -160,6 +167,15 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
         self.assertIs(selected["arch"], expected_arch)
         self.assertIs(selected["transcriber"]["model_arch"], expected_arch)
         self.assertEqual(selected["transcriber"]["model_path"], "/models/test")
+        options = selected["transcriber"]["options"]
+        self.assertEqual(options["return_audio_data"], "false")
+        if max_tokens_per_second is None:
+            self.assertNotIn("max_tokens_per_second", options)
+        else:
+            self.assertEqual(
+                options["max_tokens_per_second"],
+                max_tokens_per_second,
+            )
         self.assertEqual(force_flag, 99)
 
     def test_pcm_barrier_force_snapshot_and_stream_reset(self):

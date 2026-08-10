@@ -17,3 +17,4 @@ test_runs/
 
 # Local development documentation (public guide: README_QUICKSTART.md)
 README.md
+.venv-kokoro/

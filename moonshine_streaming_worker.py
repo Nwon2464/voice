@@ -183,11 +183,14 @@ class MoonshineStreamingWorker:
             raise RuntimeError(
                 f"requested {arch}, model downloader returned {returned_arch}"
             )
+        options = {"return_audio_data": "false"}
+        if self.language == "ja":
+            options["max_tokens_per_second"] = "13.0"
         transcriber = Transcriber(
             model_path=model_path,
             model_arch=arch,
             update_interval=UPDATE_INTERVAL_SECONDS,
-            options={"return_audio_data": "false"},
+            options=options,
         )
         return transcriber, MOONSHINE_FLAG_FORCE_UPDATE
 
