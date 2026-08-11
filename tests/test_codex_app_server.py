@@ -120,6 +120,29 @@ class CodexAppServerClientTest(unittest.TestCase):
             timeout=15,
         )
 
+    def test_read_thread_requests_turns_without_resuming(self):
+        client = CodexAppServerClient(
+            model="test-model",
+            effort="low",
+            cwd=".",
+            developer_instructions="test",
+            codex_path="/bin/false",
+        )
+        client.process = Mock()
+        client.process.poll.return_value = None
+        client._request = Mock(return_value={
+            "thread": {"id": "thread-current", "turns": []},
+        })
+
+        thread = client.read_thread("thread-current", include_turns=True)
+
+        self.assertEqual(thread["id"], "thread-current")
+        client._request.assert_called_once_with(
+            "thread/read",
+            {"threadId": "thread-current", "includeTurns": True},
+            timeout=30,
+        )
+
     def test_inject_items_persists_items_without_turn(self):
         client = CodexAppServerClient(
             model="test-model",

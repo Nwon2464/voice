@@ -157,6 +157,19 @@ class CodexAppServerClient:
             timeout=15,
         )
 
+    def read_thread(self, thread_id, include_turns=True):
+        """Read a persisted thread without resuming or modifying it."""
+        self._ensure_running()
+        response = self._request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": bool(include_turns)},
+            timeout=30,
+        )
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if not isinstance(thread, dict):
+            raise CodexAppServerError("thread/read returned no thread object")
+        return thread
+
     def list_models(self):
         """Return every list-visible model advertised by this App Server."""
         self._ensure_running()

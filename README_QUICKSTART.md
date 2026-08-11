@@ -64,6 +64,24 @@ Runtime log: /run/user/.../interview-assistant.log
 tail -n 100 /run/user/1000/interview-assistant.log
 ```
 
+## Desktop Launcher
+
+GNOME Applications와 현재 사용자의 Desktop에 launcher를 설치합니다.
+
+```bash
+./install_desktop_launcher.sh
+```
+
+설치 후 Activities에서 `Interview Assistant`를 검색해 실행하면 세 가지 모드를 선택할 수 있습니다. Desktop 위치는 `xdg-user-dir DESKTOP`의 설정을 사용하며, Desktop이 비활성화된 환경에서는 Applications에만 등록됩니다.
+
+| 모드 | 용도 | 대응 CLI command |
+|---|---|---|
+| Normal Interview | 실제 면접 기본 모드 | `./start_interview_app.sh` |
+| Performance Test | `test_runs/`에 성능 JSONL 기록 | `INTERVIEW_TEST_LOG=1 INTERVIEW_TEST_LABEL=<label> .venv/bin/python interview_app.py` |
+| STT / UI Debug | Codex 없이 STT·무음·F8/F9·UI 확인 | `INTERVIEW_DISABLE_CODEX=1 INTERVIEW_TEST_LOG=1 INTERVIEW_TEST_LABEL=<label> .venv/bin/python interview_app.py` |
+
+Performance와 Debug의 test label은 `test_runs/`에서 실행 로그를 사람이 쉽게 구분하기 위한 이름입니다. 예: `a2z`, `latency-test`, `audio-debug`.
+
 ### 터미널 foreground 실행
 
 문제 확인이나 개발 중에는 앱을 터미널에 직접 연결하여 실행할 수 있습니다.

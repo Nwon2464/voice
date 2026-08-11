@@ -13,6 +13,7 @@ import numpy as np
 
 SAMPLE_RATE = 16_000
 UPDATE_INTERVAL_SECONDS = 0.5
+STOP_JOIN_TIMEOUT_SECONDS = 5.0
 MOONSHINE_MODEL_BY_LANGUAGE = {
     "en": ("small-streaming-en", "SMALL_STREAMING"),
     "ja": ("base-ja", "BASE"),
@@ -168,7 +169,16 @@ class MoonshineStreamingWorker:
             thread = self.thread
             self.jobs.put(("stop",))
         if thread is not None:
-            thread.join()
+            thread.join(timeout=STOP_JOIN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                self.dispatch(
+                    self.on_error,
+                    RuntimeError(
+                        "Moonshine worker did not stop within "
+                        f"{STOP_JOIN_TIMEOUT_SECONDS:g} seconds"
+                    ),
+                )
+                return
         with self.lock:
             self.thread = None
 

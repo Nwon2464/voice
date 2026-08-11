@@ -9,6 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import interview_app
+from context_manager import (
+    CONTEXT_STATUS_CHANGED,
+    CONTEXT_STATUS_SYNCED,
+    ContextManager,
+    ContextState,
+)
 
 
 class _LatestOnlyCodexClient:
@@ -187,6 +193,23 @@ class _FakeSensitiveWidget:
         self.sensitive = sensitive
 
 
+class _FakeTextBuffer:
+    def __init__(self):
+        self.text = None
+
+    def set_text(self, text):
+        self.text = text
+
+
+class _ImmediateThread:
+    def __init__(self, target, args=(), **_kwargs):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
+
+
 def _wait_until(predicate, timeout=2):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -274,10 +297,12 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertEqual(captured["effort"], "high")
         self.assertTrue(captured["fast_mode"])
 
-    def test_session_list_row_displays_language_model_and_effort(self):
+    def test_session_list_row_displays_name_stt_and_last_used(self):
         row = interview_app.session_list_row({
-            "thread_id": "thread-123",
+            "session_id": "session-123",
             "created_at": "2026-08-10T17:30:45+09:00",
+            "last_used_at": "2026-08-11T09:15:20+09:00",
+            "name": "Backend Interview",
             "settings": {
                 "codex_model": "gpt-5.6-luna",
                 "codex_reasoning_effort": "medium",
@@ -286,16 +311,572 @@ class CodexLatestOnlyTest(unittest.TestCase):
         })
 
         self.assertEqual(row, (
-            "2026-08-10 17:30",
-            "thread-123",
-            "Japanese",
-            "gpt-5.6-luna",
-            "medium",
+            "Backend Interview",
+            "JA · Base",
+            "2026-08-11 09:15",
+            "session-123",
         ))
 
-    def test_preparation_settings_wait_for_catalog_before_enabling(self):
-        dialog = interview_app.PreparationChatDialog.__new__(
-            interview_app.PreparationChatDialog
+    def test_context_filename_becomes_human_readable_display_name(self):
+        self.assertEqual(interview_app.context_display_name("company.md"), "Company")
+        self.assertEqual(
+            interview_app.context_display_name("answer_style.md"),
+            "Answer Style",
+        )
+        self.assertEqual(
+            interview_app.context_display_name("interview-focus.md"),
+            "Interview Focus",
+        )
+
+    def test_stt_presentation_names_actual_model_and_asr_mode(self):
+        self.assertEqual(interview_app.stt_presentation("en"), {
+            "language": "English",
+            "title": "Moonshine Small Streaming",
+            "model": "small-streaming-en",
+            "mode": "Streaming ASR",
+        })
+        self.assertEqual(interview_app.stt_presentation("ja"), {
+            "language": "Japanese",
+            "title": "Moonshine Base",
+            "model": "base-ja",
+            "mode": "Base ASR",
+        })
+
+    def test_context_scope_and_status_have_distinct_style_classes(self):
+        self.assertEqual(
+            interview_app.context_scope_style("GLOBAL"),
+            "scope-global",
+        )
+        self.assertEqual(
+            interview_app.context_scope_style("SESSION"),
+            "scope-session",
+        )
+        self.assertEqual(
+            interview_app.context_status_style("SYNCED"),
+            "status-synced",
+        )
+        self.assertEqual(
+            interview_app.context_status_style("CHANGED"),
+            "status-changed",
+        )
+        self.assertEqual(
+            interview_app.context_status_style("NOT SYNCED"),
+            "status-not-synced",
+        )
+
+    def test_preparation_workspace_starts_at_72_28_ratio(self):
+        self.assertEqual(
+            interview_app.preparation_conversation_position(1000),
+            720,
+        )
+        self.assertEqual(
+            interview_app.preparation_conversation_position(800),
+            576,
+        )
+
+    def test_preparation_status_summaries_reflect_context_and_stt(self):
+        self.assertEqual(interview_app.stt_status_summary("en"), "EN · Streaming")
+        self.assertEqual(interview_app.stt_status_summary("ja"), "JA · Base")
+        self.assertEqual(
+            interview_app.context_status_summary([{"status": "SYNCED"}]),
+            ("● Context Synced", "status-synced"),
+        )
+        self.assertEqual(
+            interview_app.context_status_summary([
+                {"status": "SYNCED"},
+                {"status": "CHANGED"},
+            ]),
+            ("● Context Changed", "status-changed"),
+        )
+        self.assertEqual(
+            interview_app.context_status_summary([
+                {"status": "NOT SYNCED"},
+            ]),
+            ("● Context Not Synced", "status-not-synced"),
+        )
+
+    def test_effective_contexts_keep_scope_name_file_and_path_for_ui(self):
+        path = Path("/tmp/session/contexts/company.md")
+        rows = interview_app.context_display_rows([
+            ContextState(
+                scope="session",
+                name="company.md",
+                path=path,
+                status="NOT SYNCED",
+                content_hash="a" * 64,
+                synced_hash=None,
+            ),
+        ])
+
+        self.assertEqual(rows, [{
+            "scope": "SESSION",
+            "display_name": "Company",
+            "filename": "company.md",
+            "path": path,
+            "status": "NOT SYNCED",
+        }])
+
+    def test_interview_conversation_keeps_question_and_final_answer_only(self):
+        thread = {
+            "turns": [{
+                "items": [
+                    {
+                        "type": "developerMessage",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "INTERVIEW CONTEXT SNAPSHOT\nsecret",
+                        }],
+                    },
+                    {
+                        "type": "systemMessage",
+                        "content": [{
+                            "type": "text",
+                            "text": "internal system message",
+                        }],
+                    },
+                    {
+                        "type": "userMessage",
+                        "content": [{
+                            "type": "text",
+                            "text": "internal user item without marker",
+                        }],
+                    },
+                    {
+                        "type": "userMessage",
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "NEW CONVERSATION SINCE THE PREVIOUS REQUEST:\n"
+                                "INTERVIEWER: hidden context\n\n"
+                                "CURRENT INTERVIEWER QUESTION:\n"
+                                "Tell me about a difficult project."
+                            ),
+                        }],
+                    },
+                    {
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "internal commentary",
+                    },
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "I solved a difficult migration problem.",
+                    },
+                ],
+            }],
+        }
+
+        messages = interview_app.interview_conversation_messages(thread)
+
+        self.assertEqual(messages, [
+            {
+                "role": "interviewer",
+                "text": "Tell me about a difficult project.",
+            },
+            {
+                "role": "codex",
+                "text": "I solved a difficult migration problem.",
+            },
+        ])
+
+    def test_conversation_without_interview_thread_shows_guidance(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.session_store = None
+        dialog.session = {"interview_thread_id": None}
+        dialog.conversation_load_generation = 0
+        dialog.conversation_refresh_button = _FakeSensitiveWidget()
+        shown = []
+        dialog._set_conversation_text = shown.append
+
+        with patch.object(
+            interview_app.threading,
+            "Thread",
+            side_effect=AssertionError("must not read a missing thread"),
+        ):
+            dialog._refresh_conversation()
+
+        self.assertEqual(shown, [interview_app.NO_INTERVIEW_THREAD_TEXT])
+        self.assertTrue(dialog.conversation_refresh_button.sensitive)
+
+    def test_thread_without_visible_conversation_shows_empty_message(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.active = True
+        dialog.session = {"interview_thread_id": "thread-current"}
+        dialog.conversation_load_generation = 3
+        dialog.conversation_refresh_button = _FakeSensitiveWidget()
+        dialog.conversation_buffer = _FakeTextBuffer()
+        shown = []
+        dialog._set_conversation_text = shown.append
+
+        result = dialog._conversation_load_finished(
+            3,
+            "thread-current",
+            {"turns": []},
+            None,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            shown,
+            [interview_app.NO_INTERVIEW_CONVERSATION_TEXT],
+        )
+        self.assertTrue(dialog.conversation_refresh_button.sensitive)
+
+    def test_archived_thread_result_cannot_replace_current_conversation(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.active = True
+        dialog.session = {"interview_thread_id": "thread-current"}
+        dialog.conversation_load_generation = 4
+        dialog.conversation_refresh_button = _FakeSensitiveWidget()
+        dialog._set_conversation_text = lambda _text: self.fail(
+            "an archived thread result must be ignored"
+        )
+
+        result = dialog._conversation_load_finished(
+            3,
+            "thread-archived",
+            {"turns": []},
+            None,
+        )
+
+        self.assertFalse(result)
+
+    def test_conversation_loader_reads_current_thread_without_resume(self):
+        events = []
+
+        class ReadClient:
+            def connect(self):
+                events.append("connect")
+
+            def read_thread(self, thread_id, include_turns=True):
+                events.append(("read", thread_id, include_turns))
+                return {"id": thread_id, "turns": []}
+
+            def start(self, **_kwargs):
+                raise AssertionError("Conversation refresh must not resume")
+
+            def stop(self):
+                events.append("stop")
+
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        captured = {}
+        dialog._conversation_load_finished = lambda *args: captured.update(
+            args=args
+        )
+        with patch.object(
+            interview_app,
+            "_new_codex_client",
+            return_value=ReadClient(),
+        ), patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            dialog._run_conversation_load(
+                5,
+                "thread-current",
+                {"codex_model": "gpt-test"},
+            )
+
+        self.assertEqual(events, [
+            "connect",
+            ("read", "thread-current", True),
+            "stop",
+        ])
+        self.assertEqual(captured["args"][:3], (
+            5,
+            "thread-current",
+            {"id": "thread-current", "turns": []},
+        ))
+        self.assertIsNone(captured["args"][3])
+
+    def test_context_refresh_reloads_changed_and_restored_status(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = ContextManager(temporary_directory)
+            context = manager.create_context(
+                "session",
+                "thread-123",
+                "Company",
+            )
+            context.path.write_text("original", encoding="utf-8")
+            manager.record_successful_sync("thread-123", context)
+            metadata_path = manager.sync_metadata_path("thread-123")
+            metadata_before = metadata_path.read_bytes()
+
+            context.path.write_text("modified", encoding="utf-8")
+            changed = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(changed[0]["status"], CONTEXT_STATUS_CHANGED)
+            self.assertEqual(metadata_path.read_bytes(), metadata_before)
+
+            context.path.write_text("original", encoding="utf-8")
+            restored = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(restored[0]["status"], CONTEXT_STATUS_SYNCED)
+            self.assertEqual(metadata_path.read_bytes(), metadata_before)
+
+    def test_context_refresh_reloads_external_addition_and_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = ContextManager(temporary_directory)
+            company = manager.create_context(
+                "session",
+                "thread-123",
+                "Company",
+            )
+            position = manager.ensure_session("thread-123") / "position.md"
+            position.write_text("position", encoding="utf-8")
+
+            added = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(
+                {row["filename"] for row in added},
+                {"company.md", "position.md"},
+            )
+
+            company.path.unlink()
+            deleted = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(
+                [row["filename"] for row in deleted],
+                ["position.md"],
+            )
+
+    def test_context_refresh_reloads_override_changes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = ContextManager(temporary_directory)
+            global_path = manager.global_context_dir / "answer_style.md"
+            global_path.write_text("global", encoding="utf-8")
+
+            before = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(before[0]["scope"], "GLOBAL")
+            self.assertEqual(before[0]["filename"], "answer_style.md")
+
+            session = manager.create_context(
+                "session",
+                "thread-123",
+                "Answer Style",
+            )
+            overridden = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(len(overridden), 1)
+            self.assertEqual(overridden[0]["scope"], "SESSION")
+            self.assertEqual(overridden[0]["filename"], "answer-style.md")
+
+            session.path.unlink()
+            restored = interview_app.load_context_display_rows(
+                manager,
+                "thread-123",
+            )
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(restored[0]["scope"], "GLOBAL")
+            self.assertEqual(restored[0]["filename"], "answer_style.md")
+
+    def test_sync_context_runs_backend_off_ui_path_and_refreshes_success(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.session_id = "session-local"
+        dialog.context_manager = object()
+        dialog.context_sync_in_progress = False
+        dialog.active = True
+        dialog.sync_context_button = _FakeSensitiveWidget()
+        dialog.start_button = _FakeSensitiveWidget()
+        dialog.session = None
+        dialog.context_rows = []
+        sessions = [
+            {"session_id": "session-local", "version": 1},
+            {"session_id": "session-local", "version": 2},
+        ]
+
+        class FakeStore:
+            def get(self, _session_id):
+                return sessions.pop(0)
+
+        captured = {}
+
+        class FakeBackend:
+            def __init__(self, store, manager, factory):
+                captured.update({
+                    "store": store,
+                    "manager": manager,
+                    "factory": factory,
+                })
+
+            def create(self, session):
+                captured["session"] = session
+                return {"interview_thread_id": "thread-interview"}
+
+        dialog.session_store = FakeStore()
+        dialog._refresh_contexts = lambda *_args: captured.update(refresh=True)
+        dialog._refresh_conversation = lambda: captured.update(
+            conversation_refresh=True
+        )
+        dialog._show_context_error = lambda *_args, **_kwargs: captured.update(
+            error=True
+        )
+        with patch.object(interview_app, "InterviewThreadBackend", FakeBackend), \
+             patch.object(interview_app.threading, "Thread", _ImmediateThread), \
+             patch.object(
+                 interview_app.GLib,
+                 "idle_add",
+                 side_effect=lambda callback, *args: callback(*args),
+             ):
+            dialog._sync_contexts()
+
+        self.assertEqual(captured["session"]["version"], 1)
+        self.assertIs(captured["store"], dialog.session_store)
+        self.assertIs(captured["manager"], dialog.context_manager)
+        self.assertTrue(callable(captured["factory"]))
+        self.assertEqual(dialog.session["version"], 2)
+        self.assertTrue(captured["refresh"])
+        self.assertTrue(captured["conversation_refresh"])
+        self.assertNotIn("error", captured)
+        self.assertFalse(dialog.context_sync_in_progress)
+        self.assertTrue(dialog.sync_context_button.sensitive)
+
+    def test_sync_context_failure_shows_error_without_refresh(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.session_id = "session-local"
+        dialog.context_manager = object()
+        dialog.context_sync_in_progress = False
+        dialog.active = True
+        dialog.sync_context_button = _FakeSensitiveWidget()
+        dialog.start_button = _FakeSensitiveWidget()
+        dialog.session = None
+        dialog.context_rows = []
+        dialog.session_store = SimpleNamespace(
+            get=lambda _session_id: {
+                "session_id": "session-local",
+            }
+        )
+        captured = {}
+
+        class FailingBackend:
+            def __init__(self, *_args):
+                pass
+
+            def create(self, _session):
+                raise RuntimeError("sync failed")
+
+        dialog._refresh_contexts = lambda *_args: captured.update(refresh=True)
+        dialog._show_context_error = lambda title, detail, **_kwargs: (
+            captured.update(title=title, detail=detail)
+        )
+        with patch.object(
+            interview_app,
+            "InterviewThreadBackend",
+            FailingBackend,
+        ), patch.object(
+            interview_app.threading,
+            "Thread",
+            _ImmediateThread,
+        ), patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            dialog._sync_contexts()
+
+        self.assertNotIn("refresh", captured)
+        self.assertIn("실패", captured["title"])
+        self.assertEqual(captured["detail"], "sync failed")
+        self.assertFalse(dialog.context_sync_in_progress)
+        self.assertTrue(dialog.sync_context_button.sensitive)
+
+    def test_sync_context_ignores_duplicate_click_while_running(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.context_sync_in_progress = True
+        dialog.session_store = SimpleNamespace(
+            get=lambda _session_id: self.fail("session must not be reloaded")
+        )
+
+        dialog._sync_contexts()
+
+    def test_interview_start_requires_thread_and_all_contexts_synced(self):
+        synced = [{"status": "SYNCED"}, {"status": "SYNCED"}]
+        not_synced = [{"status": "SYNCED"}, {"status": "NOT SYNCED"}]
+        changed = [{"status": "CHANGED"}]
+
+        self.assertFalse(interview_app.can_start_interview(None, synced))
+        self.assertFalse(interview_app.can_start_interview(
+            {"interview_thread_id": None},
+            synced,
+        ))
+        self.assertFalse(interview_app.can_start_interview(
+            {"interview_thread_id": "thread-interview"},
+            not_synced,
+        ))
+        self.assertFalse(interview_app.can_start_interview(
+            {"interview_thread_id": "thread-interview"},
+            changed,
+        ))
+        self.assertTrue(interview_app.can_start_interview(
+            {"interview_thread_id": "thread-interview"},
+            synced,
+        ))
+
+    def test_start_button_and_live_thread_use_cached_interview_state(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.context_sync_in_progress = False
+        dialog.start_button = _FakeSensitiveWidget()
+        dialog.session = {"interview_thread_id": "thread-interview"}
+        dialog.context_rows = [{"status": "SYNCED"}]
+
+        dialog._update_start_button()
+
+        self.assertTrue(dialog.start_button.sensitive)
+        self.assertEqual(dialog.interview_thread_id(), "thread-interview")
+
+        dialog.context_rows = [{"status": "CHANGED"}]
+        dialog._update_start_button()
+
+        self.assertFalse(dialog.start_button.sensitive)
+        self.assertIsNone(dialog.interview_thread_id())
+
+    def test_start_button_is_disabled_while_context_sync_runs(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.context_sync_in_progress = True
+        dialog.start_button = _FakeSensitiveWidget()
+        dialog.session = {"interview_thread_id": "thread-interview"}
+        dialog.context_rows = [{"status": "SYNCED"}]
+
+        dialog._update_start_button()
+
+        self.assertFalse(dialog.start_button.sensitive)
+
+    def test_preparation_settings_can_be_enabled_without_a_thread(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
         )
         dialog.model_combo = _FakeSensitiveWidget()
         dialog.reasoning_combo = _FakeSensitiveWidget()
@@ -316,9 +897,53 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertTrue(dialog.fast_combo.sensitive)
         self.assertTrue(dialog.stt_language_combo.sensitive)
 
+    def test_model_catalog_load_does_not_start_or_resume_a_thread(self):
+        events = []
+
+        class CatalogClient:
+            def connect(self):
+                events.append("connect")
+
+            def list_models(self):
+                events.append("list_models")
+                return [{"model": "gpt-test"}]
+
+            def start(self, **_kwargs):
+                raise AssertionError("Preparation must not start a Codex thread")
+
+            def stop(self):
+                events.append("stop")
+
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        captured = {}
+        dialog._model_catalog_finished = (
+            lambda generation, models: captured.update(
+                generation=generation,
+                models=models,
+            )
+        )
+        with patch.object(
+            interview_app,
+            "_new_codex_client",
+            return_value=CatalogClient(),
+        ), patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            dialog._run_model_catalog_load(7, {"codex_model": "gpt-test"})
+
+        self.assertEqual(events, ["connect", "list_models", "stop"])
+        self.assertEqual(captured, {
+            "generation": 7,
+            "models": [{"model": "gpt-test"}],
+        })
+
     def test_unsupported_model_cannot_reach_live_snapshot_with_fast_enabled(self):
-        dialog = interview_app.PreparationChatDialog.__new__(
-            interview_app.PreparationChatDialog
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
         )
         dialog.codex_models = [{
             "model": "gpt-5.2",
@@ -1026,6 +1651,236 @@ class AudioStreamTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertEqual(cursor, 320)
         self.assertEqual(seen, [320])
+
+    def test_unexpected_ffmpeg_eof_reports_audio_error_once(self):
+        errors = []
+        process = SimpleNamespace(
+            stdout=io.BytesIO(b""),
+            stderr=io.BytesIO(b"pulse input failed\n"),
+            poll=lambda: 1,
+        )
+        stream = interview_app.AudioStream(
+            "INTERVIEWER",
+            "unused",
+            lambda *_args: None,
+            lambda role, error: errors.append((role, str(error))),
+        )
+        stream.process = process
+        stream._read_stderr()
+
+        stream._read_loop()
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], "INTERVIEWER")
+        self.assertIn("Audio capture stopped unexpectedly", errors[0][1])
+        self.assertIn("pulse input failed", errors[0][1])
+
+
+class RuntimeLifecycleRegressionTest(unittest.TestCase):
+    def test_shutdown_continues_cleanup_after_individual_failures(self):
+        calls = []
+
+        class Resource:
+            def __init__(self, name, fail=False):
+                self.name = name
+                self.fail = fail
+
+            def stop(self):
+                calls.append(self.name)
+                if self.fail:
+                    raise RuntimeError(f"{self.name} failed")
+
+        class Window:
+            def hide(self):
+                calls.append("hide")
+
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.running = True
+        app.exit_action = None
+        app._save_window_state = lambda: (_ for _ in ()).throw(
+            PermissionError("window state is read-only")
+        )
+        app.remote_audio = Resource("audio")
+        app.asr_worker = Resource("moonshine", fail=True)
+        app.codex_worker = Resource("codex")
+        app.trigger_socket = None
+        app.trigger_lock_file = None
+        app.log_path = None
+        app.question_count = 0
+        app.codex_request_count = 0
+        app.remote_window = Window()
+        app.answer_window = Window()
+        app.control_window = Window()
+
+        with patch.object(interview_app.Gtk, "main_quit") as main_quit:
+            result = app._stop("quit")
+
+        self.assertFalse(result)
+        self.assertEqual(calls[:3], ["audio", "moonshine", "codex"])
+        self.assertEqual(calls.count("hide"), 3)
+        main_quit.assert_called_once_with()
+
+    def test_second_instance_is_rejected_without_touching_owner_socket(self):
+        class FakeSocket:
+            def bind(self, _path):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            socket_path = runtime_dir / "trigger.sock"
+            lock_path = runtime_dir / "trigger.lock"
+            first = interview_app.InterviewApp.__new__(
+                interview_app.InterviewApp
+            )
+            first.running = False
+            first.trigger_socket = None
+            first.trigger_lock_file = None
+            first.socket_thread = None
+            second = interview_app.InterviewApp.__new__(
+                interview_app.InterviewApp
+            )
+            second.running = False
+            second.trigger_socket = None
+            second.trigger_lock_file = None
+            second.socket_thread = None
+
+            with patch.object(interview_app, "RUNTIME_DIR", runtime_dir), \
+                    patch.object(interview_app, "TRIGGER_SOCKET", socket_path), \
+                    patch.object(
+                        interview_app,
+                        "TRIGGER_LOCK_PATH",
+                        lock_path,
+                    ), patch.object(
+                        interview_app.socket,
+                        "socket",
+                        return_value=FakeSocket(),
+                    ), patch.object(interview_app.os, "chmod"):
+                first._start_trigger_listener()
+                socket_path.write_text("owner", encoding="utf-8")
+
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    second._start_trigger_listener()
+
+                self.assertEqual(
+                    socket_path.read_text(encoding="utf-8"),
+                    "owner",
+                )
+                first._close_trigger_listener()
+
+    def test_repeated_pcm_rejection_aborts_audio_and_reports_once(self):
+        callbacks = []
+
+        class Audio:
+            abort_calls = 0
+
+            def abort(self):
+                self.abort_calls += 1
+
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.audio_failure_reported = False
+        app.asr_worker = SimpleNamespace(
+            submit_pcm=lambda *_args: False,
+        )
+        app.remote_audio = Audio()
+
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callbacks.append(
+                (callback, args)
+            ),
+        ):
+            for cursor in range(5):
+                app._moonshine_pcm(b"\0\0", cursor, cursor + 1)
+
+        self.assertEqual(app.remote_audio.abort_calls, 1)
+        self.assertEqual(len(callbacks), 1)
+
+    def test_audio_error_clears_listening_state(self):
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.log_path = None
+        app.audio_started = True
+        app.remote_window = _FakeAnswerWindow()
+
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            app._audio_error("INTERVIEWER", RuntimeError("ffmpeg exited"))
+
+        self.assertFalse(app.audio_started)
+        self.assertEqual(app.remote_window.status, "Audio error: ffmpeg exited")
+        self.assertEqual(
+            app.remote_window.boundary_status,
+            interview_app.BOUNDARY_STATUS_ERROR,
+        )
+
+    def test_preparation_close_stops_and_joins_background_client(self):
+        started = threading.Event()
+        released = threading.Event()
+
+        class BlockingClient:
+            def __init__(self):
+                self.stop_calls = 0
+
+            def connect(self):
+                started.set()
+                self.assert_released = released.wait(timeout=2)
+                raise RuntimeError("stopped")
+
+            def list_models(self):
+                return []
+
+            def stop(self):
+                self.stop_calls += 1
+                released.set()
+
+        client = BlockingClient()
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog._ensure_background_state()
+
+        with patch.object(
+            interview_app,
+            "_new_codex_client",
+            return_value=client,
+        ), patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda *_args: False,
+        ):
+            thread = dialog._start_background_task(
+                dialog._run_model_catalog_load,
+                1,
+                {"codex_model": "gpt-test"},
+            )
+            self.assertTrue(started.wait(timeout=2))
+            dialog._stop_background_tasks()
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(client.assert_released)
+        self.assertGreaterEqual(client.stop_calls, 1)
+        self.assertEqual(dialog.background_clients, set())
+        self.assertEqual(dialog.background_threads, set())
+
+    def test_jsonl_session_log_uses_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            interview_app,
+            "APP_DIR",
+            Path(directory),
+        ), patch.object(interview_app, "TEST_LOGGING", True):
+            session_dir, log_path = interview_app.create_app_session()
+
+            self.assertEqual(session_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
 
 
 class LiveWindowVisibilityTest(unittest.TestCase):

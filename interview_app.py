@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Local interview transcription app with F8-triggered Codex answers."""
 
+import fcntl
 import os
 import socket
 import sys
+from collections import deque
 from pathlib import Path
 
 
 APP_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 TRIGGER_SOCKET = RUNTIME_DIR / "interview-assistant-trigger.sock"
+TRIGGER_LOCK_PATH = RUNTIME_DIR / "interview-assistant-trigger.lock"
 
 
 def send_app_command(command):
@@ -49,6 +52,8 @@ from codex_app_server import (
     CodexAppServerRecoverableError,
     CodexAppServerTransportError,
 )
+from context_manager import CONTEXT_STATUS_SYNCED, ContextManager
+from interview_thread_backend import InterviewThreadBackend
 from moonshine_streaming_worker import MoonshineStreamingWorker
 from session_store import (
     DEFAULT_CODEX_MODEL,
@@ -80,6 +85,7 @@ CODEX_REASONING = os.environ.get(
 CODEX_FAST_MODE = False
 CODEX_ENABLED = os.environ.get("INTERVIEW_DISABLE_CODEX", "0") == "0"
 CODEX_TIMEOUT_SECONDS = 60
+BACKGROUND_JOIN_TIMEOUT_SECONDS = 5
 CODEX_DEVELOPER_INSTRUCTIONS = """You assist a job candidate with interview preparation and live answers.
 Follow the candidate's preferences, background, speaking style, and answer format established in the conversation.
 When a turn contains CURRENT INTERVIEWER QUESTION, return an immediately speakable answer draft in the same language as that question.
@@ -101,20 +107,34 @@ BOUNDARY_STATUS_LISTENING = "● LISTENING"
 BOUNDARY_STATUS_AUTO = "✓ AUTO"
 BOUNDARY_STATUS_F8 = "✓ F8 NEW"
 BOUNDARY_STATUS_F9 = "✓ F9 CONTINUED"
+BOUNDARY_STATUS_ERROR = "ERROR"
 RESPONSE_STATUS_READY = "● READY"
 RESPONSE_STATUS_THINKING = "◌ THINKING..."
 RESPONSE_STATUS_UPDATING = "◌ UPDATING..."
 RESPONSE_STATUS_ERROR = "ERROR"
+NO_INTERVIEW_THREAD_TEXT = "아직 Interview Thread가 없습니다."
+NO_INTERVIEW_CONVERSATION_TEXT = "아직 면접 대화가 없습니다."
+INTERVIEW_QUESTION_MARKER = "CURRENT INTERVIEWER QUESTION:"
+STT_PRESENTATION = {
+    "en": {
+        "language": "English",
+        "title": "Moonshine Small Streaming",
+        "model": "small-streaming-en",
+        "mode": "Streaming ASR",
+    },
+    "ja": {
+        "language": "Japanese",
+        "title": "Moonshine Base",
+        "model": "base-ja",
+        "mode": "Base ASR",
+    },
+}
 
 CONFIG_DIR = Path(
     os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
 ) / "interview-assistant"
 WINDOW_STATE_PATH = CONFIG_DIR / "window_state.json"
 SESSION_STORE_PATH = CONFIG_DIR / "sessions.json"
-SESSION_INITIALIZATION_TEXT = (
-    "Interview Assistant persistent session initialized. "
-    "This is background metadata, not an interview question."
-)
 FALLBACK_CODEX_MODELS = [
     {
         "model": "gpt-5.6-sol",
@@ -221,8 +241,12 @@ def create_app_session():
         return None, None
     session_id = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     session_dir = APP_DIR / "test_runs" / f"app_session_{session_id}_{os.getpid()}"
-    session_dir.mkdir(parents=True, exist_ok=False)
-    return session_dir, session_dir / "session.jsonl"
+    session_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    session_dir.chmod(0o700)
+    log_path = session_dir / "session.jsonl"
+    log_path.touch(mode=0o600)
+    log_path.chmod(0o600)
+    return session_dir, log_path
 
 
 class AudioStream:
@@ -235,27 +259,43 @@ class AudioStream:
         self.on_error = on_error
         self.process = None
         self.thread = None
+        self.stderr_thread = None
+        self.stderr_tail = deque(maxlen=20)
         self.stopped = threading.Event()
         self.condition = threading.Condition()
         self.total_samples = 0
 
     def start(self):
         self.process = start_audio_capture(self.source)
+        self.stderr_thread = threading.Thread(
+            target=self._read_stderr,
+            daemon=True,
+        )
+        self.stderr_thread.start()
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
 
-    def stop(self):
+    def abort(self):
+        """Stop capture without joining the current PCM reader thread."""
         self.stopped.set()
-        if self.process is not None:
-            self.process.terminate()
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
+        with self.condition:
+            self.condition.notify_all()
+
+    def stop(self):
+        self.abort()
+        if self.process is not None and self.process.poll() is None:
             try:
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-        with self.condition:
-            self.condition.notify_all()
+                self.process.wait(timeout=2)
         if self.thread is not None:
             self.thread.join(timeout=2)
+        if self.stderr_thread is not None:
+            self.stderr_thread.join(timeout=2)
 
     def capture_sample_cursor_and(self, enqueue):
         """Record the absolute cursor and enqueue F8 before future PCM."""
@@ -269,6 +309,16 @@ class AudioStream:
             while not self.stopped.is_set():
                 data = self.process.stdout.read(320)
                 if not data:
+                    if not self.stopped.is_set():
+                        if self.stderr_thread is not None:
+                            self.stderr_thread.join(timeout=0.2)
+                        return_code = self.process.poll()
+                        detail = "\n".join(self.stderr_tail).strip()
+                        suffix = f": {detail}" if detail else ""
+                        raise RuntimeError(
+                            "Audio capture stopped unexpectedly "
+                            f"(exit code {return_code}){suffix}"
+                        )
                     break
                 if len(data) % SAMPLE_WIDTH:
                     raise RuntimeError("Capture returned an incomplete s16le sample")
@@ -281,6 +331,15 @@ class AudioStream:
                     self.condition.notify_all()
         except Exception as error:
             self.on_error(self.role, error)
+
+    def _read_stderr(self):
+        stream = None if self.process is None else self.process.stderr
+        if stream is None:
+            return
+        for line in stream:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            self.stderr_tail.append(line.rstrip())
 
 
 class CodexWorker:
@@ -678,6 +737,7 @@ def create_live_codex_worker(on_ready, thread_id, settings):
 
 SESSION_RESPONSE_NEW = 1
 SESSION_RESPONSE_ARCHIVE = 2
+SESSION_RESPONSE_RENAME = 3
 
 
 def moonshine_asr_backend(language):
@@ -690,15 +750,16 @@ def moonshine_asr_backend(language):
 
 def session_list_row(session):
     settings = normalize_codex_settings(session.get("settings"))
-    created = session.get("created_at") or session.get("name", "")
-    if "T" in created:
-        created = created.split("+", 1)[0].replace("T", " ")[:16]
+    last_used = (
+        session.get("last_used_at") or session.get("created_at") or ""
+    )
+    if "T" in last_used:
+        last_used = last_used.replace("T", " ")[:16]
     return (
-        created,
-        session["thread_id"],
-        "Japanese" if settings["stt_language"] == "ja" else "English",
-        settings["codex_model"],
-        settings["codex_reasoning_effort"],
+        session.get("name") or "Unnamed Session",
+        stt_status_summary(settings["stt_language"]),
+        last_used,
+        session["session_id"],
     )
 
 
@@ -728,22 +789,302 @@ def model_supports_fast(model):
     )
 
 
+def stt_presentation(language):
+    return STT_PRESENTATION.get(language, STT_PRESENTATION["en"])
+
+
+def stt_status_summary(language):
+    return "JA · Base" if language == "ja" else "EN · Streaming"
+
+
+def context_scope_style(scope):
+    return "scope-session" if scope == "SESSION" else "scope-global"
+
+
+def context_status_style(status):
+    return {
+        "SYNCED": "status-synced",
+        "CHANGED": "status-changed",
+        "NOT SYNCED": "status-not-synced",
+    }.get(status, "status-not-synced")
+
+
+def context_status_summary(context_rows):
+    statuses = {row.get("status") for row in context_rows}
+    if "CHANGED" in statuses:
+        return "● Context Changed", "status-changed"
+    if "NOT SYNCED" in statuses:
+        return "● Context Not Synced", "status-not-synced"
+    return "● Context Synced", "status-synced"
+
+
+PREPARATION_CONVERSATION_RATIO = 0.72
+
+
+def preparation_conversation_position(width):
+    return max(0, round(width * PREPARATION_CONVERSATION_RATIO))
+
+
+_APPLICATION_CSS_INSTALLED = False
+
+
+def install_application_css():
+    global _APPLICATION_CSS_INSTALLED
+    if _APPLICATION_CSS_INSTALLED:
+        return
+    css = b"""
+    window { background-color: rgba(18, 20, 24, 0.96); }
+    window.interviewer, window.answer, window.control { border-radius: 14px; }
+    window.interviewer { border: 2px solid rgba(95, 176, 255, 0.85); }
+    window.answer { border: 2px solid rgba(255, 195, 92, 0.82); }
+    window.control { border: 2px solid rgba(255, 195, 92, 0.82); }
+    window.preparation-window, window.session-window {
+        background-color: #15181d;
+    }
+    frame.preparation-card {
+        background-color: rgba(37, 41, 48, 0.72);
+        border: 1px solid rgba(174, 181, 191, 0.16);
+        border-radius: 8px;
+        padding: 10px;
+    }
+    frame.preparation-status-bar {
+        background-color: rgba(37, 41, 48, 0.58);
+        border: 1px solid rgba(174, 181, 191, 0.14);
+        border-radius: 7px;
+        padding: 6px 9px;
+    }
+    .status-session { color: #e8edf3; font: bold 11px Sans; }
+    .status-stt { color: #aeb7c3; font: 10px Sans; }
+    .context-panel-toggle { padding: 3px 8px; }
+    .settings-button { padding: 3px 9px; }
+    .settings-heading { color: #dce8f5; font: bold 11px Sans; }
+    .section-title {
+        color: #e8edf3;
+        font: bold 12px Sans;
+        padding: 0 0 4px;
+    }
+    .section-description { color: #9fa8b5; font: 10px Sans; }
+    .stt-model-title { color: #dce8f5; font: bold 11px Sans; }
+    .stt-model-detail { color: #9fa8b5; font: 10px Sans; }
+    .context-header { color: #8f99a7; font: bold 9px Sans; }
+    .context-filename { color: #aeb7c3; font: 10px Monospace; }
+    .context-badge {
+        border-radius: 5px;
+        padding: 3px 7px;
+        font: bold 9px Sans;
+    }
+    .scope-global {
+        color: #9dccff;
+        background-color: rgba(65, 126, 181, 0.28);
+        border: 1px solid rgba(115, 177, 231, 0.34);
+    }
+    .scope-session {
+        color: #d6b8ff;
+        background-color: rgba(121, 82, 166, 0.30);
+        border: 1px solid rgba(172, 130, 219, 0.34);
+    }
+    .status-synced {
+        color: #9ed6ad;
+        background-color: rgba(61, 128, 79, 0.25);
+        border: 1px solid rgba(102, 170, 120, 0.30);
+    }
+    .status-changed {
+        color: #f0c67c;
+        background-color: rgba(159, 111, 37, 0.27);
+        border: 1px solid rgba(214, 160, 72, 0.32);
+    }
+    .status-not-synced {
+        color: #c7ccd4;
+        background-color: rgba(105, 112, 124, 0.25);
+        border: 1px solid rgba(151, 158, 169, 0.28);
+    }
+    .context-edit { padding: 2px 10px; }
+    textview.conversation-view, textview.conversation-view text {
+        color: #eef2f6;
+        background-color: #101318;
+    }
+    .heading { color: #8ec8ff; font: bold 12px Sans; letter-spacing: 1px; }
+    window.answer .heading { color: #ffc75c; }
+    .position-guide { border: 2px solid rgba(255, 195, 92, 0.75); background: transparent; }
+    .focus-transcript { color: #fff5d9; background: transparent; font: bold 22px Sans; }
+    .focus-transcript text { color: #fff5d9; background: transparent; }
+    .transcript { color: #ffffff; font: 20px Sans; }
+    .boundary-status { color: rgba(142, 200, 255, 0.78); font: bold 11px Sans; padding: 1px 2px 0; border-top: 1px solid rgba(142, 200, 255, 0.18); }
+    .response-status { color: rgba(255, 199, 92, 0.78); font: bold 11px Sans; padding: 1px 2px 0; border-top: 1px solid rgba(255, 199, 92, 0.18); }
+    .shortcut-reminder { color: rgba(174, 181, 191, 0.68); font: 10px Sans; padding: 1px 2px 0; }
+    .close-button { color: #d8dde5; font: bold 18px Sans; padding: 0 4px; }
+    .close-button:hover { color: #ffffff; background: rgba(255, 90, 90, 0.55); }
+    .control-button { color: #fff5d9; font: bold 18px Sans; padding: 2px 8px; }
+    .visibility-button { padding: 2px 4px; }
+    .control-drag { color: #aeb5bf; font: 18px Sans; padding: 0 4px; }
+    .resize-handle { background: rgba(139, 146, 157, 0.16); }
+    .resize-handle:hover { background: rgba(142, 200, 255, 0.55); }
+    .resize-corner { color: #aeb5bf; font: 12px Sans; }
+    """
+    provider = Gtk.CssProvider()
+    provider.load_from_data(css)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(),
+        provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+    _APPLICATION_CSS_INSTALLED = True
+
+
+def preparation_section(title, description=None):
+    frame = Gtk.Frame()
+    frame.set_shadow_type(Gtk.ShadowType.NONE)
+    frame.get_style_context().add_class("preparation-card")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    heading = Gtk.Label(label=title)
+    heading.set_xalign(0)
+    heading.get_style_context().add_class("section-title")
+    box.pack_start(heading, False, False, 0)
+    if description:
+        detail = Gtk.Label(label=description)
+        detail.set_xalign(0)
+        detail.set_line_wrap(True)
+        detail.get_style_context().add_class("section-description")
+        box.pack_start(detail, False, False, 0)
+    frame.add(box)
+    return frame, box
+
+
+def context_display_name(filename):
+    stem = Path(filename).stem
+    return " ".join(stem.replace("_", " ").replace("-", " ").split()).title()
+
+
+def context_display_rows(contexts):
+    return [
+        {
+            "scope": context.scope.upper(),
+            "display_name": context_display_name(context.name),
+            "filename": context.name,
+            "path": context.path,
+            "status": context.status,
+        }
+        for context in contexts
+    ]
+
+
+def load_context_display_rows(context_manager, session_id):
+    return context_display_rows(
+        context_manager.resolve_effective_context_states(session_id)
+    )
+
+
+def interview_conversation_messages(thread):
+    """Extract only interviewer questions and final Codex answers."""
+    messages = []
+    for turn in thread.get("turns", []):
+        if not isinstance(turn, dict):
+            continue
+        for item in turn.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "userMessage":
+                text = CodexAppServerClient._content_text(
+                    item.get("content", [])
+                )
+                if INTERVIEW_QUESTION_MARKER not in text:
+                    continue
+                question = text.rsplit(INTERVIEW_QUESTION_MARKER, 1)[1].strip()
+                if question:
+                    messages.append({"role": "interviewer", "text": question})
+            elif (
+                item_type == "agentMessage"
+                and item.get("phase") == "final_answer"
+            ):
+                text = item.get("text", "").strip()
+                if text:
+                    messages.append({"role": "codex", "text": text})
+    return messages
+
+
+def can_start_interview(session, context_rows):
+    return bool(
+        session
+        and session.get("interview_thread_id")
+        and all(
+            row.get("status") == CONTEXT_STATUS_SYNCED
+            for row in context_rows
+        )
+    )
+
+
+class RenameSessionDialog(Gtk.Dialog):
+    """Rename only the user-facing label of an app session."""
+
+    def __init__(self, session):
+        super().__init__(title="세션 이름 변경", modal=True)
+        self.set_default_size(420, -1)
+        self.set_border_width(12)
+        self.add_button("취소", Gtk.ResponseType.CANCEL)
+        self.rename_button = self.add_button(
+            "이름 변경",
+            Gtk.ResponseType.OK,
+        )
+        self.rename_button.get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        content = self.get_content_area()
+        content.set_spacing(8)
+        label = Gtk.Label(label="Session Name")
+        label.set_xalign(0)
+        content.pack_start(label, False, False, 0)
+        self.name_entry = Gtk.Entry()
+        self.name_entry.set_text(session.get("name") or "")
+        self.name_entry.set_activates_default(True)
+        self.name_entry.connect("changed", self._name_changed)
+        content.pack_start(self.name_entry, False, False, 0)
+        self._name_changed(self.name_entry)
+        self.show_all()
+        self.name_entry.grab_focus()
+        self.name_entry.select_region(0, -1)
+
+    def session_name(self):
+        return self.name_entry.get_text().strip()
+
+    def _name_changed(self, entry):
+        self.rename_button.set_sensitive(bool(entry.get_text().strip()))
+
+
 class SessionChooserDialog(Gtk.Dialog):
     """Keyboard-friendly chooser for Interview Assistant-owned sessions."""
 
-    def __init__(self, sessions, preferred_thread_id=None):
+    def __init__(self, sessions, preferred_session_id=None):
         super().__init__(title="Interview Assistant Sessions")
-        self.set_default_size(720, 420)
+        self.set_default_size(820, 520)
+        self.set_resizable(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+        self.set_skip_taskbar_hint(False)
         self.set_border_width(12)
         self.set_modal(True)
+        self.get_style_context().add_class("session-window")
 
-        self.new_button = self.add_button("새 세션", SESSION_RESPONSE_NEW)
+        self.new_button = self.add_button("+ 새 세션", SESSION_RESPONSE_NEW)
+        self.rename_button = self.add_button(
+            "이름 변경",
+            SESSION_RESPONSE_RENAME,
+        )
+        self.rename_button.set_sensitive(False)
         self.archive_button = self.add_button(
-            "세션 삭제",
+            "삭제",
             SESSION_RESPONSE_ARCHIVE,
         )
+        self.archive_button.set_sensitive(False)
+        self.archive_button.get_style_context().add_class(
+            "destructive-action"
+        )
+        self.get_action_area().set_child_secondary(
+            self.archive_button,
+            True,
+        )
         self.add_button("취소", Gtk.ResponseType.CANCEL)
-        self.open_button = self.add_button("선택", Gtk.ResponseType.OK)
+        self.open_button = self.add_button("열기", Gtk.ResponseType.OK)
+        self.open_button.set_sensitive(False)
         self.open_button.get_style_context().add_class("suggested-action")
 
         content = self.get_content_area()
@@ -754,45 +1095,50 @@ class SessionChooserDialog(Gtk.Dialog):
         content.pack_start(heading, False, False, 0)
 
         help_text = Gtk.Label(
-            label="↑/↓로 이동하고 Enter를 누르면 선택한 세션으로 들어갑니다."
+            label=(
+                "최근 사용한 면접 세션부터 표시됩니다.\n"
+                "세션을 선택하고 열기를 누르거나 Enter를 눌러주세요."
+            )
         )
         help_text.set_xalign(0)
         content.pack_start(help_text, False, False, 0)
 
-        self.sessions_by_thread_id = {
-            session["thread_id"]: session for session in sessions
+        self.sessions_by_session_id = {
+            session["session_id"]: session for session in sessions
         }
-        self.model = Gtk.ListStore(str, str, str, str, str)
+        self.model = Gtk.ListStore(str, str, str, str)
         preferred_path = None
         for index, session in enumerate(sessions):
             self.model.append(session_list_row(session))
-            if session["thread_id"] == preferred_thread_id:
+            if session["session_id"] == preferred_session_id:
                 preferred_path = Gtk.TreePath.new_from_indices([index])
 
         self.tree = Gtk.TreeView(model=self.model)
         self.tree.set_headers_visible(True)
         self.tree.set_activate_on_single_click(False)
-        self.tree.append_column(
-            Gtk.TreeViewColumn(
-                "Created",
-                Gtk.CellRendererText(),
-                text=0,
-            )
+        name_renderer = Gtk.CellRendererText()
+        name_renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+        name_renderer.set_property("weight", Pango.Weight.BOLD)
+        name_column = Gtk.TreeViewColumn("Name", name_renderer, text=0)
+        name_column.set_expand(True)
+        name_column.set_resizable(True)
+        self.tree.append_column(name_column)
+        stt_renderer = Gtk.CellRendererText()
+        stt_renderer.set_property("foreground", "#9dccff")
+        stt_renderer.set_property("weight", Pango.Weight.BOLD)
+        stt_column = Gtk.TreeViewColumn("STT", stt_renderer, text=1)
+        stt_column.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+        stt_column.set_cell_data_func(stt_renderer, self._render_stt_cell)
+        self.tree.append_column(stt_column)
+        last_used_renderer = Gtk.CellRendererText()
+        last_used_renderer.set_property("xalign", 1.0)
+        last_used_column = Gtk.TreeViewColumn(
+            "Last Used",
+            last_used_renderer,
+            text=2,
         )
-        id_renderer = Gtk.CellRendererText()
-        id_renderer.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
-        self.tree.append_column(
-            Gtk.TreeViewColumn("세션 ID", id_renderer, text=1)
-        )
-        self.tree.append_column(
-            Gtk.TreeViewColumn("Language", Gtk.CellRendererText(), text=2)
-        )
-        self.tree.append_column(
-            Gtk.TreeViewColumn("Model", Gtk.CellRendererText(), text=3)
-        )
-        self.tree.append_column(
-            Gtk.TreeViewColumn("Effort", Gtk.CellRendererText(), text=4)
-        )
+        last_used_column.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+        self.tree.append_column(last_used_column)
         self.tree.connect("row-activated", self._row_activated)
         self.tree.connect("key-press-event", self._key_pressed)
         selection = self.tree.get_selection()
@@ -824,7 +1170,7 @@ class SessionChooserDialog(Gtk.Dialog):
         model, tree_iter = self.tree.get_selection().get_selected()
         if tree_iter is None:
             return None
-        return self.sessions_by_thread_id[model[tree_iter][1]]
+        return self.sessions_by_session_id[model[tree_iter][3]]
 
     def _row_activated(self, *_args):
         self.response(Gtk.ResponseType.OK)
@@ -839,7 +1185,16 @@ class SessionChooserDialog(Gtk.Dialog):
     def _selection_changed(self, selection):
         has_selection = selection.get_selected()[1] is not None
         self.open_button.set_sensitive(has_selection)
+        self.rename_button.set_sensitive(has_selection)
         self.archive_button.set_sensitive(has_selection)
+
+    def _render_stt_cell(self, _column, cell, model, tree_iter, _data):
+        color = (
+            "#d6b8ff"
+            if model[tree_iter][1].startswith("JA")
+            else "#9dccff"
+        )
+        cell.set_property("foreground", color)
 
 
 def _new_codex_client(settings=None):
@@ -855,23 +1210,6 @@ def _new_codex_client(settings=None):
         developer_instructions=CODEX_DEVELOPER_INSTRUCTIONS,
         timeout_seconds=CODEX_TIMEOUT_SECONDS,
     )
-
-
-def create_persisted_codex_session(settings=None):
-    client = _new_codex_client(settings)
-    try:
-        result = client.start(ephemeral=False)
-        client.inject_items([{
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": SESSION_INITIALIZATION_TEXT,
-            }],
-        }])
-        return result
-    finally:
-        client.stop()
 
 
 def archive_persisted_codex_session(thread_id):
@@ -898,24 +1236,25 @@ def _confirm_archive(session):
     dialog = Gtk.MessageDialog(
         message_type=Gtk.MessageType.QUESTION,
         buttons=Gtk.ButtonsType.NONE,
-        text="선택한 세션을 보관함으로 옮길까요?",
+        text="선택한 세션을 삭제할까요?",
     )
     dialog.format_secondary_text(
-        f"{session['name']}\n{session['thread_id']}\n\n나중에 복구할 수 있습니다."
+        f"{session['name']}\n\n이 세션은 활성 목록에서 제거됩니다."
     )
     dialog.add_button("취소", Gtk.ResponseType.CANCEL)
-    dialog.add_button("보관함으로 이동", Gtk.ResponseType.OK)
+    delete_button = dialog.add_button("삭제", Gtk.ResponseType.OK)
+    delete_button.get_style_context().add_class("destructive-action")
     response = dialog.run()
     dialog.destroy()
     return response == Gtk.ResponseType.OK
 
 
-def choose_interview_session(store):
-    preferred_thread_id = None
+def choose_interview_session(store, context_manager):
+    preferred_session_id = None
     while True:
         dialog = SessionChooserDialog(
             store.active(),
-            preferred_thread_id=preferred_thread_id,
+            preferred_session_id=preferred_session_id,
         )
         response = dialog.run()
         selected = dialog.selected_session()
@@ -923,39 +1262,57 @@ def choose_interview_session(store):
 
         if response == SESSION_RESPONSE_NEW:
             try:
-                settings = normalize_codex_settings()
-                result = create_persisted_codex_session(settings)
                 created = datetime.now().astimezone()
-                thread_id = result["thread_id"]
-                store.add(
-                    thread_id,
+                session = store.create(
                     created.strftime("%Y-%m-%d %H:%M"),
                     created.isoformat(timespec="seconds"),
-                    settings,
+                    normalize_codex_settings(),
                 )
-                preferred_thread_id = thread_id
+                session_id = session["session_id"]
+                context_manager.ensure_session(session_id)
+                preferred_session_id = session_id
             except Exception as error:
                 _show_session_error(error)
+            continue
+
+        if response == SESSION_RESPONSE_RENAME and selected is not None:
+            rename_dialog = RenameSessionDialog(selected)
+            rename_response = rename_dialog.run()
+            new_name = rename_dialog.session_name()
+            rename_dialog.destroy()
+            if rename_response == Gtk.ResponseType.OK:
+                try:
+                    store.update_name(selected["session_id"], new_name)
+                    preferred_session_id = selected["session_id"]
+                except (OSError, ValueError) as error:
+                    _show_session_error(error)
             continue
 
         if response == SESSION_RESPONSE_ARCHIVE and selected is not None:
             if _confirm_archive(selected):
                 try:
-                    archive_persisted_codex_session(selected["thread_id"])
-                    store.mark_archived(selected["thread_id"])
-                    preferred_thread_id = None
+                    interview_thread_id = selected.get("interview_thread_id")
+                    if interview_thread_id:
+                        archive_persisted_codex_session(interview_thread_id)
+                    store.mark_archived(selected["session_id"])
+                    preferred_session_id = None
                 except Exception as error:
                     if isinstance(error, CodexAppServerError) and (
                         "no rollout found" in str(error).lower()
                     ):
-                        store.mark_archived(selected["thread_id"])
-                        preferred_thread_id = None
+                        store.mark_archived(selected["session_id"])
+                        preferred_session_id = None
                     else:
                         _show_session_error(error)
             continue
 
         if response == Gtk.ResponseType.OK and selected is not None:
-            store.mark_used(selected["thread_id"])
+            try:
+                context_manager.ensure_session(selected["session_id"])
+            except (OSError, ValueError) as error:
+                _show_session_error(error)
+                continue
+            store.mark_used(selected["session_id"])
             selected["last_used_at"] = datetime.now().astimezone().isoformat(
                 timespec="seconds"
             )
@@ -966,7 +1323,6 @@ def choose_interview_session(store):
 
 CHAT_RESPONSE_BACK = 10
 CHAT_RESPONSE_START_INTERVIEW = 11
-CHAT_HISTORY_PAGE_TURNS = 50
 
 
 class CompactMenuSelector(Gtk.MenuButton):
@@ -1021,26 +1377,111 @@ class CompactMenuSelector(Gtk.MenuButton):
         self._on_changed(self)
 
 
-class PreparationChatDialog(Gtk.Dialog):
-    """Chat with the selected Codex thread before starting audio capture."""
+class NewContextDialog(Gtk.Dialog):
+    """Collect a free-form Context name and destination scope."""
 
-    def __init__(self, thread_id, session_store=None, session_settings=None):
+    def __init__(self, parent):
+        super().__init__(
+            title="New Context",
+            transient_for=parent,
+            modal=True,
+        )
+        self.set_default_size(420, -1)
+        self.set_border_width(12)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.create_button = self.add_button("Create", Gtk.ResponseType.OK)
+        self.create_button.get_style_context().add_class("suggested-action")
+        self.create_button.set_sensitive(False)
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        content = self.get_content_area()
+        content.set_spacing(8)
+        name_label = Gtk.Label(label="Context Name")
+        name_label.set_xalign(0)
+        content.pack_start(name_label, False, False, 0)
+        self.name_entry = Gtk.Entry()
+        self.name_entry.set_activates_default(True)
+        self.name_entry.connect("changed", self._name_changed)
+        content.pack_start(self.name_entry, False, False, 0)
+
+        scope_label = Gtk.Label(label="Scope")
+        scope_label.set_xalign(0)
+        content.pack_start(scope_label, False, False, 4)
+        self.session_scope = Gtk.RadioButton.new_with_label_from_widget(
+            None,
+            "Session",
+        )
+        self.global_scope = Gtk.RadioButton.new_with_label_from_widget(
+            self.session_scope,
+            "Global",
+        )
+        self.session_scope.set_active(True)
+        content.pack_start(self.session_scope, False, False, 0)
+        content.pack_start(self.global_scope, False, False, 0)
+
+        file_label = Gtk.Label(label="File")
+        file_label.set_xalign(0)
+        content.pack_start(file_label, False, False, 4)
+        self.filename_label = Gtk.Label(label="—")
+        self.filename_label.set_xalign(0)
+        self.filename_label.set_selectable(True)
+        content.pack_start(self.filename_label, False, False, 0)
+        self.show_all()
+        self.name_entry.grab_focus()
+
+    def context_name(self):
+        return self.name_entry.get_text()
+
+    def context_scope(self):
+        return "session" if self.session_scope.get_active() else "global"
+
+    def _name_changed(self, entry):
+        try:
+            filename = ContextManager.context_filename(entry.get_text())
+        except ValueError:
+            filename = "—"
+        self.filename_label.set_text(filename)
+        self.create_button.set_sensitive(filename != "—")
+
+
+class PreparationDialog(Gtk.Dialog):
+    """Configure Context and live settings before starting an interview."""
+
+    def __init__(
+        self,
+        session_id,
+        session_store=None,
+        session_settings=None,
+        context_manager=None,
+    ):
         super().__init__(title="Interview Preparation")
-        self.thread_id = thread_id
+        self.session_id = session_id
         self.session_store = session_store
+        self.context_manager = context_manager
         self.codex_settings = normalize_codex_settings(session_settings)
         self.codex_models = list(FALLBACK_CODEX_MODELS)
         self._updating_settings_ui = False
-        self.worker = None
-        self.ready = False
-        self.busy = False
         self.active = False
-        self.stream_started = False
-        self.history_turns = []
-        self.history_start = 0
-        self.set_default_size(820, 640)
+        self.context_sync_in_progress = False
+        self.context_sync_generation = 0
+        self.model_catalog_load_generation = 0
+        self.conversation_load_generation = 0
+        self.background_stop = threading.Event()
+        self.background_lock = threading.Lock()
+        self.background_threads = set()
+        self.background_clients = set()
+        self.session = (
+            self.session_store.get(self.session_id)
+            if self.session_store is not None
+            else None
+        )
+        self.set_default_size(940, 760)
+        self.set_resizable(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+        self.set_skip_taskbar_hint(False)
         self.set_border_width(12)
         self.set_modal(False)
+        self.get_style_context().add_class("preparation-window")
 
         self.back_button = self.add_button("뒤로가기", CHAT_RESPONSE_BACK)
         self.start_button = self.add_button(
@@ -1051,171 +1492,784 @@ class PreparationChatDialog(Gtk.Dialog):
         self.start_button.set_sensitive(False)
 
         content = self.get_content_area()
-        content.set_spacing(10)
-        heading = Gtk.Label()
-        heading.set_markup("<b>면접 준비 채팅</b>")
-        heading.set_xalign(0)
-        content.pack_start(heading, False, False, 0)
-
-        session_label = Gtk.Label(label=f"세션 ID: {thread_id}")
-        session_label.set_xalign(0)
-        session_label.set_selectable(True)
-        content.pack_start(session_label, False, False, 0)
-
-        settings_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=8,
+        content.set_spacing(8)
+        session_name = (
+            self.session.get("name")
+            if self.session is not None
+            else "Interview Session"
+        ) or "Interview Session"
+        status_frame = Gtk.Frame()
+        status_frame.set_shadow_type(Gtk.ShadowType.NONE)
+        status_frame.get_style_context().add_class(
+            "preparation-status-bar"
         )
-        settings_row.pack_start(Gtk.Label(label="Model"), False, False, 0)
+        status_bar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10,
+        )
+        self.session_summary_label = Gtk.Label(label=session_name)
+        self.session_summary_label.set_xalign(0)
+        self.session_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.session_summary_label.get_style_context().add_class(
+            "status-session"
+        )
+        status_bar.pack_start(
+            self.session_summary_label,
+            True,
+            True,
+            0,
+        )
+        self.context_panel_button = Gtk.ToggleButton()
+        self.context_panel_button.set_active(True)
+        self.context_panel_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.context_panel_button.set_tooltip_text(
+            "Context panel 접기/펼치기"
+        )
+        self.context_panel_button.get_style_context().add_class(
+            "context-panel-toggle"
+        )
+        status_bar.pack_start(
+            self.context_panel_button,
+            False,
+            False,
+            0,
+        )
+        self.stt_summary_label = Gtk.Label()
+        self.stt_summary_label.get_style_context().add_class("status-stt")
+        status_bar.pack_start(self.stt_summary_label, False, False, 0)
+        self.settings_button = Gtk.Button(label="⚙ Settings")
+        self.settings_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.settings_button.get_style_context().add_class("settings-button")
+        self.settings_button.connect("clicked", self._show_settings)
+        status_bar.pack_end(self.settings_button, False, False, 0)
+        status_frame.add(status_bar)
+        content.pack_start(status_frame, False, False, 0)
+
+        self.settings_dialog = Gtk.Dialog(
+            title="Interview Settings",
+            transient_for=self,
+            modal=True,
+        )
+        self.settings_dialog.set_default_size(620, 390)
+        self.settings_dialog.set_resizable(True)
+        self.settings_dialog.add_button("닫기", Gtk.ResponseType.CLOSE)
+        self.settings_dialog.connect("delete-event", self._close_settings)
+        settings_content = self.settings_dialog.get_content_area()
+        settings_content.set_border_width(12)
+        settings_content.set_spacing(10)
+
+        session_heading = Gtk.Label(label="Session")
+        session_heading.set_xalign(0)
+        session_heading.get_style_context().add_class("settings-heading")
+        settings_content.pack_start(session_heading, False, False, 0)
+        session_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        session_grid.attach(Gtk.Label(label="Session Name"), 0, 0, 1, 1)
+        session_name_label = Gtk.Label(label=session_name)
+        session_name_label.set_xalign(0)
+        session_name_label.set_selectable(True)
+        session_name_label.set_hexpand(True)
+        session_grid.attach(session_name_label, 1, 0, 1, 1)
+        session_grid.attach(Gtk.Label(label="Session ID"), 0, 1, 1, 1)
+        session_id_label = Gtk.Label(label=session_id)
+        session_id_label.set_xalign(0)
+        session_id_label.set_selectable(True)
+        session_id_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        session_grid.attach(session_id_label, 1, 1, 1, 1)
+        settings_content.pack_start(session_grid, False, False, 0)
+        settings_content.pack_start(
+            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+            False,
+            False,
+            2,
+        )
+
+        codex_heading = Gtk.Label(label="Codex")
+        codex_heading.set_xalign(0)
+        codex_heading.get_style_context().add_class("settings-heading")
+        settings_content.pack_start(codex_heading, False, False, 0)
+        codex_grid = Gtk.Grid(column_spacing=8, row_spacing=4)
+        model_label = Gtk.Label(label="Model")
+        model_label.set_xalign(0)
+        codex_grid.attach(model_label, 0, 0, 1, 1)
         self.model_combo = CompactMenuSelector(self._model_changed)
         self.model_combo.set_size_request(180, -1)
-        settings_row.pack_start(self.model_combo, False, False, 0)
-        settings_row.pack_start(Gtk.Label(label="Reasoning"), False, False, 6)
+        codex_grid.attach(self.model_combo, 0, 1, 1, 1)
+        reasoning_label = Gtk.Label(label="Reasoning")
+        reasoning_label.set_xalign(0)
+        codex_grid.attach(reasoning_label, 1, 0, 1, 1)
         self.reasoning_combo = CompactMenuSelector(self._reasoning_changed)
         self.reasoning_combo.set_size_request(110, -1)
-        settings_row.pack_start(self.reasoning_combo, False, False, 0)
-        settings_row.pack_start(Gtk.Label(label="Fast"), False, False, 6)
+        codex_grid.attach(self.reasoning_combo, 1, 1, 1, 1)
+        fast_label = Gtk.Label(label="Fast")
+        fast_label.set_xalign(0)
+        codex_grid.attach(fast_label, 2, 0, 1, 1)
         self.fast_combo = CompactMenuSelector(self._fast_changed)
         self.fast_combo.set_size_request(72, -1)
         self.fast_combo.append("off", "Off")
         self.fast_combo.append("on", "On")
-        settings_row.pack_start(self.fast_combo, False, False, 0)
-        content.pack_start(settings_row, False, False, 0)
-
-        stt_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=8,
+        codex_grid.attach(self.fast_combo, 2, 1, 1, 1)
+        settings_content.pack_start(codex_grid, False, False, 0)
+        settings_content.pack_start(
+            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+            False,
+            False,
+            2,
         )
-        stt_row.pack_start(Gtk.Label(label="STT Language:"), False, False, 0)
+
+        stt_heading = Gtk.Label(label="Speech Recognition")
+        stt_heading.set_xalign(0)
+        stt_heading.get_style_context().add_class("settings-heading")
+        settings_content.pack_start(stt_heading, False, False, 0)
+        stt_grid = Gtk.Grid(column_spacing=16, row_spacing=4)
+        language_label = Gtk.Label(label="STT Language")
+        language_label.set_xalign(0)
+        stt_grid.attach(language_label, 0, 0, 1, 1)
         self.stt_language_combo = CompactMenuSelector(
             self._stt_language_changed
         )
-        self.stt_language_combo.set_size_request(140, -1)
+        self.stt_language_combo.set_size_request(160, -1)
         self.stt_language_combo.append("en", "English")
         self.stt_language_combo.append("ja", "Japanese")
         self.stt_language_combo.set_active_id(
             self.codex_settings["stt_language"]
         )
-        stt_row.pack_start(self.stt_language_combo, False, False, 0)
-        content.pack_start(stt_row, False, False, 0)
+        stt_grid.attach(self.stt_language_combo, 0, 1, 1, 1)
+        self.stt_model_info = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=2,
+        )
+        self.stt_model_title = Gtk.Label()
+        self.stt_model_title.set_xalign(0)
+        self.stt_model_title.get_style_context().add_class("stt-model-title")
+        self.stt_model_detail = Gtk.Label()
+        self.stt_model_detail.set_xalign(0)
+        self.stt_model_detail.get_style_context().add_class("stt-model-detail")
+        self.stt_model_info.pack_start(
+            self.stt_model_title,
+            False,
+            False,
+            0,
+        )
+        self.stt_model_info.pack_start(
+            self.stt_model_detail,
+            False,
+            False,
+            0,
+        )
+        stt_grid.attach(self.stt_model_info, 1, 1, 1, 1)
+        settings_content.pack_start(stt_grid, False, False, 0)
+        self._update_stt_model_info(self.codex_settings["stt_language"])
         self._set_model_catalog(self.codex_models, persist=False)
-        self._set_settings_sensitive(False)
+        self._set_settings_sensitive(True)
 
-        self.history = Gtk.TextView()
-        self.history.set_editable(False)
-        self.history.set_cursor_visible(False)
-        self.history.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.history.set_left_margin(14)
-        self.history.set_right_margin(14)
-        self.history.set_top_margin(12)
-        self.history.set_bottom_margin(12)
-        self.history_buffer = self.history.get_buffer()
-        self.user_tag = self.history_buffer.create_tag(
-            "chat-user",
+        workspace = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        workspace.set_wide_handle(True)
+        workspace.set_hexpand(True)
+        workspace.set_vexpand(True)
+        workspace.connect("size-allocate", self._allocate_workspace)
+        content.pack_start(workspace, True, True, 0)
+        self.workspace_paned = workspace
+
+        conversation_frame = Gtk.Frame()
+        conversation_frame.set_shadow_type(Gtk.ShadowType.NONE)
+        conversation_frame.get_style_context().add_class("preparation-card")
+        conversation_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=8,
+        )
+        conversation_heading_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+        conversation_heading = Gtk.Label(label="Interview Conversation")
+        conversation_heading.set_xalign(0)
+        conversation_heading.get_style_context().add_class("section-title")
+        conversation_heading_row.pack_start(
+            conversation_heading,
+            True,
+            True,
+            0,
+        )
+        self.conversation_refresh_button = Gtk.Button(
+            label="Refresh Conversation"
+        )
+        self.conversation_refresh_button.connect(
+            "clicked",
+            self._refresh_conversation,
+        )
+        conversation_heading_row.pack_end(
+            self.conversation_refresh_button,
+            False,
+            False,
+            0,
+        )
+        conversation_box.pack_start(
+            conversation_heading_row,
+            False,
+            False,
+            0,
+        )
+        self.conversation_view = Gtk.TextView()
+        self.conversation_view.set_editable(False)
+        self.conversation_view.set_cursor_visible(False)
+        self.conversation_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.conversation_view.set_left_margin(14)
+        self.conversation_view.set_right_margin(14)
+        self.conversation_view.set_top_margin(12)
+        self.conversation_view.set_bottom_margin(12)
+        self.conversation_view.get_style_context().add_class(
+            "conversation-view"
+        )
+        self.conversation_buffer = self.conversation_view.get_buffer()
+        self.conversation_interviewer_tag = self.conversation_buffer.create_tag(
+            "conversation-interviewer",
             foreground="#8ec8ff",
             weight=Pango.Weight.BOLD,
         )
-        self.codex_tag = self.history_buffer.create_tag(
-            "chat-codex",
+        self.conversation_codex_tag = self.conversation_buffer.create_tag(
+            "conversation-codex",
             foreground="#ffc75c",
             weight=Pango.Weight.BOLD,
         )
-        self.body_tag = self.history_buffer.create_tag(
-            "chat-body",
+        self.conversation_body_tag = self.conversation_buffer.create_tag(
+            "conversation-body",
             foreground="#f2f4f7",
         )
-        self.error_tag = self.history_buffer.create_tag(
-            "chat-error",
-            foreground="#ff8f8f",
-        )
-
-        self.history_scroller = Gtk.ScrolledWindow()
-        self.history_scroller.set_policy(
+        conversation_scroller = Gtk.ScrolledWindow()
+        conversation_scroller.set_policy(
             Gtk.PolicyType.AUTOMATIC,
             Gtk.PolicyType.AUTOMATIC,
         )
-        self.history_scroller.set_shadow_type(Gtk.ShadowType.IN)
-        self.history_scroller.add(self.history)
-        self.history_scroller.get_vadjustment().connect(
-            "value-changed",
-            self._history_scrolled,
+        conversation_scroller.set_shadow_type(Gtk.ShadowType.IN)
+        conversation_scroller.add(self.conversation_view)
+        conversation_box.pack_start(conversation_scroller, True, True, 0)
+        conversation_frame.add(conversation_box)
+        workspace.pack1(conversation_frame, resize=True, shrink=False)
+
+        self.context_frame, context_box = preparation_section(
+            "Context",
+            "Global Context와 이 세션의 override 및 sync 상태입니다.",
         )
-        content.pack_start(self.history_scroller, True, True, 0)
-
-        self.status = Gtk.Label(label="Codex 세션에 연결 중…")
-        self.status.set_xalign(0)
-        content.pack_start(self.status, False, False, 0)
-
-        input_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        input_scroller = Gtk.ScrolledWindow()
-        input_scroller.set_policy(
-            Gtk.PolicyType.AUTOMATIC,
-            Gtk.PolicyType.AUTOMATIC,
+        self.context_list_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
         )
-        input_scroller.set_size_request(-1, 92)
-        self.input = Gtk.TextView()
-        self.input.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.input.set_left_margin(10)
-        self.input.set_right_margin(10)
-        self.input.set_top_margin(8)
-        self.input.set_bottom_margin(8)
-        self.input.connect("key-press-event", self._input_key_pressed)
-        input_scroller.add(self.input)
-        input_row.pack_start(input_scroller, True, True, 0)
-
-        self.send_button = Gtk.Button(label="전송")
-        self.send_button.set_sensitive(False)
-        self.send_button.connect("clicked", self._send)
-        input_row.pack_end(self.send_button, False, False, 0)
-        content.pack_start(input_row, False, False, 0)
+        self.context_list_box.set_vexpand(True)
+        context_box.pack_start(self.context_list_box, True, True, 0)
+        context_primary_actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+        self.add_context_button = Gtk.Button(label="+ Context")
+        self.add_context_button.set_sensitive(self.context_manager is not None)
+        self.add_context_button.connect("clicked", self._new_context)
+        context_primary_actions.pack_start(
+            self.add_context_button,
+            True,
+            True,
+            0,
+        )
+        self.refresh_context_button = Gtk.Button(label="Refresh")
+        self.refresh_context_button.set_sensitive(
+            self.context_manager is not None
+        )
+        self.refresh_context_button.connect("clicked", self._refresh_contexts)
+        context_primary_actions.pack_start(
+            self.refresh_context_button,
+            True,
+            True,
+            0,
+        )
+        context_box.pack_start(context_primary_actions, False, False, 2)
+        self.sync_context_button = Gtk.Button(label="Sync Context")
+        self.sync_context_button.set_sensitive(
+            self.context_manager is not None and self.session_store is not None
+        )
+        self.sync_context_button.connect("clicked", self._sync_contexts)
+        context_box.pack_start(
+            self.sync_context_button,
+            False,
+            True,
+            0,
+        )
+        self.context_rows = []
+        self._refresh_contexts()
+        workspace.pack2(self.context_frame, resize=True, shrink=False)
+        self.context_panel_button.connect(
+            "toggled",
+            self._toggle_context_panel,
+        )
+        self._set_conversation_text(NO_INTERVIEW_THREAD_TEXT)
 
         self.connect("delete-event", self._delete)
         self.show_all()
 
-    def run_session(self):
-        self.active = True
-        self.ready = False
-        self._set_settings_sensitive(False)
-        self._set_busy(False)
-        self.status.set_text("Codex 세션에 연결 중…")
-        snapshot = self.settings_snapshot()
-        self.worker = CodexWorker(
-            self._codex_ready,
-            thread_id=self.thread_id,
-            model=snapshot["codex_model"],
-            effort=snapshot["codex_reasoning_effort"],
-            load_model_catalog=True,
+    def _allocate_workspace(self, paned, allocation):
+        position = (
+            preparation_conversation_position(allocation.width)
+            if self.context_panel_button.get_active()
+            else allocation.width
         )
+        if paned.get_position() != position:
+            paned.set_position(position)
+
+    def _toggle_context_panel(self, button):
+        if button.get_active():
+            self.context_frame.show_all()
+        else:
+            self.context_frame.hide()
+        self._update_context_summary()
+        self.workspace_paned.queue_resize()
+
+    def _show_settings(self, *_args):
+        self.settings_dialog.show_all()
+        self.settings_dialog.run()
+        self.settings_dialog.hide()
+
+    def _close_settings(self, dialog, _event):
+        dialog.response(Gtk.ResponseType.CLOSE)
+        return True
+
+    def _refresh_contexts(self, *_args):
+        self.context_rows = (
+            load_context_display_rows(self.context_manager, self.session_id)
+            if self.context_manager is not None
+            else []
+        )
+        for child in self.context_list_box.get_children():
+            child.destroy()
+        context_grid = Gtk.Grid(column_spacing=7, row_spacing=5)
+        context_grid.set_hexpand(True)
+        for column, title in enumerate(("SCOPE", "NAME", "STATUS", "")):
+            header = Gtk.Label(label=title)
+            header.set_xalign(0)
+            header.get_style_context().add_class("context-header")
+            context_grid.attach(header, column, 0, 1, 1)
+        for row_number, row in enumerate(self.context_rows):
+            grid_row = row_number + 1
+            scope_label = Gtk.Label(label=row["scope"])
+            scope_label.set_xalign(0.5)
+            scope_label.get_style_context().add_class("context-badge")
+            scope_label.get_style_context().add_class(
+                context_scope_style(row["scope"])
+            )
+            display_label = Gtk.Label(label=row["display_name"])
+            display_label.set_xalign(0)
+            display_label.set_hexpand(True)
+            display_label.set_ellipsize(Pango.EllipsizeMode.END)
+            display_label.set_tooltip_text(row["filename"])
+            status_label = Gtk.Label(label=row["status"])
+            status_label.set_xalign(0.5)
+            status_label.get_style_context().add_class("context-badge")
+            status_label.get_style_context().add_class(
+                context_status_style(row["status"])
+            )
+            edit_button = Gtk.Button(label="Edit")
+            edit_button.get_style_context().add_class("context-edit")
+            edit_button.connect("clicked", self._edit_context, row)
+            context_grid.attach(scope_label, 0, grid_row, 1, 1)
+            context_grid.attach(display_label, 1, grid_row, 1, 1)
+            context_grid.attach(status_label, 2, grid_row, 1, 1)
+            context_grid.attach(edit_button, 3, grid_row, 1, 1)
+        if not self.context_rows:
+            empty_label = Gtk.Label(label="등록된 Context가 없습니다.")
+            empty_label.set_xalign(0)
+            context_grid.attach(empty_label, 0, 1, 4, 1)
+        context_scroller = Gtk.ScrolledWindow()
+        context_scroller.set_policy(
+            Gtk.PolicyType.NEVER,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        context_scroller.set_shadow_type(Gtk.ShadowType.NONE)
+        context_scroller.add(context_grid)
+        self.context_list_box.pack_start(
+            context_scroller,
+            True,
+            True,
+            0,
+        )
+        self.context_list_box.show_all()
+        self._update_context_summary()
+        self._update_start_button()
+
+    def _update_context_summary(self):
+        if not hasattr(self, "context_panel_button"):
+            return
+        label, style_class = context_status_summary(self.context_rows)
+        if self.context_sync_in_progress:
+            label = "◌ Context Syncing..."
+            style_class = "status-not-synced"
+        arrow = "▾" if self.context_panel_button.get_active() else "▸"
+        self.context_panel_button.set_label(f"{label}  {arrow}")
+        style = self.context_panel_button.get_style_context()
+        for candidate in (
+            "status-synced",
+            "status-changed",
+            "status-not-synced",
+        ):
+            style.remove_class(candidate)
+        style.add_class(style_class)
+
+    def _new_context(self, *_args):
+        dialog = NewContextDialog(self)
+        while True:
+            response = dialog.run()
+            if response != Gtk.ResponseType.OK:
+                break
+            try:
+                self.context_manager.create_context(
+                    dialog.context_scope(),
+                    self.session_id,
+                    dialog.context_name(),
+                )
+            except FileExistsError:
+                self._show_context_error(
+                    "Context가 이미 존재합니다.",
+                    "같은 scope에 동일한 filename의 Context가 있습니다.",
+                    parent=dialog,
+                )
+                continue
+            except (OSError, ValueError) as error:
+                self._show_context_error(
+                    "Context를 만들 수 없습니다.",
+                    str(error),
+                    parent=dialog,
+                )
+                continue
+            self._refresh_contexts()
+            break
+        dialog.destroy()
+
+    def _sync_contexts(self, *_args):
+        if self.context_sync_in_progress:
+            return
+        session = (
+            self.session_store.get(self.session_id)
+            if self.session_store is not None
+            else None
+        )
+        if session is None:
+            self._show_context_error(
+                "Context를 sync할 수 없습니다.",
+                "현재 세션 정보를 찾을 수 없습니다.",
+            )
+            return
+        self._ensure_background_state()
+        self.context_sync_in_progress = True
+        self.context_sync_generation += 1
+        generation = self.context_sync_generation
+        self.sync_context_button.set_sensitive(False)
+        self._update_context_summary()
+        self._update_start_button()
+        self._start_background_task(
+            self._run_context_sync,
+            session,
+            generation,
+        )
+
+    def _run_context_sync(self, session, generation):
+        client = None
+
+        def client_factory(settings):
+            nonlocal client
+            client = self._new_background_client(settings)
+            return client
+
+        try:
+            backend = InterviewThreadBackend(
+                self.session_store,
+                self.context_manager,
+                client_factory,
+            )
+            result = backend.create(session)
+            error = None
+        except Exception as caught_error:
+            result = None
+            error = caught_error
+        finally:
+            self._unregister_background_client(client)
+        GLib.idle_add(
+            self._context_sync_finished,
+            generation,
+            result,
+            error,
+        )
+
+    def _context_sync_finished(self, generation, _result, error):
+        if generation != self.context_sync_generation:
+            return False
+        self.context_sync_in_progress = False
+        if not self.active:
+            return False
+        self.sync_context_button.set_sensitive(True)
+        if error is not None:
+            self._update_context_summary()
+            self._update_start_button()
+            self._show_context_error(
+                "Context sync에 실패했습니다.",
+                str(error),
+            )
+            return False
+        self.session = self.session_store.get(self.session_id)
+        self._refresh_contexts()
+        self._refresh_conversation()
+        return False
+
+    def _set_conversation_text(self, text):
+        self.conversation_buffer.set_text(text)
+
+    def _refresh_conversation(self, *_args):
+        if self.session_store is not None:
+            self.session = self.session_store.get(self.session_id)
+        self.conversation_load_generation += 1
+        generation = self.conversation_load_generation
+        thread_id = (
+            self.session.get("interview_thread_id")
+            if self.session is not None
+            else None
+        )
+        if not thread_id:
+            self.conversation_refresh_button.set_sensitive(True)
+            self._set_conversation_text(NO_INTERVIEW_THREAD_TEXT)
+            return
+        self.conversation_refresh_button.set_sensitive(False)
+        self._set_conversation_text("면접 대화를 불러오는 중…")
+        self._start_background_task(
+            self._run_conversation_load,
+            generation,
+            thread_id,
+            self.settings_snapshot(),
+        )
+
+    def _run_conversation_load(self, generation, thread_id, settings):
+        client = None
+        try:
+            client = self._new_background_client(settings)
+            client.connect()
+            thread = client.read_thread(thread_id, include_turns=True)
+            error = None
+        except Exception as caught_error:
+            thread = None
+            error = caught_error
+        finally:
+            if client is not None:
+                try:
+                    client.stop()
+                finally:
+                    self._unregister_background_client(client)
+        GLib.idle_add(
+            self._conversation_load_finished,
+            generation,
+            thread_id,
+            thread,
+            error,
+        )
+
+    def _conversation_load_finished(
+        self,
+        generation,
+        thread_id,
+        thread,
+        error,
+    ):
+        current_thread_id = (
+            self.session.get("interview_thread_id")
+            if self.session is not None
+            else None
+        )
+        if (
+            not self.active
+            or generation != self.conversation_load_generation
+            or thread_id != current_thread_id
+        ):
+            return False
+        self.conversation_refresh_button.set_sensitive(True)
+        if error is not None:
+            self._set_conversation_text(
+                f"면접 대화를 불러올 수 없습니다: {error}"
+            )
+            return False
+        messages = interview_conversation_messages(thread or {})
+        self.conversation_buffer.set_text("")
+        if not messages:
+            self._set_conversation_text(NO_INTERVIEW_CONVERSATION_TEXT)
+            return False
+        for message in messages:
+            self._append_conversation_message(
+                message["role"],
+                message["text"],
+            )
+        return False
+
+    def _append_conversation_message(self, role, text):
+        end = self.conversation_buffer.get_end_iter()
+        if self.conversation_buffer.get_char_count():
+            self.conversation_buffer.insert(end, "\n\n")
+            end = self.conversation_buffer.get_end_iter()
+        if role == "interviewer":
+            label = "INTERVIEWER\n"
+            tag = self.conversation_interviewer_tag
+        else:
+            label = "CODEX\n"
+            tag = self.conversation_codex_tag
+        self.conversation_buffer.insert_with_tags(end, label, tag)
+        end = self.conversation_buffer.get_end_iter()
+        self.conversation_buffer.insert_with_tags(
+            end,
+            text,
+            self.conversation_body_tag,
+        )
+
+    def interview_thread_id(self):
+        if not can_start_interview(self.session, self.context_rows):
+            return None
+        return self.session["interview_thread_id"]
+
+    def _edit_context(self, _button, row):
+        try:
+            path = Path(row["path"]).resolve(strict=True)
+            if not path.is_file():
+                raise OSError(f"Context file does not exist: {path}")
+            if not Gio.AppInfo.launch_default_for_uri(path.as_uri(), None):
+                raise OSError(f"No application can open: {path.name}")
+        except (OSError, ValueError, GLib.Error) as error:
+            self._show_context_error(
+                "Context 파일을 열 수 없습니다.",
+                str(error),
+            )
+
+    def _show_context_error(self, title, detail, parent=None):
+        dialog = Gtk.MessageDialog(
+            transient_for=parent or self,
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=title,
+        )
+        dialog.format_secondary_text(detail)
+        dialog.run()
+        dialog.destroy()
+
+    def run_session(self):
+        self._ensure_background_state()
+        self.background_stop.clear()
+        self.session = (
+            self.session_store.get(self.session_id)
+            if self.session_store is not None
+            else None
+        )
+        self._refresh_contexts()
+        self.sync_context_button.set_sensitive(
+            not self.context_sync_in_progress
+            and self.context_manager is not None
+            and self.session_store is not None
+        )
+        self.active = True
+        self._load_model_catalog()
+        self._refresh_conversation()
         response = self.run()
-        self.hide()
         self.active = False
-        if self.worker is not None:
-            self.worker.stop()
-            self.worker = None
+        self.context_sync_generation += 1
+        self.model_catalog_load_generation += 1
+        self.conversation_load_generation += 1
+        self._stop_background_tasks()
+        self.hide()
         return response
 
-    def _codex_ready(self, result, error):
-        if not self.active or self.worker is None:
-            return False
-        if error:
-            self.status.set_text(f"Codex 연결 오류: {error}")
-            self._append_status(f"Codex 연결 오류: {error}")
-            return False
-        self.ready = True
-        if result.get("models"):
-            self._set_model_catalog(result["models"], persist=True)
-        self._set_settings_sensitive(True)
-        self.history_turns = CodexAppServerClient.conversation_turns(
-            result.get("thread", {})
+    def _load_model_catalog(self):
+        self.model_catalog_load_generation += 1
+        generation = self.model_catalog_load_generation
+        self._start_background_task(
+            self._run_model_catalog_load,
+            generation,
+            self.settings_snapshot(),
         )
-        self.history_start = max(
-            0,
-            len(self.history_turns) - CHAT_HISTORY_PAGE_TURNS,
-        )
-        self._render_history()
-        self.status.set_text("준비 내용을 입력하세요. Enter 전송 · Shift+Enter 줄바꿈")
-        self._set_busy(False)
-        self.input.grab_focus()
+
+    def _run_model_catalog_load(self, generation, settings):
+        client = None
+        try:
+            client = self._new_background_client(settings)
+            client.connect()
+            models = client.list_models()
+        except Exception:
+            models = None
+        finally:
+            if client is not None:
+                try:
+                    client.stop()
+                finally:
+                    self._unregister_background_client(client)
+        GLib.idle_add(self._model_catalog_finished, generation, models)
+
+    def _ensure_background_state(self):
+        if not hasattr(self, "background_stop"):
+            self.background_stop = threading.Event()
+            self.background_lock = threading.Lock()
+            self.background_threads = set()
+            self.background_clients = set()
+        if not hasattr(self, "context_sync_generation"):
+            self.context_sync_generation = 0
+
+    def _start_background_task(self, target, *args):
+        self._ensure_background_state()
+        if self.background_stop.is_set():
+            return None
+        thread_holder = {}
+
+        def run():
+            try:
+                target(*args)
+            finally:
+                with self.background_lock:
+                    self.background_threads.discard(thread_holder["thread"])
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread_holder["thread"] = thread
+        with self.background_lock:
+            self.background_threads.add(thread)
+        thread.start()
+        return thread
+
+    def _new_background_client(self, settings):
+        self._ensure_background_state()
+        client = _new_codex_client(settings)
+        with self.background_lock:
+            if self.background_stop.is_set():
+                client.stop()
+                raise RuntimeError("Preparation background work is stopping")
+            self.background_clients.add(client)
+        return client
+
+    def _unregister_background_client(self, client):
+        if client is None:
+            return
+        self._ensure_background_state()
+        with self.background_lock:
+            self.background_clients.discard(client)
+
+    def _stop_background_tasks(self):
+        self._ensure_background_state()
+        self.background_stop.set()
+        with self.background_lock:
+            clients = list(self.background_clients)
+            threads = list(self.background_threads)
+        for client in clients:
+            try:
+                client.stop()
+            except Exception:
+                pass
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is not current:
+                thread.join(timeout=BACKGROUND_JOIN_TIMEOUT_SECONDS)
+
+    def _model_catalog_finished(self, generation, models):
+        if (
+            not self.active
+            or generation != self.model_catalog_load_generation
+        ):
+            return False
+        if models:
+            self._set_model_catalog(models, persist=True)
         return False
 
     def settings_snapshot(self):
@@ -1349,170 +2403,34 @@ class PreparationChatDialog(Gtk.Dialog):
         if language not in {"en", "ja"}:
             return
         self.codex_settings["stt_language"] = language
+        self._update_stt_model_info(language)
         self._persist_settings()
+
+    def _update_stt_model_info(self, language):
+        presentation = stt_presentation(language)
+        self.stt_model_title.set_text(presentation["title"])
+        self.stt_model_detail.set_text(
+            f"model: {presentation['model']}  ·  {presentation['mode']}"
+        )
+        self.stt_summary_label.set_text(stt_status_summary(language))
+        self.stt_summary_label.set_tooltip_text(
+            f"{presentation['title']}\n"
+            f"model: {presentation['model']}\n"
+            f"{presentation['mode']}"
+        )
 
     def _persist_settings(self):
         if self.session_store is not None:
             self.session_store.update_settings(
-                self.thread_id,
+                self.session_id,
                 self.codex_settings,
             )
-        if self.worker is not None:
-            self.worker.set_model_and_effort(
-                self.codex_settings["codex_model"],
-                self.codex_settings["codex_reasoning_effort"],
-            )
 
-    def _render_history(self):
-        self.history_buffer.set_text("")
-        for turn in self.history_turns[self.history_start:]:
-            for message in turn:
-                self._append_message(message["role"], message["text"])
-        GLib.idle_add(self._scroll_to_bottom)
-
-    def _append_message(self, role, text):
-        if not text:
-            return
-        end = self.history_buffer.get_end_iter()
-        if self.history_buffer.get_char_count():
-            self.history_buffer.insert(end, "\n")
-            end = self.history_buffer.get_end_iter()
-        if role == "user":
-            self.history_buffer.insert_with_tags(end, "YOU\n", self.user_tag)
-        else:
-            self.history_buffer.insert_with_tags(end, "CODEX\n", self.codex_tag)
-        end = self.history_buffer.get_end_iter()
-        self.history_buffer.insert_with_tags(end, text, self.body_tag)
-
-    def _append_status(self, text):
-        end = self.history_buffer.get_end_iter()
-        if self.history_buffer.get_char_count():
-            self.history_buffer.insert(end, "\n\n")
-            end = self.history_buffer.get_end_iter()
-        self.history_buffer.insert_with_tags(end, text, self.error_tag)
-        GLib.idle_add(self._scroll_to_bottom)
-
-    def _start_codex_stream(self, delta):
-        self.stream_started = True
-        end = self.history_buffer.get_end_iter()
-        self.history_buffer.insert(end, "\n\n")
-        end = self.history_buffer.get_end_iter()
-        self.history_buffer.insert_with_tags(end, "CODEX\n", self.codex_tag)
-        end = self.history_buffer.get_end_iter()
-        self.history_buffer.insert_with_tags(end, delta, self.body_tag)
-        GLib.idle_add(self._scroll_to_bottom)
-
-    def _append_codex_stream(self, delta):
-        end = self.history_buffer.get_end_iter()
-        self.history_buffer.insert_with_tags(end, delta, self.body_tag)
-        GLib.idle_add(self._scroll_to_bottom)
-
-    def _send(self, *_args):
-        if not self.ready or self.busy or self.worker is None:
-            return
-        buffer = self.input.get_buffer()
-        text = buffer.get_text(
-            buffer.get_start_iter(),
-            buffer.get_end_iter(),
-            True,
-        ).strip()
-        if not text:
-            return
-        buffer.set_text("")
-        self._append_message("user", text)
-        self.stream_started = False
-        self._set_busy(True)
-        self.status.set_text("Codex가 답변을 작성 중입니다…")
-        GLib.idle_add(self._scroll_to_bottom)
-
-        def streamed(delta, _elapsed):
-            if not self.active:
-                return False
-            if self.stream_started:
-                self._append_codex_stream(delta)
-            else:
-                self._start_codex_stream(delta)
-            return False
-
-        def finished(result, error):
-            if not self.active:
-                return False
-            turn_messages = [{"role": "user", "text": text}]
-            if error:
-                self._append_status(f"Codex 오류: {error}")
-            else:
-                turn_messages.append({
-                    "role": "assistant",
-                    "text": result["text"],
-                })
-                if not self.stream_started:
-                    self._append_message("assistant", result["text"])
-            self.history_turns.append(turn_messages)
-            self.status.set_text(
-                "준비 내용을 입력하세요. Enter 전송 · Shift+Enter 줄바꿈"
-            )
-            self._set_busy(False)
-            self.input.grab_focus()
-            return False
-
-        self.worker.submit(
-            text,
-            finished,
-            streamed,
-            interactive=True,
-            on_approval=self._approve_tool,
+    def _update_start_button(self):
+        self.start_button.set_sensitive(
+            not self.context_sync_in_progress
+            and can_start_interview(self.session, self.context_rows)
         )
-
-    def _approve_tool(self, method, params):
-        is_command = method == "item/commandExecution/requestApproval"
-        title = "명령 실행을 허용할까요?" if is_command else "파일 변경을 허용할까요?"
-        detail = params.get("reason") or "Codex가 작업 승인을 요청했습니다."
-        if is_command and params.get("command"):
-            command = params["command"]
-            if isinstance(command, list):
-                command = " ".join(str(part) for part in command)
-            detail = f"{detail}\n\n{command}"
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            message_type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.NONE,
-            text=title,
-        )
-        dialog.format_secondary_text(detail)
-        dialog.add_button("거부", Gtk.ResponseType.CANCEL)
-        dialog.add_button("허용", Gtk.ResponseType.OK)
-        response = dialog.run()
-        dialog.destroy()
-        return "accept" if response == Gtk.ResponseType.OK else "decline"
-
-    def _set_busy(self, busy):
-        self.busy = busy
-        enabled = self.ready and not busy
-        self.send_button.set_sensitive(enabled)
-        self.start_button.set_sensitive(enabled)
-        self.input.set_sensitive(enabled)
-
-    def _input_key_pressed(self, _widget, event):
-        if event.keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            return False
-        if event.state & Gdk.ModifierType.SHIFT_MASK:
-            return False
-        self._send()
-        return True
-
-    def _history_scrolled(self, adjustment):
-        if adjustment.get_value() > 1 or self.history_start == 0:
-            return
-        self.history_start = max(0, self.history_start - CHAT_HISTORY_PAGE_TURNS)
-        self._render_history()
-
-    def _scroll_to_bottom(self):
-        adjustment = self.history_scroller.get_vadjustment()
-        adjustment.set_value(
-            max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size())
-        )
-        return False
 
     def _delete(self, *_args):
         self.response(Gtk.ResponseType.DELETE_EVENT)
@@ -1563,7 +2481,7 @@ class InterviewControlWindow(Gtk.Window):
         self.set_live_windows_hidden(False)
 
         back_button = Gtk.Button(label="←")
-        back_button.set_tooltip_text("준비 채팅으로 돌아가기")
+        back_button.set_tooltip_text("면접 준비 화면으로 돌아가기")
         back_button.get_style_context().add_class("control-button")
         back_button.connect("clicked", lambda _button: on_back())
         row.pack_start(back_button, False, False, 0)
@@ -1713,7 +2631,7 @@ class TranscriptWindow(Gtk.Window):
                 answer_overlay.add_overlay(close_button)
             if self.on_back is not None:
                 back_button = Gtk.Button(label="←")
-                back_button.set_tooltip_text("준비 채팅으로 돌아가기")
+                back_button.set_tooltip_text("면접 준비 화면으로 돌아가기")
                 back_button.set_halign(Gtk.Align.START)
                 back_button.set_valign(Gtk.Align.START)
                 back_button.set_margin_top(2)
@@ -1979,6 +2897,8 @@ class InterviewApp:
         self.audio_started = False
         self.socket_thread = None
         self.trigger_socket = None
+        self.trigger_lock_file = None
+        self.audio_failure_reported = False
         self.window_state = self._load_window_state()
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
@@ -2097,36 +3017,7 @@ class InterviewApp:
         self.asr_worker.start()
 
     def _install_css(self):
-        css = b"""
-        window { background-color: rgba(18, 20, 24, 0.94); border-radius: 14px; }
-        window.interviewer { border: 2px solid rgba(95, 176, 255, 0.85); }
-        window.answer { border: 2px solid rgba(255, 195, 92, 0.82); }
-        window.control { border: 2px solid rgba(255, 195, 92, 0.82); }
-        .heading { color: #8ec8ff; font: bold 12px Sans; letter-spacing: 1px; }
-        window.answer .heading { color: #ffc75c; }
-        .position-guide { border: 2px solid rgba(255, 195, 92, 0.75); background: transparent; }
-        .focus-transcript { color: #fff5d9; background: transparent; font: bold 22px Sans; }
-        .focus-transcript text { color: #fff5d9; background: transparent; }
-        .transcript { color: #ffffff; font: 20px Sans; }
-        .boundary-status { color: rgba(142, 200, 255, 0.78); font: bold 11px Sans; padding: 1px 2px 0; border-top: 1px solid rgba(142, 200, 255, 0.18); }
-        .response-status { color: rgba(255, 199, 92, 0.78); font: bold 11px Sans; padding: 1px 2px 0; border-top: 1px solid rgba(255, 199, 92, 0.18); }
-        .shortcut-reminder { color: rgba(174, 181, 191, 0.68); font: 10px Sans; padding: 1px 2px 0; }
-        .close-button { color: #d8dde5; font: bold 18px Sans; padding: 0 4px; }
-        .close-button:hover { color: #ffffff; background: rgba(255, 90, 90, 0.55); }
-        .control-button { color: #fff5d9; font: bold 18px Sans; padding: 2px 8px; }
-        .visibility-button { padding: 2px 4px; }
-        .control-drag { color: #aeb5bf; font: 18px Sans; padding: 0 4px; }
-        .resize-handle { background: rgba(139, 146, 157, 0.16); }
-        .resize-handle:hover { background: rgba(142, 200, 255, 0.55); }
-        .resize-corner { color: #aeb5bf; font: 12px Sans; }
-        """
-        provider = Gtk.CssProvider()
-        provider.load_from_data(css)
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(),
-            provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
+        install_application_css()
 
     def _load_window_state(self):
         try:
@@ -2135,7 +3026,8 @@ class InterviewApp:
             return {}
 
     def _save_window_state(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        CONFIG_DIR.chmod(0o700)
         state = {}
         for role, window in (
             ("INTERVIEWER", self.remote_window),
@@ -2149,6 +3041,7 @@ class InterviewApp:
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        WINDOW_STATE_PATH.chmod(0o600)
 
     def _install_global_f8(self):
         return self._install_global_hotkey(
@@ -2208,6 +3101,20 @@ class InterviewApp:
             return f"error: {error}"
 
     def _start_trigger_listener(self):
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        lock_file = TRIGGER_LOCK_PATH.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(
+                lock_file.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as error:
+            lock_file.close()
+            raise RuntimeError(
+                "Interview Assistant is already running"
+            ) from error
+
+        self.trigger_lock_file = lock_file
         try:
             TRIGGER_SOCKET.unlink(missing_ok=True)
             self.trigger_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -2215,6 +3122,7 @@ class InterviewApp:
             os.chmod(TRIGGER_SOCKET, 0o600)
             self.trigger_socket.settimeout(0.5)
         except OSError as error:
+            self._close_trigger_listener()
             raise RuntimeError(f"Cannot create F8 trigger socket: {error}") from error
 
         def listen():
@@ -2234,6 +3142,28 @@ class InterviewApp:
 
         self.socket_thread = threading.Thread(target=listen, daemon=True)
         self.socket_thread.start()
+
+    def _close_trigger_listener(self):
+        socket_error = None
+        try:
+            if self.trigger_socket is not None:
+                self.trigger_socket.close()
+        except OSError as error:
+            socket_error = error
+        finally:
+            self.trigger_socket = None
+            if self.trigger_lock_file is not None:
+                try:
+                    TRIGGER_SOCKET.unlink(missing_ok=True)
+                finally:
+                    fcntl.flock(
+                        self.trigger_lock_file.fileno(),
+                        fcntl.LOCK_UN,
+                    )
+                    self.trigger_lock_file.close()
+                    self.trigger_lock_file = None
+        if socket_error is not None:
+            raise socket_error
 
     def _key_pressed(self, _window, event):
         if event.keyval == Gdk.KEY_F8:
@@ -2273,6 +3203,8 @@ class InterviewApp:
         return False
 
     def _moonshine_pcm(self, pcm_audio, start_cursor, end_cursor):
+        if getattr(self, "audio_failure_reported", False):
+            return
         try:
             accepted = self.asr_worker.submit_pcm(
                 pcm_audio,
@@ -2282,6 +3214,8 @@ class InterviewApp:
             if not accepted:
                 raise RuntimeError("Moonshine worker is not accepting PCM")
         except Exception as error:
+            self.audio_failure_reported = True
+            self.remote_audio.abort()
             GLib.idle_add(self._moonshine_error, error)
 
     def _moonshine_preview(self, snapshot):
@@ -2295,7 +3229,12 @@ class InterviewApp:
     def _moonshine_error(self, error):
         if not self.running:
             return False
+        if not getattr(self, "audio_failure_reported", False):
+            self.audio_failure_reported = True
+            self.remote_audio.abort()
+        self.audio_started = False
         self.remote_window.set_status(f"Moonshine error: {error}")
+        self.remote_window.set_boundary_status(BOUNDARY_STATUS_ERROR)
         append_log(self.log_path, {
             "event": "moonshine_error",
             "error": str(error),
@@ -2992,7 +3931,15 @@ PREVIOUS INCOMPLETE QUESTION:
         append_log(self.log_path, {
             "event": "audio_error", "role": role, "error": str(error),
         })
-        GLib.idle_add(self._window(role).set_status, f"Audio error: {error}")
+        self.audio_started = False
+
+        def show_error():
+            window = self._window(role)
+            window.set_status(f"Audio error: {error}")
+            window.set_boundary_status(BOUNDARY_STATUS_ERROR)
+            return False
+
+        GLib.idle_add(show_error)
 
     def _window(self, role):
         return self.remote_window
@@ -3021,31 +3968,42 @@ PREVIOUS INCOMPLETE QUESTION:
             return False
         self.running = False
         self.exit_action = exit_action
-        self._save_window_state()
-        self.remote_audio.stop()
-        self.asr_worker.stop()
+        cleanup_errors = []
+
+        def run_cleanup(name, callback):
+            try:
+                callback()
+            except Exception as error:
+                cleanup_errors.append((name, error))
+
+        run_cleanup("window_state", self._save_window_state)
+        run_cleanup("audio", self.remote_audio.stop)
+        run_cleanup("moonshine", self.asr_worker.stop)
         if self.codex_worker is not None:
-            self.codex_worker.stop()
-        if self.trigger_socket is not None:
-            self.trigger_socket.close()
-        TRIGGER_SOCKET.unlink(missing_ok=True)
-        append_log(self.log_path, {
+            run_cleanup("codex", self.codex_worker.stop)
+        run_cleanup("trigger_socket", self._close_trigger_listener)
+        run_cleanup("session_log", lambda: append_log(self.log_path, {
             "event": "app_session_end",
             "exit_action": exit_action,
             "questions": self.question_count,
             "codex_requests": self.codex_request_count,
-        })
+            "cleanup_errors": [
+                {"resource": name, "error": str(error)}
+                for name, error in cleanup_errors
+            ],
+        }))
         for window in (
             self.remote_window,
             self.answer_window,
             self.control_window,
         ):
-            window.hide()
-        Gtk.main_quit()
+            run_cleanup("window_hide", window.hide)
+        run_cleanup("gtk_quit", Gtk.main_quit)
         return False
 
 
 def main():
+    install_application_css()
     if not CODEX_ENABLED:
         app = InterviewApp(None)
         GLib.unix_signal_add(
@@ -3057,28 +4015,33 @@ def main():
         return
 
     store = SessionStore(SESSION_STORE_PATH)
+    context_manager = ContextManager(CONFIG_DIR)
     while True:
-        session = choose_interview_session(store)
+        session = choose_interview_session(store, context_manager)
         if session is None:
             return
-        thread_id = session["thread_id"]
-        chat = PreparationChatDialog(
-            thread_id,
+        session_id = session["session_id"]
+        preparation = PreparationDialog(
+            session_id,
             session_store=store,
             session_settings=session.get("settings"),
+            context_manager=context_manager,
         )
         while True:
-            response = chat.run_session()
+            response = preparation.run_session()
             if response == CHAT_RESPONSE_BACK:
-                chat.destroy()
+                preparation.destroy()
                 break
             if response != CHAT_RESPONSE_START_INTERVIEW:
-                chat.destroy()
+                preparation.destroy()
                 return
 
-            live_codex_settings = chat.settings_snapshot()
+            live_codex_settings = preparation.settings_snapshot()
+            interview_thread_id = preparation.interview_thread_id()
+            if interview_thread_id is None:
+                continue
             app = InterviewApp(
-                thread_id,
+                interview_thread_id,
                 codex_settings=live_codex_settings,
             )
             signal_source = GLib.unix_signal_add(
@@ -3090,7 +4053,7 @@ def main():
             GLib.source_remove(signal_source)
             if app.exit_action == "back":
                 continue
-            chat.destroy()
+            preparation.destroy()
             return
 
 

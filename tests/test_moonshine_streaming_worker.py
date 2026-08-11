@@ -412,6 +412,36 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
         worker.stop()
         self.assertEqual(auto_results, [])
 
+    def test_stop_times_out_instead_of_waiting_forever(self):
+        errors = []
+
+        class StuckThread:
+            def __init__(self):
+                self.join_timeout = None
+
+            def join(self, timeout=None):
+                self.join_timeout = timeout
+
+            def is_alive(self):
+                return True
+
+        worker = MoonshineStreamingWorker(
+            lambda *_args: None,
+            lambda *_args: None,
+            errors.append,
+        )
+        stuck = StuckThread()
+        worker.thread = stuck
+        worker.accepting = True
+
+        worker.stop()
+
+        self.assertEqual(stuck.join_timeout, 5.0)
+        self.assertFalse(worker.accepting)
+        self.assertIs(worker.thread, stuck)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("did not stop within 5 seconds", str(errors[0]))
+
 
 if __name__ == "__main__":
     unittest.main()
