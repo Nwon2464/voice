@@ -263,7 +263,7 @@ class InterviewLauncher(Gtk.Window):
         cards.pack_start(self._add_card(
             DEBUG_MODE,
             "STT / UI Debug",
-            "Codex 없이 STT, silence commit, F8/F9, UI 테스트",
+            "Codex 없이 STT, silence segment, F8/F9, UI 테스트",
             "디버그 로그를 구분할 이름을 입력하세요.",
             "예: audio-debug, stt-check",
         ), False, False, 0)

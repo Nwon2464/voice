@@ -1331,16 +1331,13 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             interview_app.BOUNDARY_STATUS_LISTENING,
         )
 
-    def test_auto_commit_logs_silence_source_with_codex_disabled(self):
+    def test_silence_segment_never_commits_question_or_requests_codex(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
-            app.running = True
-            app.log_path = Path(directory) / "session.jsonl"
-            app.codex_enabled = False
-            app.question_count = 0
-            app.remote_window = _FakeAnswerWindow()
-            app.answer_window = _FakeAnswerWindow()
-            app.conversation_context = []
+            app = self._app(
+                codex_enabled=True,
+                log_path=Path(directory) / "session.jsonl",
+            )
+            app.stt_language = "ja"
             result = {
                 "text": "Why this role?",
                 "display_text": "Why this role?",
@@ -1356,62 +1353,29 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
                 "max_backlog_ms": 20.0,
                 "barrier_wait_ms": 0.0,
                 "force_update_ms": 2.0,
+                "segment_preserved": True,
+                "accumulated_segment_count": 1,
             }
 
+            app._moonshine_auto_commit(result, None)
+            result["text"] = "What are your strengths?"
+            result["accumulated_segment_count"] = 2
             app._moonshine_auto_commit(result, None)
 
             events = [
                 json.loads(line)
                 for line in app.log_path.read_text(encoding="utf-8").splitlines()
             ]
-            question = next(event for event in events if event["event"] == "question")
-            self.assertEqual(question["commit_source"], "silence")
-            self.assertEqual(app.question_count, 1)
-            self.assertEqual(app.answer_window.status, "Codex disabled · question logged only")
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["silence_segment", "silence_segment"],
+            )
+            self.assertEqual(app.question_count, 0)
+            self.assertEqual(app.conversation_context, [])
+            self.assertEqual(app.codex_worker.jobs, [])
             self.assertEqual(
                 app.remote_window.boundary_status,
                 interview_app.BOUNDARY_STATUS_AUTO,
-            )
-
-    def test_silence_a_then_f9_b_replaces_a_with_combined_question(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            log_path = Path(directory) / "session.jsonl"
-            app = self._app(log_path=log_path)
-            self._commit(app, 1, "Tell me about a project where you", 16_000, "silence")
-
-            self._continue(
-                app,
-                "had to solve a difficult technical problem.",
-                32_000,
-            )
-
-            combined = (
-                "Tell me about a project where you "
-                "had to solve a difficult technical problem."
-            )
-            self.assertEqual(app.conversation_context, [("INTERVIEWER", combined)])
-            self.assertEqual(app.remote_window.text, combined)
-            self.assertEqual(
-                app.last_commit_state["commit_source"],
-                "f9_continuation",
-            )
-            events = [
-                json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
-            ]
-            correction = [
-                event for event in events
-                if event.get("commit_source") == "f9_continuation"
-                and event["event"] == "question"
-            ][0]
-            self.assertEqual(correction["previous_question"], 1)
-            self.assertEqual(correction["previous_target_sample_cursor"], 16_000)
-            self.assertEqual(correction["text"], combined)
-            self.assertTrue(correction["cursor_complete"])
-            self.assertEqual(correction["audio_drop_samples"], 0)
-            self.assertEqual(
-                app.remote_window.boundary_status,
-                interview_app.BOUNDARY_STATUS_F9,
             )
 
     def test_f8_a_then_f9_b_replaces_a_with_combined_question(self):
@@ -1464,16 +1428,26 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
                 {"moonshine-base-ja"},
             )
 
-    def test_silence_a_then_f8_b_stays_as_two_questions(self):
-        app = self._app()
-        self._commit(app, 1, "Why this role?", 10_000, "silence")
-        self._commit(app, 2, "What are your strengths?", 20_000, "f8")
+    def test_empty_and_duplicate_f8_do_not_consume_question_number(self):
+        app = self._app(codex_enabled=True)
+        app.asr_worker = SimpleNamespace(last_committed_sample_cursor=10_000)
+        empty = self._result("", 10_000)
+        empty["committed"] = False
 
-        self.assertEqual(app.conversation_context, [
-            ("INTERVIEWER", "Why this role?"),
-            ("INTERVIEWER", "What are your strengths?"),
-        ])
-        self.assertEqual(app.last_commit_state["commit_source"], "f8")
+        app._moonshine_question_ready(
+            None, time.perf_counter(), empty, None, commit_source="f8"
+        )
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result("Why this role?", 20_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        self.assertEqual(app.last_commit_state["question_number"], 1)
 
     def test_f8_a_then_f8_b_stays_as_two_questions(self):
         app = self._app()
@@ -1520,7 +1494,7 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
 
     def test_completed_codex_a_is_explicitly_superseded_by_a_plus_b(self):
         app = self._app(codex_enabled=True)
-        self._commit(app, 1, "Tell me about a project where you", 10_000, "silence")
+        self._commit(app, 1, "Tell me about a project where you", 10_000, "f8")
         first_job = app.codex_worker.jobs[0]
         first_job["on_start"]()
         first_job["callback"]({

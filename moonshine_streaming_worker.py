@@ -310,8 +310,10 @@ class MoonshineStreamingWorker:
                     "force_update_ms": round(force_update_ms, 1),
                 }
 
+            accumulated_segments = []
+
             def commit_snapshot(request):
-                """Shared F8/auto cursor barrier, FORCE snapshot and reset."""
+                """Snapshot/reset a silence segment or commit all segments manually."""
                 nonlocal stream, speech_seen_since_commit, silence_samples
                 target = request["target_sample_cursor"]
                 if self.consumed_sample_cursor != target:
@@ -321,7 +323,9 @@ class MoonshineStreamingWorker:
                     )
 
                 if (
-                    self.last_committed_sample_cursor is not None
+                    request["commit_source"] != "silence"
+                    and not accumulated_segments
+                    and self.last_committed_sample_cursor is not None
                     and not speech_seen_since_commit
                 ):
                     result = snapshot_result(
@@ -338,20 +342,68 @@ class MoonshineStreamingWorker:
                 transcript = stream.update_transcription(force_flag)
                 force_done = time.perf_counter()
                 lines = transcript_lines_snapshot(transcript)
+                current_text = lines_question_text(lines)
+                current_display_text = lines_display_text(lines)
+                if request["commit_source"] == "silence":
+                    if current_text:
+                        accumulated_segments.append({
+                            "text": current_text,
+                            "display_text": current_display_text,
+                            "lines": lines,
+                        })
+                    committed_lines = lines
+                    committed_text = current_text
+                    committed_display_text = current_display_text
+                else:
+                    committed_lines = [
+                        line
+                        for segment in accumulated_segments
+                        for line in segment["lines"]
+                    ] + lines
+                    committed_text = " ".join(
+                        text
+                        for text in (
+                            *(
+                                segment["text"]
+                                for segment in accumulated_segments
+                            ),
+                            current_text,
+                        )
+                        if text
+                    )
+                    committed_display_text = "\n".join(
+                        text
+                        for text in (
+                            *(
+                                segment["display_text"]
+                                for segment in accumulated_segments
+                            ),
+                            current_display_text,
+                        )
+                        if text
+                    )
+                committed = bool(committed_text)
                 result = snapshot_result(
                     request,
-                    committed=True,
+                    committed=committed,
                     barrier_wait_ms=(
                         force_started - request["requested_at"]
                     ) * 1000,
                     force_update_ms=(force_done - force_started) * 1000,
                 )
                 result.update({
-                    "text": lines_question_text(lines),
-                    "display_text": lines_display_text(lines),
-                    "lines": lines,
+                    "text": committed_text,
+                    "display_text": committed_display_text,
+                    "lines": committed_lines,
+                    "accumulated_segment_count": len(accumulated_segments),
+                    "segment_preserved": (
+                        request["commit_source"] == "silence"
+                        and bool(current_text)
+                    ),
                 })
-                self.last_committed_sample_cursor = target
+                if request["commit_source"] != "silence" and committed:
+                    self.last_committed_sample_cursor = target
+                    accumulated_segments.clear()
                 speech_seen_since_commit = False
                 silence_samples = 0
                 self.dispatch(request["callback"], result, None)
