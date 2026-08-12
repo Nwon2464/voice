@@ -161,6 +161,146 @@ class _FakeAnswerWindow:
         self.stream = text
 
 
+class _FocusTextIter:
+    def __init__(self, offset):
+        self.offset = offset
+
+
+class _FocusTextMark:
+    def __init__(self, offset, left_gravity):
+        self.offset = offset
+        self.left_gravity = left_gravity
+
+
+class _FocusTextBuffer:
+    def __init__(self):
+        self.text = ""
+        self.marks = []
+        self.set_text_calls = 0
+
+    def set_text(self, text):
+        self.text = text
+        self.set_text_calls += 1
+
+    def get_end_iter(self):
+        return _FocusTextIter(len(self.text))
+
+    def get_iter_at_offset(self, offset):
+        return _FocusTextIter(offset)
+
+    def get_iter_at_mark(self, mark):
+        return _FocusTextIter(mark.offset)
+
+    def get_text(self, start, end, _include_hidden):
+        return self.text[start.offset:end.offset]
+
+    def insert(self, position, text):
+        offset = position.offset
+        self.text = self.text[:offset] + text + self.text[offset:]
+        for mark in self.marks:
+            if mark.offset > offset or (
+                mark.offset == offset and not mark.left_gravity
+            ):
+                mark.offset += len(text)
+
+    def delete(self, start, end):
+        removed = end.offset - start.offset
+        self.text = self.text[:start.offset] + self.text[end.offset:]
+        for mark in self.marks:
+            if mark.offset > end.offset:
+                mark.offset -= removed
+            elif mark.offset >= start.offset:
+                mark.offset = start.offset
+
+    def create_mark(self, _name, position, left_gravity):
+        mark = _FocusTextMark(position.offset, left_gravity)
+        self.marks.append(mark)
+        return mark
+
+    def delete_mark(self, mark):
+        self.marks.remove(mark)
+
+
+class _FocusTextView:
+    def __init__(self):
+        self.buffer = _FocusTextBuffer()
+        self.scroll_position = 0
+        self.scroll_calls = []
+
+    def get_buffer(self):
+        return self.buffer
+
+    def scroll_to_mark(
+        self,
+        mark,
+        within_margin,
+        use_align,
+        xalign,
+        yalign,
+    ):
+        self.scroll_position = mark.offset
+        self.scroll_calls.append(
+            (mark, within_margin, use_align, xalign, yalign)
+        )
+
+    def get_iter_location(self, position):
+        return SimpleNamespace(y=position.offset)
+
+
+class _FocusAdjustment:
+    def __init__(self):
+        self.value = 0
+
+    def get_lower(self):
+        return 0
+
+    def get_upper(self):
+        return 10_000
+
+    def get_page_size(self):
+        return 100
+
+    def set_value(self, value):
+        self.value = value
+
+    def get_value(self):
+        return self.value
+
+
+class _FocusScroller:
+    def __init__(self):
+        self.adjustment = _FocusAdjustment()
+
+    def get_vadjustment(self):
+        return self.adjustment
+
+
+class _FocusHistoryHarness:
+    start_stream = interview_app.TranscriptWindow.start_stream
+    append_stream = interview_app.TranscriptWindow.append_stream
+    finish_stream = interview_app.TranscriptWindow.finish_stream
+    _render_focus_answers = interview_app.TranscriptWindow._render_focus_answers
+    _clear_latest_answer_mark = (
+        interview_app.TranscriptWindow._clear_latest_answer_mark
+    )
+    _set_latest_answer_mark = (
+        interview_app.TranscriptWindow._set_latest_answer_mark
+    )
+    _align_latest_answer_once = (
+        interview_app.TranscriptWindow._align_latest_answer_once
+    )
+
+    def __init__(self, history):
+        self.focus_mode = True
+        self.text = _FocusTextView()
+        self.focus_scroller = _FocusScroller()
+        self.answer_history = list(history)
+        self.active_answer = ""
+        self.focus_placeholder = ""
+        self.latest_answer_mark = None
+        self._render_focus_answers()
+
+
 class _FakeVisibleWindow:
     def __init__(self, text, position, size, scroll):
         self.visible = True
@@ -1198,6 +1338,89 @@ class CodexLatestOnlyTest(unittest.TestCase):
             [stage for generation, stage in recovery_events if generation == 31],
             ["started", "resumed"],
         )
+
+
+class AnswerHistoryScrollTest(unittest.TestCase):
+    def test_new_answer_aligns_once_and_streaming_preserves_manual_scroll(self):
+        idle_callbacks = []
+        window = _FocusHistoryHarness(["First answer", "Second answer"])
+        initial_set_text_calls = window.text.buffer.set_text_calls
+
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: idle_callbacks.append(
+                (callback, args)
+            ),
+        ):
+            window.start_stream("Short answer")
+
+            self.assertEqual(len(idle_callbacks), 1)
+            callback, args = idle_callbacks.pop()
+            callback(*args)
+            latest_start = len("First answer\n\nSecond answer\n\n")
+            self.assertEqual(window.latest_answer_mark.offset, latest_start)
+            self.assertEqual(
+                window.focus_scroller.adjustment.get_value(),
+                latest_start,
+            )
+            self.assertEqual(
+                window.text.buffer.text,
+                "First answer\n\nSecond answer\n\nShort answer",
+            )
+
+            aligned_position = window.focus_scroller.adjustment.get_value()
+            window.append_stream(" plus tokens")
+            self.assertEqual(
+                window.focus_scroller.adjustment.get_value(),
+                aligned_position,
+            )
+            self.assertEqual(idle_callbacks, [])
+            self.assertEqual(
+                window.text.buffer.set_text_calls,
+                initial_set_text_calls + 1,
+            )
+
+            window.focus_scroller.adjustment.set_value(3)
+            window.append_stream(" after manual scroll")
+            self.assertEqual(window.focus_scroller.adjustment.get_value(), 3)
+            self.assertEqual(idle_callbacks, [])
+
+            final_text = "Short answer plus tokens after manual scroll"
+            window.finish_stream(final_text)
+            self.assertEqual(window.focus_scroller.adjustment.get_value(), 3)
+            self.assertEqual(
+                window.text.buffer.set_text_calls,
+                initial_set_text_calls + 1,
+            )
+            self.assertEqual(window.answer_history[-1], final_text)
+            self.assertTrue(window.text.buffer.text.startswith("First answer\n\n"))
+            self.assertGreater(window.latest_answer_mark.offset, 0)
+
+    def test_finish_corrects_only_latest_answer_without_scrolling(self):
+        idle_callbacks = []
+        window = _FocusHistoryHarness(["Previous answer"])
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: idle_callbacks.append(
+                (callback, args)
+            ),
+        ):
+            window.start_stream("Draft")
+            callback, args = idle_callbacks.pop()
+            callback(*args)
+            window.focus_scroller.adjustment.set_value(2)
+            set_text_calls = window.text.buffer.set_text_calls
+
+            window.finish_stream("Corrected final answer")
+
+            self.assertEqual(window.focus_scroller.adjustment.get_value(), 2)
+            self.assertEqual(window.text.buffer.set_text_calls, set_text_calls)
+            self.assertEqual(
+                window.text.buffer.text,
+                "Previous answer\n\nCorrected final answer",
+            )
 
 
 class MoonshineAppIntegrationTest(unittest.TestCase):

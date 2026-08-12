@@ -2548,6 +2548,7 @@ class TranscriptWindow(Gtk.Window):
         self.answer_history = []
         self.active_answer = ""
         self.focus_placeholder = ""
+        self.latest_answer_mark = None
         self.set_default_size(width, height)
         self.set_decorated(False)
         self.set_keep_above(True)
@@ -2736,6 +2737,17 @@ class TranscriptWindow(Gtk.Window):
                 self.answer_history.append(text)
                 self.focus_placeholder = ""
                 self._render_focus_answers()
+                buffer = self.text.get_buffer()
+                answer_start = len("\n\n".join(self.answer_history[:-1]))
+                if answer_start:
+                    answer_start += 2
+                self._set_latest_answer_mark(
+                    buffer.get_iter_at_offset(answer_start)
+                )
+                GLib.idle_add(
+                    self._align_latest_answer_once,
+                    self.latest_answer_mark,
+                )
             else:
                 self.text.set_text(text)
         elif self.focus_mode:
@@ -2770,9 +2782,19 @@ class TranscriptWindow(Gtk.Window):
         if not self.focus_mode:
             self.text.set_text(text)
             return
-        self.active_answer = text
+        self.active_answer = ""
         self.focus_placeholder = ""
         self._render_focus_answers()
+        buffer = self.text.get_buffer()
+        if self.answer_history:
+            buffer.insert(buffer.get_end_iter(), "\n\n")
+        self._set_latest_answer_mark(buffer.get_end_iter())
+        buffer.insert(buffer.get_end_iter(), text)
+        self.active_answer = text
+        GLib.idle_add(
+            self._align_latest_answer_once,
+            self.latest_answer_mark,
+        )
 
     def append_stream(self, text):
         if not text:
@@ -2781,32 +2803,66 @@ class TranscriptWindow(Gtk.Window):
             self.text.set_text(f"{self.text.get_text()}{text}")
             return
         self.active_answer += text
-        self._render_focus_answers()
+        self.text.get_buffer().insert(
+            self.text.get_buffer().get_end_iter(),
+            text,
+        )
 
     def finish_stream(self, text):
         if not self.focus_mode:
             self.set_text(text)
             return
+        buffer = self.text.get_buffer()
+        if self.latest_answer_mark is None:
+            self.set_text(text)
+            return
+        answer_start = buffer.get_iter_at_mark(self.latest_answer_mark)
+        current = buffer.get_text(
+            answer_start,
+            buffer.get_end_iter(),
+            True,
+        )
+        if current != text:
+            buffer.delete(answer_start, buffer.get_end_iter())
+            buffer.insert(buffer.get_end_iter(), text)
         self.active_answer = ""
         self.answer_history.append(text)
         self.focus_placeholder = ""
-        self._render_focus_answers()
 
     def _render_focus_answers(self):
+        self._clear_latest_answer_mark()
         parts = [*self.answer_history]
         if self.active_answer:
             parts.append(self.active_answer)
         rendered = "\n\n".join(parts) or self.focus_placeholder
         self.text.get_buffer().set_text(rendered)
-        GLib.idle_add(self._reset_focus_scroll)
 
-    def _reset_focus_scroll(self):
+    def _clear_latest_answer_mark(self):
+        if self.latest_answer_mark is not None:
+            self.text.get_buffer().delete_mark(self.latest_answer_mark)
+            self.latest_answer_mark = None
+
+    def _set_latest_answer_mark(self, position):
+        self._clear_latest_answer_mark()
+        self.latest_answer_mark = self.text.get_buffer().create_mark(
+            None,
+            position,
+            True,
+        )
+
+    def _align_latest_answer_once(self, mark):
+        if mark is not self.latest_answer_mark:
+            return False
+        buffer = self.text.get_buffer()
+        answer_start = buffer.get_iter_at_mark(mark)
+        answer_rect = self.text.get_iter_location(answer_start)
         adjustment = self.focus_scroller.get_vadjustment()
-        bottom = max(
-            adjustment.get_lower(),
+        minimum = adjustment.get_lower()
+        maximum = max(
+            minimum,
             adjustment.get_upper() - adjustment.get_page_size(),
         )
-        adjustment.set_value(bottom)
+        adjustment.set_value(max(minimum, min(answer_rect.y, maximum)))
         return False
 
     def _focus_scroll(self, _widget, event):
