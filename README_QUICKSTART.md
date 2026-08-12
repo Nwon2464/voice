@@ -4,7 +4,7 @@
 
 - 영어/일본어 면접 음성을 지원하며, Preparation 화면에서 언어를 선택합니다.
 - 영어는 Moonshine Small Streaming, 일본어는 Moonshine Base 모델로 실시간 자막화합니다.
-- 1.5초 무음 또는 F8로 새 질문을 확정합니다.
+- 1.5초 무음마다 transcript segment를 보존하고, F8로만 새 질문을 확정합니다.
 - F9으로 직전 질문에 이어진 발화를 합쳐 질문을 교정합니다.
 - Codex 답변은 별도의 Answer 창에 스트리밍합니다.
 - 세션별로 언어, Codex Model, Reasoning, Fast 설정과 대화 이력을 유지합니다.
@@ -145,7 +145,7 @@ INTERVIEW_TEST_LABEL=debug \
 .venv/bin/python interview_app.py
 ```
 
-Codex 요청 없이 Moonshine, 무음 commit, F8/F9와 UI만 확인하려면:
+Codex 요청 없이 Moonshine, 무음 segment, F8/F9와 UI만 확인하려면:
 
 ```bash
 INTERVIEW_DISABLE_CODEX=1 \

@@ -161,6 +161,146 @@ class _FakeAnswerWindow:
         self.stream = text
 
 
+class _FocusTextIter:
+    def __init__(self, offset):
+        self.offset = offset
+
+
+class _FocusTextMark:
+    def __init__(self, offset, left_gravity):
+        self.offset = offset
+        self.left_gravity = left_gravity
+
+
+class _FocusTextBuffer:
+    def __init__(self):
+        self.text = ""
+        self.marks = []
+        self.set_text_calls = 0
+
+    def set_text(self, text):
+        self.text = text
+        self.set_text_calls += 1
+
+    def get_end_iter(self):
+        return _FocusTextIter(len(self.text))
+
+    def get_iter_at_offset(self, offset):
+        return _FocusTextIter(offset)
+
+    def get_iter_at_mark(self, mark):
+        return _FocusTextIter(mark.offset)
+
+    def get_text(self, start, end, _include_hidden):
+        return self.text[start.offset:end.offset]
+
+    def insert(self, position, text):
+        offset = position.offset
+        self.text = self.text[:offset] + text + self.text[offset:]
+        for mark in self.marks:
+            if mark.offset > offset or (
+                mark.offset == offset and not mark.left_gravity
+            ):
+                mark.offset += len(text)
+
+    def delete(self, start, end):
+        removed = end.offset - start.offset
+        self.text = self.text[:start.offset] + self.text[end.offset:]
+        for mark in self.marks:
+            if mark.offset > end.offset:
+                mark.offset -= removed
+            elif mark.offset >= start.offset:
+                mark.offset = start.offset
+
+    def create_mark(self, _name, position, left_gravity):
+        mark = _FocusTextMark(position.offset, left_gravity)
+        self.marks.append(mark)
+        return mark
+
+    def delete_mark(self, mark):
+        self.marks.remove(mark)
+
+
+class _FocusTextView:
+    def __init__(self):
+        self.buffer = _FocusTextBuffer()
+        self.scroll_position = 0
+        self.scroll_calls = []
+
+    def get_buffer(self):
+        return self.buffer
+
+    def scroll_to_mark(
+        self,
+        mark,
+        within_margin,
+        use_align,
+        xalign,
+        yalign,
+    ):
+        self.scroll_position = mark.offset
+        self.scroll_calls.append(
+            (mark, within_margin, use_align, xalign, yalign)
+        )
+
+    def get_iter_location(self, position):
+        return SimpleNamespace(y=position.offset)
+
+
+class _FocusAdjustment:
+    def __init__(self):
+        self.value = 0
+
+    def get_lower(self):
+        return 0
+
+    def get_upper(self):
+        return 10_000
+
+    def get_page_size(self):
+        return 100
+
+    def set_value(self, value):
+        self.value = value
+
+    def get_value(self):
+        return self.value
+
+
+class _FocusScroller:
+    def __init__(self):
+        self.adjustment = _FocusAdjustment()
+
+    def get_vadjustment(self):
+        return self.adjustment
+
+
+class _FocusHistoryHarness:
+    start_stream = interview_app.TranscriptWindow.start_stream
+    append_stream = interview_app.TranscriptWindow.append_stream
+    finish_stream = interview_app.TranscriptWindow.finish_stream
+    _render_focus_answers = interview_app.TranscriptWindow._render_focus_answers
+    _clear_latest_answer_mark = (
+        interview_app.TranscriptWindow._clear_latest_answer_mark
+    )
+    _set_latest_answer_mark = (
+        interview_app.TranscriptWindow._set_latest_answer_mark
+    )
+    _align_latest_answer_once = (
+        interview_app.TranscriptWindow._align_latest_answer_once
+    )
+
+    def __init__(self, history):
+        self.focus_mode = True
+        self.text = _FocusTextView()
+        self.focus_scroller = _FocusScroller()
+        self.answer_history = list(history)
+        self.active_answer = ""
+        self.focus_placeholder = ""
+        self.latest_answer_mark = None
+        self._render_focus_answers()
+
+
 class _FakeVisibleWindow:
     def __init__(self, text, position, size, scroll):
         self.visible = True
@@ -1200,6 +1340,89 @@ class CodexLatestOnlyTest(unittest.TestCase):
         )
 
 
+class AnswerHistoryScrollTest(unittest.TestCase):
+    def test_new_answer_aligns_once_and_streaming_preserves_manual_scroll(self):
+        idle_callbacks = []
+        window = _FocusHistoryHarness(["First answer", "Second answer"])
+        initial_set_text_calls = window.text.buffer.set_text_calls
+
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: idle_callbacks.append(
+                (callback, args)
+            ),
+        ):
+            window.start_stream("Short answer")
+
+            self.assertEqual(len(idle_callbacks), 1)
+            callback, args = idle_callbacks.pop()
+            callback(*args)
+            latest_start = len("First answer\n\nSecond answer\n\n")
+            self.assertEqual(window.latest_answer_mark.offset, latest_start)
+            self.assertEqual(
+                window.focus_scroller.adjustment.get_value(),
+                latest_start,
+            )
+            self.assertEqual(
+                window.text.buffer.text,
+                "First answer\n\nSecond answer\n\nShort answer",
+            )
+
+            aligned_position = window.focus_scroller.adjustment.get_value()
+            window.append_stream(" plus tokens")
+            self.assertEqual(
+                window.focus_scroller.adjustment.get_value(),
+                aligned_position,
+            )
+            self.assertEqual(idle_callbacks, [])
+            self.assertEqual(
+                window.text.buffer.set_text_calls,
+                initial_set_text_calls + 1,
+            )
+
+            window.focus_scroller.adjustment.set_value(3)
+            window.append_stream(" after manual scroll")
+            self.assertEqual(window.focus_scroller.adjustment.get_value(), 3)
+            self.assertEqual(idle_callbacks, [])
+
+            final_text = "Short answer plus tokens after manual scroll"
+            window.finish_stream(final_text)
+            self.assertEqual(window.focus_scroller.adjustment.get_value(), 3)
+            self.assertEqual(
+                window.text.buffer.set_text_calls,
+                initial_set_text_calls + 1,
+            )
+            self.assertEqual(window.answer_history[-1], final_text)
+            self.assertTrue(window.text.buffer.text.startswith("First answer\n\n"))
+            self.assertGreater(window.latest_answer_mark.offset, 0)
+
+    def test_finish_corrects_only_latest_answer_without_scrolling(self):
+        idle_callbacks = []
+        window = _FocusHistoryHarness(["Previous answer"])
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: idle_callbacks.append(
+                (callback, args)
+            ),
+        ):
+            window.start_stream("Draft")
+            callback, args = idle_callbacks.pop()
+            callback(*args)
+            window.focus_scroller.adjustment.set_value(2)
+            set_text_calls = window.text.buffer.set_text_calls
+
+            window.finish_stream("Corrected final answer")
+
+            self.assertEqual(window.focus_scroller.adjustment.get_value(), 2)
+            self.assertEqual(window.text.buffer.set_text_calls, set_text_calls)
+            self.assertEqual(
+                window.text.buffer.text,
+                "Previous answer\n\nCorrected final answer",
+            )
+
+
 class MoonshineAppIntegrationTest(unittest.TestCase):
     @staticmethod
     def _result(text, cursor):
@@ -1331,16 +1554,13 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             interview_app.BOUNDARY_STATUS_LISTENING,
         )
 
-    def test_auto_commit_logs_silence_source_with_codex_disabled(self):
+    def test_silence_segment_never_commits_question_or_requests_codex(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
-            app.running = True
-            app.log_path = Path(directory) / "session.jsonl"
-            app.codex_enabled = False
-            app.question_count = 0
-            app.remote_window = _FakeAnswerWindow()
-            app.answer_window = _FakeAnswerWindow()
-            app.conversation_context = []
+            app = self._app(
+                codex_enabled=True,
+                log_path=Path(directory) / "session.jsonl",
+            )
+            app.stt_language = "ja"
             result = {
                 "text": "Why this role?",
                 "display_text": "Why this role?",
@@ -1356,62 +1576,29 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
                 "max_backlog_ms": 20.0,
                 "barrier_wait_ms": 0.0,
                 "force_update_ms": 2.0,
+                "segment_preserved": True,
+                "accumulated_segment_count": 1,
             }
 
+            app._moonshine_auto_commit(result, None)
+            result["text"] = "What are your strengths?"
+            result["accumulated_segment_count"] = 2
             app._moonshine_auto_commit(result, None)
 
             events = [
                 json.loads(line)
                 for line in app.log_path.read_text(encoding="utf-8").splitlines()
             ]
-            question = next(event for event in events if event["event"] == "question")
-            self.assertEqual(question["commit_source"], "silence")
-            self.assertEqual(app.question_count, 1)
-            self.assertEqual(app.answer_window.status, "Codex disabled · question logged only")
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["silence_segment", "silence_segment"],
+            )
+            self.assertEqual(app.question_count, 0)
+            self.assertEqual(app.conversation_context, [])
+            self.assertEqual(app.codex_worker.jobs, [])
             self.assertEqual(
                 app.remote_window.boundary_status,
                 interview_app.BOUNDARY_STATUS_AUTO,
-            )
-
-    def test_silence_a_then_f9_b_replaces_a_with_combined_question(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            log_path = Path(directory) / "session.jsonl"
-            app = self._app(log_path=log_path)
-            self._commit(app, 1, "Tell me about a project where you", 16_000, "silence")
-
-            self._continue(
-                app,
-                "had to solve a difficult technical problem.",
-                32_000,
-            )
-
-            combined = (
-                "Tell me about a project where you "
-                "had to solve a difficult technical problem."
-            )
-            self.assertEqual(app.conversation_context, [("INTERVIEWER", combined)])
-            self.assertEqual(app.remote_window.text, combined)
-            self.assertEqual(
-                app.last_commit_state["commit_source"],
-                "f9_continuation",
-            )
-            events = [
-                json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
-            ]
-            correction = [
-                event for event in events
-                if event.get("commit_source") == "f9_continuation"
-                and event["event"] == "question"
-            ][0]
-            self.assertEqual(correction["previous_question"], 1)
-            self.assertEqual(correction["previous_target_sample_cursor"], 16_000)
-            self.assertEqual(correction["text"], combined)
-            self.assertTrue(correction["cursor_complete"])
-            self.assertEqual(correction["audio_drop_samples"], 0)
-            self.assertEqual(
-                app.remote_window.boundary_status,
-                interview_app.BOUNDARY_STATUS_F9,
             )
 
     def test_f8_a_then_f9_b_replaces_a_with_combined_question(self):
@@ -1464,16 +1651,26 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
                 {"moonshine-base-ja"},
             )
 
-    def test_silence_a_then_f8_b_stays_as_two_questions(self):
-        app = self._app()
-        self._commit(app, 1, "Why this role?", 10_000, "silence")
-        self._commit(app, 2, "What are your strengths?", 20_000, "f8")
+    def test_empty_and_duplicate_f8_do_not_consume_question_number(self):
+        app = self._app(codex_enabled=True)
+        app.asr_worker = SimpleNamespace(last_committed_sample_cursor=10_000)
+        empty = self._result("", 10_000)
+        empty["committed"] = False
 
-        self.assertEqual(app.conversation_context, [
-            ("INTERVIEWER", "Why this role?"),
-            ("INTERVIEWER", "What are your strengths?"),
-        ])
-        self.assertEqual(app.last_commit_state["commit_source"], "f8")
+        app._moonshine_question_ready(
+            None, time.perf_counter(), empty, None, commit_source="f8"
+        )
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result("Why this role?", 20_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        self.assertEqual(app.last_commit_state["question_number"], 1)
 
     def test_f8_a_then_f8_b_stays_as_two_questions(self):
         app = self._app()
@@ -1520,7 +1717,7 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
 
     def test_completed_codex_a_is_explicitly_superseded_by_a_plus_b(self):
         app = self._app(codex_enabled=True)
-        self._commit(app, 1, "Tell me about a project where you", 10_000, "silence")
+        self._commit(app, 1, "Tell me about a project where you", 10_000, "f8")
         first_job = app.codex_worker.jobs[0]
         first_job["on_start"]()
         first_job["callback"]({

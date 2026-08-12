@@ -2545,6 +2545,10 @@ class TranscriptWindow(Gtk.Window):
         self.smooth_scroll_delta = 0.0
         self.boundary_status = None
         self.response_status = None
+        self.answer_history = []
+        self.active_answer = ""
+        self.focus_placeholder = ""
+        self.latest_answer_mark = None
         self.set_default_size(width, height)
         self.set_decorated(False)
         self.set_keep_above(True)
@@ -2729,15 +2733,40 @@ class TranscriptWindow(Gtk.Window):
     def set_text(self, text):
         if text:
             if self.focus_mode:
-                self.text.get_buffer().set_text(text)
-                GLib.idle_add(self._reset_focus_scroll)
+                self.active_answer = ""
+                self.answer_history.append(text)
+                self.focus_placeholder = ""
+                self._render_focus_answers()
+                buffer = self.text.get_buffer()
+                answer_start = len("\n\n".join(self.answer_history[:-1]))
+                if answer_start:
+                    answer_start += 2
+                self._set_latest_answer_mark(
+                    buffer.get_iter_at_offset(answer_start)
+                )
+                GLib.idle_add(
+                    self._align_latest_answer_once,
+                    self.latest_answer_mark,
+                )
             else:
                 self.text.set_text(text)
+        elif self.focus_mode:
+            self.active_answer = ""
+            self._render_focus_answers()
+
+    def discard_current_answer(self, *, remove_completed=False):
+        if not self.focus_mode:
+            return
+        self.active_answer = ""
+        if remove_completed and self.answer_history:
+            self.answer_history.pop()
+        self._render_focus_answers()
 
     def set_status(self, text):
         if self.focus_mode:
-            self.text.get_buffer().set_text(text)
-            GLib.idle_add(self._reset_focus_scroll)
+            self.focus_placeholder = text
+            if not self.answer_history and not self.active_answer:
+                self._render_focus_answers()
         else:
             self.text.set_text(text)
 
@@ -2753,8 +2782,19 @@ class TranscriptWindow(Gtk.Window):
         if not self.focus_mode:
             self.text.set_text(text)
             return
-        self.text.get_buffer().set_text(text)
-        GLib.idle_add(self._reset_focus_scroll)
+        self.active_answer = ""
+        self.focus_placeholder = ""
+        self._render_focus_answers()
+        buffer = self.text.get_buffer()
+        if self.answer_history:
+            buffer.insert(buffer.get_end_iter(), "\n\n")
+        self._set_latest_answer_mark(buffer.get_end_iter())
+        buffer.insert(buffer.get_end_iter(), text)
+        self.active_answer = text
+        GLib.idle_add(
+            self._align_latest_answer_once,
+            self.latest_answer_mark,
+        )
 
     def append_stream(self, text):
         if not text:
@@ -2762,24 +2802,67 @@ class TranscriptWindow(Gtk.Window):
         if not self.focus_mode:
             self.text.set_text(f"{self.text.get_text()}{text}")
             return
-        buffer = self.text.get_buffer()
-        buffer.insert(buffer.get_end_iter(), text)
+        self.active_answer += text
+        self.text.get_buffer().insert(
+            self.text.get_buffer().get_end_iter(),
+            text,
+        )
 
     def finish_stream(self, text):
         if not self.focus_mode:
             self.set_text(text)
             return
         buffer = self.text.get_buffer()
+        if self.latest_answer_mark is None:
+            self.set_text(text)
+            return
+        answer_start = buffer.get_iter_at_mark(self.latest_answer_mark)
         current = buffer.get_text(
-            buffer.get_start_iter(),
+            answer_start,
             buffer.get_end_iter(),
             True,
         )
         if current != text:
-            buffer.set_text(text)
+            buffer.delete(answer_start, buffer.get_end_iter())
+            buffer.insert(buffer.get_end_iter(), text)
+        self.active_answer = ""
+        self.answer_history.append(text)
+        self.focus_placeholder = ""
 
-    def _reset_focus_scroll(self):
-        self.focus_scroller.get_vadjustment().set_value(0)
+    def _render_focus_answers(self):
+        self._clear_latest_answer_mark()
+        parts = [*self.answer_history]
+        if self.active_answer:
+            parts.append(self.active_answer)
+        rendered = "\n\n".join(parts) or self.focus_placeholder
+        self.text.get_buffer().set_text(rendered)
+
+    def _clear_latest_answer_mark(self):
+        if self.latest_answer_mark is not None:
+            self.text.get_buffer().delete_mark(self.latest_answer_mark)
+            self.latest_answer_mark = None
+
+    def _set_latest_answer_mark(self, position):
+        self._clear_latest_answer_mark()
+        self.latest_answer_mark = self.text.get_buffer().create_mark(
+            None,
+            position,
+            True,
+        )
+
+    def _align_latest_answer_once(self, mark):
+        if mark is not self.latest_answer_mark:
+            return False
+        buffer = self.text.get_buffer()
+        answer_start = buffer.get_iter_at_mark(mark)
+        answer_rect = self.text.get_iter_location(answer_start)
+        adjustment = self.focus_scroller.get_vadjustment()
+        minimum = adjustment.get_lower()
+        maximum = max(
+            minimum,
+            adjustment.get_upper() - adjustment.get_page_size(),
+        )
+        adjustment.set_value(max(minimum, min(answer_rect.y, maximum)))
         return False
 
     def _focus_scroll(self, _widget, event):
@@ -3251,11 +3334,16 @@ class InterviewApp:
     ):
         if not self.running:
             return False
+        pending_question_number = (
+            question_number
+            if question_number is not None
+            else self.question_count + 1
+        )
         if error:
             self.answer_window.set_status(f"Moonshine error: {error}")
             append_log(self.log_path, {
                 "event": "question_error",
-                "question": question_number,
+                "question": pending_question_number,
                 "commit_source": commit_source,
                 "error": str(error),
             })
@@ -3265,7 +3353,7 @@ class InterviewApp:
             self.answer_window.set_status("Waiting for question…")
             append_log(self.log_path, {
                 "event": "question_duplicate_suppressed",
-                "question": question_number,
+                "question": pending_question_number,
                 "commit_source": commit_source,
                 "target_sample_cursor": result["target_sample_cursor"],
                 "last_committed_sample_cursor": (
@@ -3281,6 +3369,14 @@ class InterviewApp:
             if commit_source == "f8"
             else {"silence_commit_to_question_ms": round(elapsed * 1000, 1)}
         )
+        if not question_text:
+            self.answer_window.set_status("No question detected")
+            return False
+
+        if question_number is None:
+            self.question_count += 1
+            question_number = self.question_count
+
         append_log(self.log_path, {
             "event": "question",
             "question": question_number,
@@ -3302,9 +3398,6 @@ class InterviewApp:
             "force_update_ms": result["force_update_ms"],
             **latency_field,
         })
-        if not question_text:
-            self.answer_window.set_status("No question detected")
-            return False
 
         self.remote_window.set_text(result["display_text"] or question_text)
         if commit_source == "silence":
@@ -3341,23 +3434,32 @@ class InterviewApp:
     def _moonshine_auto_commit(self, result, error):
         if not self.running:
             return False
-        self.question_count += 1
-        question_number = self.question_count
-        commit_started = (
-            result.get("commit_requested_at", time.perf_counter())
-            if result is not None
-            else time.perf_counter()
-        )
-        return self._moonshine_question_ready(
-            question_number,
-            commit_started,
-            result,
-            error,
-            commit_source="silence",
-        )
+        if error:
+            return self._moonshine_error(error)
+        append_log(self.log_path, {
+            "event": "silence_segment",
+            "text": result["text"].strip(),
+            "segment_preserved": result.get("segment_preserved", False),
+            "accumulated_segment_count": result.get(
+                "accumulated_segment_count", 0
+            ),
+            "asr_backend": moonshine_asr_backend(
+                getattr(self, "stt_language", "en")
+            ),
+            "target_sample_cursor": result["target_sample_cursor"],
+            "consumed_sample_cursor": result["consumed_sample_cursor"],
+            "cursor_complete": result["cursor_complete"],
+            "audio_drop_samples": result["audio_drop_samples"],
+            "max_backlog_ms": result["max_backlog_ms"],
+            "force_update_ms": result["force_update_ms"],
+        })
+        self.remote_window.set_boundary_status(BOUNDARY_STATUS_AUTO)
+        return False
 
     def _continuation_base_is_valid(self, base):
         if not base or not base.get("text"):
+            return False
+        if base.get("commit_source") not in {"f8", "f9_continuation"}:
             return False
         if getattr(self, "last_commit_state", None) != base:
             return False
@@ -3586,7 +3688,20 @@ PREVIOUS INCOMPLETE QUESTION:
         self.answer_window.set_response_status(pending_response_status)
         self.answer_window.set_status("Thinking…")
         if superseded or correction is not None:
-            self.answer_window.set_text("")
+            remove_completed = correction is not None and any(
+                item["generation"] == supersedes_generation
+                and item["previous_status"] == "completed"
+                for item in superseded
+            )
+            discard = getattr(
+                self.answer_window,
+                "discard_current_answer",
+                None,
+            )
+            if discard is None:
+                self.answer_window.set_text("")
+            else:
+                discard(remove_completed=remove_completed)
         append_log(self.log_path, {
             "event": "codex_request",
             "request": request_number,
@@ -3825,10 +3940,8 @@ PREVIOUS INCOMPLETE QUESTION:
             })
             self.remote_window.set_status("Moonshine is still loading…")
             return False
-        self.question_count += 1
-        question_number = self.question_count
         callback = lambda result, error: self._moonshine_question_ready(
-            question_number,
+            None,
             now,
             result,
             error,
@@ -3840,7 +3953,7 @@ PREVIOUS INCOMPLETE QUESTION:
             )
         except Exception as error:
             self._moonshine_question_ready(
-                question_number,
+                None,
                 now,
                 None,
                 error,
@@ -3848,7 +3961,7 @@ PREVIOUS INCOMPLETE QUESTION:
             return False
         if not accepted:
             self._moonshine_question_ready(
-                question_number,
+                None,
                 now,
                 None,
                 RuntimeError("Moonshine worker rejected F8 snapshot"),
@@ -3856,7 +3969,7 @@ PREVIOUS INCOMPLETE QUESTION:
             return False
         append_log(self.log_path, {
             "event": "f8_trigger",
-            "question": question_number,
+            "question": self.question_count + 1,
             "target_sample_cursor": target_cursor,
             "trigger_absolute_seconds": round(target_cursor / SAMPLE_RATE, 3),
             "asr_backend": moonshine_asr_backend(
