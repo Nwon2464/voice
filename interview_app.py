@@ -83,6 +83,7 @@ CODEX_REASONING = os.environ.get(
     DEFAULT_CODEX_REASONING_EFFORT,
 )
 CODEX_FAST_MODE = False
+APP_MODE = os.environ.get("INTERVIEW_APP_MODE", "normal")
 CODEX_ENABLED = os.environ.get("INTERVIEW_DISABLE_CODEX", "0") == "0"
 CODEX_TIMEOUT_SECONDS = 60
 BACKGROUND_JOIN_TIMEOUT_SECONDS = 5
@@ -98,6 +99,9 @@ ANSWER_CONTENT_SCROLL_PIXELS = 60
 ANSWER_POSITION_GUIDE_HEIGHT = 96
 ENTER_DEBOUNCE_MS = 300
 TEST_LOGGING = os.environ.get("INTERVIEW_TEST_LOG", "0") != "0"
+STT_DIAGNOSTICS_ENABLED = (
+    os.environ.get("INTERVIEW_STT_DIAGNOSTICS", "0") != "0"
+)
 TEST_LABEL = os.environ.get("INTERVIEW_TEST_LABEL")
 TEXT_WIDTH_CHARS = shutil.get_terminal_size(fallback=(100, 24)).columns
 SAMPLE_RATE = 16_000
@@ -128,6 +132,11 @@ STT_PRESENTATION = {
         "model": "base-ja",
         "mode": "Base ASR",
     },
+}
+APP_MODE_TITLES = {
+    "normal": "Normal Interview",
+    "performance": "Performance Test",
+    "stt_diagnostic": "STT Diagnostic",
 }
 
 CONFIG_DIR = Path(
@@ -738,6 +747,7 @@ def create_live_codex_worker(on_ready, thread_id, settings):
 SESSION_RESPONSE_NEW = 1
 SESSION_RESPONSE_ARCHIVE = 2
 SESSION_RESPONSE_RENAME = 3
+SESSION_RESPONSE_BACK = 4
 
 
 def moonshine_asr_backend(language):
@@ -795,6 +805,32 @@ def stt_presentation(language):
 
 def stt_status_summary(language):
     return "JA · Base" if language == "ja" else "EN · Streaming"
+
+
+def runtime_options(environment=None):
+    environment = os.environ if environment is None else environment
+    return {
+        "mode": environment.get("INTERVIEW_APP_MODE", "normal"),
+        "codex_enabled": environment.get("INTERVIEW_DISABLE_CODEX", "0")
+        == "0",
+        "logging_enabled": environment.get("INTERVIEW_TEST_LOG", "0")
+        != "0",
+        "diagnostics_enabled": environment.get(
+            "INTERVIEW_STT_DIAGNOSTICS", "0"
+        )
+        != "0",
+    }
+
+
+def preparation_runtime_summary(options, language):
+    title = APP_MODE_TITLES.get(options["mode"], options["mode"])
+    presentation = stt_presentation(language)
+    return (
+        f"Mode: {title}  ·  "
+        f"Codex: {'On' if options['codex_enabled'] else 'Off'}  ·  "
+        f"Logging: {'On' if options['logging_enabled'] else 'Off'}  ·  "
+        f"STT: {presentation['language']} / {presentation['model']}"
+    )
 
 
 def context_scope_style(scope):
@@ -1003,10 +1039,13 @@ def interview_conversation_messages(thread):
     return messages
 
 
-def can_start_interview(session, context_rows):
+def can_start_interview(session, context_rows, codex_enabled=True):
+    if not session:
+        return False
+    if not codex_enabled:
+        return True
     return bool(
-        session
-        and session.get("interview_thread_id")
+        session.get("interview_thread_id")
         and all(
             row.get("status") == CONTEXT_STATUS_SYNCED
             for row in context_rows
@@ -1082,6 +1121,7 @@ class SessionChooserDialog(Gtk.Dialog):
             self.archive_button,
             True,
         )
+        self.add_button("뒤로가기", SESSION_RESPONSE_BACK)
         self.add_button("취소", Gtk.ResponseType.CANCEL)
         self.open_button = self.add_button("열기", Gtk.ResponseType.OK)
         self.open_button.set_sensitive(False)
@@ -1249,7 +1289,7 @@ def _confirm_archive(session):
     return response == Gtk.ResponseType.OK
 
 
-def choose_interview_session(store, context_manager):
+def choose_interview_session(store, context_manager, codex_enabled=True):
     preferred_session_id = None
     while True:
         dialog = SessionChooserDialog(
@@ -1259,6 +1299,9 @@ def choose_interview_session(store, context_manager):
         response = dialog.run()
         selected = dialog.selected_session()
         dialog.destroy()
+
+        if response == SESSION_RESPONSE_BACK:
+            return SESSION_RESPONSE_BACK
 
         if response == SESSION_RESPONSE_NEW:
             try:
@@ -1292,7 +1335,7 @@ def choose_interview_session(store, context_manager):
             if _confirm_archive(selected):
                 try:
                     interview_thread_id = selected.get("interview_thread_id")
-                    if interview_thread_id:
+                    if codex_enabled and interview_thread_id:
                         archive_persisted_codex_session(interview_thread_id)
                     store.mark_archived(selected["session_id"])
                     preferred_session_id = None
@@ -1319,6 +1362,15 @@ def choose_interview_session(store, context_manager):
             return selected
 
         return None
+
+
+def launch_interview_launcher():
+    return subprocess.Popen(
+        [sys.executable, str(APP_DIR / "interview_launcher.py")],
+        cwd=APP_DIR,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 CHAT_RESPONSE_BACK = 10
@@ -1453,11 +1505,14 @@ class PreparationDialog(Gtk.Dialog):
         session_store=None,
         session_settings=None,
         context_manager=None,
+        runtime=None,
     ):
         super().__init__(title="Interview Preparation")
         self.session_id = session_id
         self.session_store = session_store
         self.context_manager = context_manager
+        self.runtime = runtime_options() if runtime is None else dict(runtime)
+        self.codex_enabled = self.runtime["codex_enabled"]
         self.codex_settings = normalize_codex_settings(session_settings)
         self.codex_models = list(FALLBACK_CODEX_MODELS)
         self._updating_settings_ui = False
@@ -1515,6 +1570,15 @@ class PreparationDialog(Gtk.Dialog):
         )
         status_bar.pack_start(
             self.session_summary_label,
+            True,
+            True,
+            0,
+        )
+        self.runtime_summary_label = Gtk.Label()
+        self.runtime_summary_label.set_xalign(0)
+        self.runtime_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        status_bar.pack_start(
+            self.runtime_summary_label,
             True,
             True,
             0,
@@ -1782,7 +1846,9 @@ class PreparationDialog(Gtk.Dialog):
         context_box.pack_start(context_primary_actions, False, False, 2)
         self.sync_context_button = Gtk.Button(label="Sync Context")
         self.sync_context_button.set_sensitive(
-            self.context_manager is not None and self.session_store is not None
+            self.codex_enabled
+            and self.context_manager is not None
+            and self.session_store is not None
         )
         self.sync_context_button.connect("clicked", self._sync_contexts)
         context_box.pack_start(
@@ -1940,7 +2006,10 @@ class PreparationDialog(Gtk.Dialog):
         dialog.destroy()
 
     def _sync_contexts(self, *_args):
-        if self.context_sync_in_progress:
+        if (
+            not getattr(self, "codex_enabled", True)
+            or self.context_sync_in_progress
+        ):
             return
         session = (
             self.session_store.get(self.session_id)
@@ -2000,7 +2069,9 @@ class PreparationDialog(Gtk.Dialog):
         self.context_sync_in_progress = False
         if not self.active:
             return False
-        self.sync_context_button.set_sensitive(True)
+        self.sync_context_button.set_sensitive(
+            getattr(self, "codex_enabled", True)
+        )
         if error is not None:
             self._update_context_summary()
             self._update_start_button()
@@ -2022,6 +2093,10 @@ class PreparationDialog(Gtk.Dialog):
             self.session = self.session_store.get(self.session_id)
         self.conversation_load_generation += 1
         generation = self.conversation_load_generation
+        if not getattr(self, "codex_enabled", True):
+            self.conversation_refresh_button.set_sensitive(False)
+            self._set_conversation_text("Codex is disabled in this mode.")
+            return
         thread_id = (
             self.session.get("interview_thread_id")
             if self.session is not None
@@ -2120,9 +2195,13 @@ class PreparationDialog(Gtk.Dialog):
         )
 
     def interview_thread_id(self):
-        if not can_start_interview(self.session, self.context_rows):
+        if not can_start_interview(
+            self.session,
+            self.context_rows,
+            getattr(self, "codex_enabled", True),
+        ):
             return None
-        return self.session["interview_thread_id"]
+        return self.session.get("interview_thread_id")
 
     def _edit_context(self, _button, row):
         try:
@@ -2159,12 +2238,14 @@ class PreparationDialog(Gtk.Dialog):
         )
         self._refresh_contexts()
         self.sync_context_button.set_sensitive(
-            not self.context_sync_in_progress
+            getattr(self, "codex_enabled", True)
+            and not self.context_sync_in_progress
             and self.context_manager is not None
             and self.session_store is not None
         )
         self.active = True
-        self._load_model_catalog()
+        if getattr(self, "codex_enabled", True):
+            self._load_model_catalog()
         self._refresh_conversation()
         response = self.run()
         self.active = False
@@ -2289,9 +2370,10 @@ class PreparationDialog(Gtk.Dialog):
         return snapshot
 
     def _set_settings_sensitive(self, sensitive):
-        self.model_combo.set_sensitive(sensitive)
-        self.reasoning_combo.set_sensitive(sensitive)
-        self.fast_combo.set_sensitive(sensitive)
+        codex_sensitive = sensitive and getattr(self, "codex_enabled", True)
+        self.model_combo.set_sensitive(codex_sensitive)
+        self.reasoning_combo.set_sensitive(codex_sensitive)
+        self.fast_combo.set_sensitive(codex_sensitive)
         self.stt_language_combo.set_sensitive(sensitive)
 
     def _set_model_catalog(self, models, persist):
@@ -2418,6 +2500,10 @@ class PreparationDialog(Gtk.Dialog):
             f"model: {presentation['model']}\n"
             f"{presentation['mode']}"
         )
+        if hasattr(self, "runtime_summary_label"):
+            summary = preparation_runtime_summary(self.runtime, language)
+            self.runtime_summary_label.set_text(summary)
+            self.runtime_summary_label.set_tooltip_text(summary)
 
     def _persist_settings(self):
         if self.session_store is not None:
@@ -2429,7 +2515,11 @@ class PreparationDialog(Gtk.Dialog):
     def _update_start_button(self):
         self.start_button.set_sensitive(
             not self.context_sync_in_progress
-            and can_start_interview(self.session, self.context_rows)
+            and can_start_interview(
+                self.session,
+                self.context_rows,
+                getattr(self, "codex_enabled", True),
+            )
         )
 
     def _delete(self, *_args):
@@ -2952,8 +3042,9 @@ class TranscriptWindow(Gtk.Window):
 
 
 class InterviewApp:
-    def __init__(self, codex_thread_id, codex_settings=None):
+    def __init__(self, codex_thread_id, codex_settings=None, runtime=None):
         self.session_dir, self.log_path = create_app_session()
+        self.runtime = runtime_options() if runtime is None else dict(runtime)
         self.codex_thread_id = codex_thread_id
         live_codex_settings = normalize_codex_settings(codex_settings)
         self.codex_model = live_codex_settings["codex_model"]
@@ -2962,7 +3053,7 @@ class InterviewApp:
         ]
         self.codex_fast_mode = live_codex_settings["codex_fast_mode"]
         self.stt_language = live_codex_settings["stt_language"]
-        self.codex_enabled = CODEX_ENABLED
+        self.codex_enabled = self.runtime["codex_enabled"]
         self.exit_action = None
         self.running = True
         self.question_count = 0
@@ -3055,6 +3146,9 @@ class InterviewApp:
             "moonshine_update_interval_ms": 500,
             "moonshine_word_timestamps": False,
             "language": self.stt_language,
+            "app_mode": self.runtime["mode"],
+            "logging_enabled": self.runtime["logging_enabled"],
+            "stt_diagnostics_enabled": self.runtime["diagnostics_enabled"],
             "codex_enabled": self.codex_enabled,
             "codex_model": self.codex_model,
             "codex_reasoning_effort": self.codex_reasoning_effort,
@@ -4117,20 +4211,18 @@ PREVIOUS INCOMPLETE QUESTION:
 
 def main():
     install_application_css()
-    if not CODEX_ENABLED:
-        app = InterviewApp(None)
-        GLib.unix_signal_add(
-            GLib.PRIORITY_DEFAULT,
-            signal.SIGINT,
-            app.shutdown,
-        )
-        Gtk.main()
-        return
-
+    active_runtime = runtime_options()
     store = SessionStore(SESSION_STORE_PATH)
     context_manager = ContextManager(CONFIG_DIR)
     while True:
-        session = choose_interview_session(store, context_manager)
+        session = choose_interview_session(
+            store,
+            context_manager,
+            codex_enabled=active_runtime["codex_enabled"],
+        )
+        if session == SESSION_RESPONSE_BACK:
+            launch_interview_launcher()
+            return
         if session is None:
             return
         session_id = session["session_id"]
@@ -4139,6 +4231,7 @@ def main():
             session_store=store,
             session_settings=session.get("settings"),
             context_manager=context_manager,
+            runtime=active_runtime,
         )
         while True:
             response = preparation.run_session()
@@ -4151,11 +4244,12 @@ def main():
 
             live_codex_settings = preparation.settings_snapshot()
             interview_thread_id = preparation.interview_thread_id()
-            if interview_thread_id is None:
+            if active_runtime["codex_enabled"] and interview_thread_id is None:
                 continue
             app = InterviewApp(
                 interview_thread_id,
                 codex_settings=live_codex_settings,
+                runtime=active_runtime,
             )
             signal_source = GLib.unix_signal_add(
                 GLib.PRIORITY_DEFAULT,

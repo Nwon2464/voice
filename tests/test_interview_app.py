@@ -457,6 +457,40 @@ class CodexLatestOnlyTest(unittest.TestCase):
             "session-123",
         ))
 
+    def test_session_back_returns_to_mode_selection_without_opening_session(self):
+        dialog = SimpleNamespace(
+            run=lambda: interview_app.SESSION_RESPONSE_BACK,
+            selected_session=lambda: None,
+            destroy=lambda: None,
+        )
+        store = SimpleNamespace(active=lambda: [])
+
+        with patch.object(
+            interview_app,
+            "SessionChooserDialog",
+            return_value=dialog,
+        ):
+            result = interview_app.choose_interview_session(
+                store,
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(result, interview_app.SESSION_RESPONSE_BACK)
+
+    def test_session_back_relaunches_mode_selector_detached(self):
+        with patch.object(interview_app.subprocess, "Popen") as popen:
+            interview_app.launch_interview_launcher()
+
+        popen.assert_called_once_with(
+            [
+                interview_app.sys.executable,
+                str(interview_app.APP_DIR / "interview_launcher.py"),
+            ],
+            cwd=interview_app.APP_DIR,
+            stdin=interview_app.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
     def test_context_filename_becomes_human_readable_display_name(self):
         self.assertEqual(interview_app.context_display_name("company.md"), "Company")
         self.assertEqual(
@@ -533,6 +567,20 @@ class CodexLatestOnlyTest(unittest.TestCase):
                 {"status": "NOT SYNCED"},
             ]),
             ("● Context Not Synced", "status-not-synced"),
+        )
+
+    def test_stt_diagnostic_runtime_options_keep_codex_off(self):
+        diagnostic = interview_app.runtime_options({
+            "INTERVIEW_APP_MODE": "stt_diagnostic",
+            "INTERVIEW_DISABLE_CODEX": "1",
+            "INTERVIEW_TEST_LOG": "1",
+            "INTERVIEW_STT_DIAGNOSTICS": "1",
+        })
+        self.assertFalse(diagnostic["codex_enabled"])
+        self.assertEqual(
+            interview_app.preparation_runtime_summary(diagnostic, "ja"),
+            "Mode: STT Diagnostic  ·  Codex: Off  ·  Logging: On  ·  "
+            "STT: Japanese / base-ja",
         )
 
     def test_effective_contexts_keep_scope_name_file_and_path_for_ui(self):
@@ -981,6 +1029,14 @@ class CodexLatestOnlyTest(unittest.TestCase):
             synced,
         ))
 
+    def test_codex_off_session_can_start_without_thread_or_context_sync(self):
+        self.assertFalse(interview_app.can_start_interview(None, [], False))
+        self.assertTrue(interview_app.can_start_interview(
+            {"interview_thread_id": None},
+            [{"status": "NOT SYNCED"}],
+            False,
+        ))
+
     def test_start_button_and_live_thread_use_cached_interview_state(self):
         dialog = interview_app.PreparationDialog.__new__(
             interview_app.PreparationDialog
@@ -1035,6 +1091,23 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertTrue(dialog.model_combo.sensitive)
         self.assertTrue(dialog.reasoning_combo.sensitive)
         self.assertTrue(dialog.fast_combo.sensitive)
+        self.assertTrue(dialog.stt_language_combo.sensitive)
+
+    def test_codex_off_disables_only_codex_settings(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.codex_enabled = False
+        dialog.model_combo = _FakeSensitiveWidget()
+        dialog.reasoning_combo = _FakeSensitiveWidget()
+        dialog.fast_combo = _FakeSensitiveWidget()
+        dialog.stt_language_combo = _FakeSensitiveWidget()
+
+        dialog._set_settings_sensitive(True)
+
+        self.assertFalse(dialog.model_combo.sensitive)
+        self.assertFalse(dialog.reasoning_combo.sensitive)
+        self.assertFalse(dialog.fast_combo.sensitive)
         self.assertTrue(dialog.stt_language_combo.sensitive)
 
     def test_model_catalog_load_does_not_start_or_resume_a_thread(self):
