@@ -17,9 +17,36 @@ from gi.repository import Gdk, GLib, Gtk
 APP_DIR = Path(__file__).resolve().parent
 NORMAL_MODE = "normal"
 PERFORMANCE_MODE = "performance"
-DEBUG_MODE = "debug"
-MODES = {NORMAL_MODE, PERFORMANCE_MODE, DEBUG_MODE}
-LABEL_REQUIRED_MODES = {PERFORMANCE_MODE, DEBUG_MODE}
+STT_DIAGNOSTIC_MODE = "stt_diagnostic"
+# Compatibility for callers that imported the old constant name.
+DEBUG_MODE = STT_DIAGNOSTIC_MODE
+MODE_CONFIG = {
+    NORMAL_MODE: {
+        "title": "Normal Interview",
+        "codex": True,
+        "logging": False,
+        "diagnostics": False,
+        "label_required": False,
+    },
+    PERFORMANCE_MODE: {
+        "title": "Performance Test",
+        "codex": True,
+        "logging": True,
+        "diagnostics": False,
+        "label_required": True,
+    },
+    STT_DIAGNOSTIC_MODE: {
+        "title": "STT Diagnostic",
+        "codex": False,
+        "logging": True,
+        "diagnostics": True,
+        "label_required": True,
+    },
+}
+MODES = set(MODE_CONFIG)
+LABEL_REQUIRED_MODES = {
+    mode for mode, config in MODE_CONFIG.items() if config["label_required"]
+}
 STARTUP_CHECK_MS = 500
 
 
@@ -43,13 +70,14 @@ def mode_environment(mode, label="", base_environment=None):
     environment = dict(
         os.environ if base_environment is None else base_environment
     )
-    environment["INTERVIEW_DISABLE_CODEX"] = (
-        "1" if mode == DEBUG_MODE else "0"
+    config = MODE_CONFIG[mode]
+    environment["INTERVIEW_APP_MODE"] = mode
+    environment["INTERVIEW_DISABLE_CODEX"] = "0" if config["codex"] else "1"
+    environment["INTERVIEW_TEST_LOG"] = "1" if config["logging"] else "0"
+    environment["INTERVIEW_STT_DIAGNOSTICS"] = (
+        "1" if config["diagnostics"] else "0"
     )
-    environment["INTERVIEW_TEST_LOG"] = (
-        "1" if mode in LABEL_REQUIRED_MODES else "0"
-    )
-    if mode in LABEL_REQUIRED_MODES:
+    if config["label_required"]:
         cleaned_label = label.strip()
         if not cleaned_label:
             raise ValueError("test label must not be empty")
@@ -90,7 +118,7 @@ def ensure_codex_cli_path(environment):
 
 def prepare_launch_environment(mode, label="", base_environment=None):
     environment = mode_environment(mode, label, base_environment)
-    if mode != DEBUG_MODE and ensure_codex_cli_path(environment) is None:
+    if MODE_CONFIG[mode]["codex"] and ensure_codex_cli_path(environment) is None:
         raise FileNotFoundError(
             "Codex CLI was not found. Install Codex or make it available "
             "in PATH, ~/.local/bin, or an NVM Node bin directory."
@@ -103,9 +131,14 @@ def displayed_command(mode, label=""):
         raise ValueError(f"unsupported launch mode: {mode}")
     if mode == NORMAL_MODE:
         return "./start_interview_app.sh"
-    assignments = ["INTERVIEW_TEST_LOG=1"]
-    if mode == DEBUG_MODE:
-        assignments.insert(0, "INTERVIEW_DISABLE_CODEX=1")
+    config = MODE_CONFIG[mode]
+    assignments = [
+        f"INTERVIEW_APP_MODE={mode}",
+        f"INTERVIEW_DISABLE_CODEX={'0' if config['codex'] else '1'}",
+        f"INTERVIEW_TEST_LOG={'1' if config['logging'] else '0'}",
+        "INTERVIEW_STT_DIAGNOSTICS="
+        f"{'1' if config['diagnostics'] else '0'}",
+    ]
     assignments.append(
         f"INTERVIEW_TEST_LABEL={shlex.quote(label.strip() or '<label>')}"
     )
@@ -261,9 +294,9 @@ class InterviewLauncher(Gtk.Window):
             "예: a2z, latency-test, english-practice",
         ), False, False, 0)
         cards.pack_start(self._add_card(
-            DEBUG_MODE,
-            "STT / UI Debug",
-            "Codex 없이 STT, silence segment, F8/F9, UI 테스트",
+            STT_DIAGNOSTIC_MODE,
+            "STT Diagnostic",
+            "Codex 없이 Session과 Preparation을 거쳐 STT/F8/F9 진단",
             "디버그 로그를 구분할 이름을 입력하세요.",
             "예: audio-debug, stt-check",
         ), False, False, 0)
