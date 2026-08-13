@@ -25,6 +25,7 @@ class WindowsBridgeAudioStream:
         on_hotkey,
         on_status,
         *,
+        on_pcm=None,
         client_factory=WindowsBridgeClient,
     ):
         self.role = role
@@ -32,6 +33,7 @@ class WindowsBridgeAudioStream:
         self.on_error = on_error
         self.on_hotkey = on_hotkey
         self.on_status = on_status
+        self.on_pcm = on_pcm
         self.client_factory = client_factory
         self.client = None
         self.condition = threading.Condition()
@@ -99,8 +101,16 @@ class WindowsBridgeAudioStream:
                     return
                 start_cursor = self.total_samples
                 end_cursor = start_cursor + len(pcm) // SAMPLE_WIDTH_BYTES
-                if not self.worker.submit_pcm(pcm, start_cursor, end_cursor):
-                    raise RuntimeError("Moonshine worker is not accepting PCM")
+                if self.on_pcm is None:
+                    accepted = self.worker.submit_pcm(
+                        pcm,
+                        start_cursor,
+                        end_cursor,
+                    )
+                    if not accepted:
+                        raise RuntimeError("Moonshine worker is not accepting PCM")
+                else:
+                    self.on_pcm(pcm, start_cursor, end_cursor)
                 self.total_samples = end_cursor
                 self.condition.notify_all()
         except Exception as error:
@@ -116,3 +126,91 @@ class WindowsBridgeAudioStream:
     def _on_error(self, error):
         if not self.stopped.is_set():
             self.on_error(self.role, error)
+
+
+class WindowsPlatformBackend:
+    """Adapt the native Windows bridge to the shared transport callbacks."""
+
+    name = "windows_bridge"
+
+    def __init__(
+        self,
+        worker,
+        on_pcm,
+        on_error,
+        on_f8,
+        on_f9,
+        on_status,
+        *,
+        stream_factory=WindowsBridgeAudioStream,
+    ):
+        self.on_error = on_error
+        self.on_f8 = on_f8
+        self.on_f9 = on_f9
+        self.on_status = on_status
+        self.audio_stream = stream_factory(
+            "INTERVIEWER",
+            worker,
+            on_error,
+            self._on_hotkey,
+            self._on_bridge_status,
+            on_pcm=on_pcm,
+        )
+        self.remote_source = None
+
+    def prepare(self):
+        return {
+            "remote_source": self.remote_source,
+            "global_f8": "windows_bridge_pending",
+            "global_f9": "windows_bridge_pending",
+        }
+
+    def start(self):
+        self.audio_stream.start()
+
+    def abort(self):
+        self.audio_stream.abort()
+
+    def stop(self):
+        self.audio_stream.stop()
+
+    def capture_sample_cursor_and(self, enqueue):
+        return self.audio_stream.capture_sample_cursor_and(enqueue)
+
+    def cursor_state(self):
+        return self.audio_stream.cursor_state()
+
+    def _on_hotkey(self, event, capture_sample_cursor_and):
+        key = event.get("key")
+        if key == "F8":
+            return self.on_f8(
+                capture_sample_cursor_and=capture_sample_cursor_and,
+                hotkey_event=event,
+            )
+        if key == "F9":
+            return self.on_f9(
+                capture_sample_cursor_and=capture_sample_cursor_and,
+                hotkey_event=event,
+            )
+        self.on_error(
+            "INTERVIEWER",
+            ValueError(f"unexpected bridge hotkey: {key!r}"),
+        )
+        return False
+
+    def _on_bridge_status(self, status):
+        event = status.get("event", "unknown")
+        self.on_status({
+            "event": "windows_bridge_status",
+            "bridge_event": event,
+            "audio_backend": self.name,
+            "device": status.get("device"),
+            "audio_enabled": status.get("audio_enabled"),
+            "hotkeys_enabled": status.get("hotkeys_enabled"),
+            "error": status.get("error"),
+        })
+        if event in {"error", "audio_error", "hotkey_error"}:
+            self.on_error(
+                "INTERVIEWER",
+                RuntimeError(status.get("error", event)),
+            )

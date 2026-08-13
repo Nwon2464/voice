@@ -201,7 +201,7 @@ Close or reconfigure the application holding the shortcut and run the probe
 again.  The helper unregisters every successfully registered key during normal
 shutdown and partial-registration cleanup.
 
-## STEP 4: WSLg Interview Assistant integration
+## STEP 4–5: WSLg Interview Assistant integration
 
 The normal Linux backend remains the default. Select the Windows bridge only
 explicitly, with `INTERVIEW_AUDIO_BACKEND=windows_bridge`; supported values are
@@ -211,22 +211,31 @@ path, but it does not start ffmpeg/PulseAudio capture, install GNOME keybindings
 or create the Linux trigger socket. Instead, it starts one `WindowsBridgeClient`
 for WASAPI PCM and native F8/F9 events.
 
-For the first actual-app smoke test, run the Codex-off diagnostic flow:
+Launch the same GTK launcher used by Linux while selecting only the Windows
+audio/hotkey backend:
 
 ```bash
 cd /home/won/voice
 ./start_wsl_windows_app.sh
 ```
 
-This wrapper sets `INTERVIEW_AUDIO_BACKEND=windows_bridge` and reuses the
-existing `stt_diagnostic` mode, so Session and Preparation still appear but no
-Codex request is made. Choose/create a Session, continue through Preparation,
-and start Interview. The runtime log (and diagnostic session JSONL) records the
-selected playback device, bridge readiness/hotkey state, F8/F9 sequence and
-cursor/barrier diagnostics, and final bridge cursor state at shutdown.
+This wrapper sets only `INTERVIEW_AUDIO_BACKEND=windows_bridge`, then opens the
+existing launcher. Its modes keep their Linux meanings: Normal has Codex on and
+logging off; Performance has Codex on and logging on; STT Diagnostic has Codex
+off with diagnostics/logging on. Choose/create a Session, continue through
+Preparation, and start Interview. The selected session's existing persistent
+Interview thread, Codex App Server stdio transport, context snapshot, streaming
+Answer UI, and F8/F9 continuation/supersede path are unchanged by the bridge.
+
+For an actual Codex smoke test, choose **Performance Test** and enter a label.
+The runtime log and performance JSONL record bridge readiness/hotkey state,
+F8/F9 cursor/barrier diagnostics, `codex_request`, `codex_stream_start`,
+`codex_response` (including first-token and completion latency), and the final
+bridge cursor state at shutdown.
 
 With a Windows native application such as Chrome focused, play audio and press
 F8 at the question boundary. The Interviewer window should commit one question.
-Play the continuation and press F9; it should update that same question number.
-Close the app and confirm the log contains `windows_bridge_stopped: true` and
-that no Windows helper remains running.
+Play the continuation and press F9; it should update that same question number,
+supersede the previous generation, and stream the corrected answer. Close the
+app and confirm the log contains `windows_bridge_stopped: true` and that no
+Windows helper remains running.

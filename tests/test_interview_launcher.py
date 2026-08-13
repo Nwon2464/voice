@@ -73,6 +73,29 @@ class InterviewLauncherTest(unittest.TestCase):
         self.assertEqual(environment["INTERVIEW_STT_DIAGNOSTICS"], "1")
         self.assertEqual(environment["INTERVIEW_TEST_LABEL"], "audio-debug")
 
+    def test_windows_bridge_is_preserved_for_each_existing_mode(self):
+        base_environment = {"INTERVIEW_AUDIO_BACKEND": "windows_bridge"}
+        expected_codex = {
+            interview_launcher.NORMAL_MODE: "0",
+            interview_launcher.PERFORMANCE_MODE: "0",
+            interview_launcher.STT_DIAGNOSTIC_MODE: "1",
+        }
+
+        for mode, codex_disabled in expected_codex.items():
+            with self.subTest(mode=mode):
+                environment = interview_launcher.mode_environment(
+                    mode,
+                    "windows-smoke"
+                    if mode != interview_launcher.NORMAL_MODE else "",
+                    base_environment=base_environment,
+                )
+                self.assertEqual(
+                    environment["INTERVIEW_AUDIO_BACKEND"], "windows_bridge"
+                )
+                self.assertEqual(
+                    environment["INTERVIEW_DISABLE_CODEX"], codex_disabled
+                )
+
     def test_label_modes_reject_empty_label(self):
         for mode in (
             interview_launcher.PERFORMANCE_MODE,

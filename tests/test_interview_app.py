@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import interview_app
+from linux_port import backend as linux_backend
+from windows_port.app_backend import WindowsPlatformBackend
 from context_manager import (
     CONTEXT_STATUS_CHANGED,
     CONTEXT_STATUS_SYNCED,
@@ -582,6 +584,26 @@ class CodexLatestOnlyTest(unittest.TestCase):
             "Mode: STT Diagnostic  ·  Codex: Off  ·  Logging: On  ·  "
             "STT: Japanese / base-ja",
         )
+
+    def test_windows_bridge_runtime_options_keep_launcher_codex_choice(self):
+        for mode, codex_disabled, logging_enabled in (
+            ("normal", "0", False),
+            ("performance", "0", True),
+            ("stt_diagnostic", "1", True),
+        ):
+            with self.subTest(mode=mode):
+                options = interview_app.runtime_options({
+                    "INTERVIEW_AUDIO_BACKEND": "windows_bridge",
+                    "INTERVIEW_APP_MODE": mode,
+                    "INTERVIEW_DISABLE_CODEX": codex_disabled,
+                    "INTERVIEW_TEST_LOG": "1" if logging_enabled else "0",
+                    "INTERVIEW_STT_DIAGNOSTICS": (
+                        "1" if mode == "stt_diagnostic" else "0"
+                    ),
+                })
+                self.assertEqual(options["audio_backend"], "windows_bridge")
+                self.assertEqual(options["codex_enabled"], codex_disabled == "0")
+                self.assertEqual(options["logging_enabled"], logging_enabled)
 
     def test_effective_contexts_keep_scope_name_file_and_path_for_ui(self):
         path = Path("/tmp/session/contexts/company.md")
@@ -1902,7 +1924,11 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             "idle_add",
             side_effect=lambda callback, *args: callback(*args),
         ):
-            app._on_windows_bridge_hotkey(
+            backend = WindowsPlatformBackend.__new__(WindowsPlatformBackend)
+            backend.on_f8 = app._on_f8
+            backend.on_f9 = app._on_f9
+            backend.on_error = lambda *_args: None
+            backend._on_hotkey(
                 {"key": "F8", "sequence": 4, "timestamp_ns": 99},
                 lambda enqueue: (
                     captured.append(32_000),
@@ -1912,6 +1938,71 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
 
         self.assertEqual(captured, [32_000])
         self.assertEqual(requested[0][0], 32_000)
+
+    def test_windows_bridge_f8_and_f9_reuse_live_codex_request_path(self):
+        app = self._app(codex_enabled=True)
+        app.last_f8_at = None
+        app.last_f9_at = None
+        app.moonshine_ready = True
+        app.audio_started = True
+        requested = []
+        app.asr_worker = SimpleNamespace(
+            request_snapshot=lambda cursor, callback: (
+                requested.append((cursor, callback)),
+                True,
+            )[1],
+        )
+
+        def capture(cursor):
+            return lambda enqueue: (
+                cursor,
+                enqueue(cursor),
+                {
+                    "received_cursor": cursor,
+                    "queued_cursor": cursor,
+                    "consumed_cursor": cursor,
+                    "audio_drop_samples": 0,
+                },
+            )
+
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            backend = WindowsPlatformBackend.__new__(WindowsPlatformBackend)
+            backend.on_f8 = app._on_f8
+            backend.on_f9 = app._on_f9
+            backend.on_error = lambda *_args: None
+            backend._on_hotkey(
+                {"key": "F8", "sequence": 4, "timestamp_ns": 99},
+                capture(16_000),
+            )
+            requested[0][1](self._result("What would you", 16_000), None)
+
+            backend._on_hotkey(
+                {"key": "F9", "sequence": 5, "timestamp_ns": 100},
+                capture(32_000),
+            )
+            requested[1][1](
+                self._result("do in this situation?", 32_000),
+                None,
+            )
+
+        self.assertEqual([cursor for cursor, _callback in requested], [
+            16_000,
+            32_000,
+        ])
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(app.last_commit_state["question_number"], 1)
+        self.assertEqual(app.last_commit_state["commit_source"], "f9_continuation")
+        self.assertEqual(len(app.codex_worker.jobs), 2)
+        self.assertEqual(app.codex_request_states[1]["status"], "superseded")
+        self.assertEqual(app.codex_request_states[2]["question"], 1)
+        self.assertIn(
+            "What would you do in this situation?",
+            app.codex_worker.jobs[1]["prompt"],
+        )
 
 
 class AudioStreamTest(unittest.TestCase):
@@ -2001,6 +2092,7 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
             PermissionError("window state is read-only")
         )
         app.remote_audio = Resource("audio")
+        app.platform_backend = app.remote_audio
         app.asr_worker = Resource("moonshine", fail=True)
         app.codex_worker = Resource("codex")
         app.trigger_socket = None
@@ -2035,29 +2127,29 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
             runtime_dir = Path(directory)
             socket_path = runtime_dir / "trigger.sock"
             lock_path = runtime_dir / "trigger.lock"
-            first = interview_app.InterviewApp.__new__(
-                interview_app.InterviewApp
+            first = linux_backend.LinuxPlatformBackend.__new__(
+                linux_backend.LinuxPlatformBackend
             )
-            first.running = False
+            first.is_running = lambda: False
             first.trigger_socket = None
             first.trigger_lock_file = None
             first.socket_thread = None
-            second = interview_app.InterviewApp.__new__(
-                interview_app.InterviewApp
+            second = linux_backend.LinuxPlatformBackend.__new__(
+                linux_backend.LinuxPlatformBackend
             )
-            second.running = False
+            second.is_running = lambda: False
             second.trigger_socket = None
             second.trigger_lock_file = None
             second.socket_thread = None
 
-            with patch.object(interview_app, "RUNTIME_DIR", runtime_dir), \
-                    patch.object(interview_app, "TRIGGER_SOCKET", socket_path), \
+            with patch.object(linux_backend, "RUNTIME_DIR", runtime_dir), \
+                    patch.object(linux_backend, "TRIGGER_SOCKET", socket_path), \
                     patch.object(
-                        interview_app,
+                        linux_backend,
                         "TRIGGER_LOCK_PATH",
                         lock_path,
                     ), patch.object(
-                        interview_app.socket,
+                        linux_backend.socket,
                         "socket",
                         return_value=FakeSocket(),
                     ), patch.object(interview_app.os, "chmod"):

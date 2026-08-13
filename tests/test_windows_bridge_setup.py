@@ -17,6 +17,16 @@ class WindowsBridgeSetupTests(unittest.TestCase):
         self.assertIn("cd \"$windows_cwd\"", setup)
         self.assertIn("--only-binary=:all:", setup)
 
+    def test_wsl_app_wrapper_uses_launcher_and_leaves_mode_to_it(self):
+        wrapper = (ROOT / "start_wsl_windows_app.sh").read_text()
+
+        self.assertIn("INTERVIEW_AUDIO_BACKEND=windows_bridge", wrapper)
+        self.assertIn('"$app_dir/interview_launcher.py"', wrapper)
+        self.assertNotIn("INTERVIEW_APP_MODE=", wrapper)
+        self.assertNotIn("INTERVIEW_DISABLE_CODEX=", wrapper)
+        self.assertNotIn("INTERVIEW_TEST_LOG=", wrapper)
+        self.assertNotIn("INTERVIEW_STT_DIAGNOSTICS=", wrapper)
+
 
 if __name__ == "__main__":
     unittest.main()

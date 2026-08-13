@@ -89,5 +89,25 @@ class WindowsBridgeAudioBackendTests(unittest.TestCase):
         self.assertEqual(str(errors[0][1]), "helper failed")
         self.assertTrue(client.stopped)
 
+    def test_explicit_pcm_callback_uses_the_shared_delivery_contract(self):
+        forwarded = []
+        worker = _Worker()
+        backend = WindowsBridgeAudioStream(
+            "INTERVIEWER",
+            worker,
+            lambda *_args: None,
+            lambda *_args: None,
+            lambda _status: None,
+            on_pcm=lambda pcm, start, end: forwarded.append(
+                (pcm, start, end)
+            ),
+            client_factory=_BridgeClient,
+        )
+        backend.start()
+        _BridgeClient.instances[0].on_pcm(bytes(320))
+
+        self.assertEqual(forwarded, [(bytes(320), 0, 160)])
+        self.assertEqual(worker.submissions, [])
+
 if __name__ == "__main__":
     unittest.main()

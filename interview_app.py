@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
 """Local interview transcription app with F8-triggered Codex answers."""
 
-import fcntl
 import os
-import socket
 import sys
-from collections import deque
 from pathlib import Path
+
+from linux_port.backend import AudioStream, send_app_command
 
 
 APP_DIR = Path(__file__).resolve().parent
-RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
-TRIGGER_SOCKET = RUNTIME_DIR / "interview-assistant-trigger.sock"
-TRIGGER_LOCK_PATH = RUNTIME_DIR / "interview-assistant-trigger.lock"
-
-
-def send_app_command(command):
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    try:
-        client.sendto(command, str(TRIGGER_SOCKET))
-    except OSError as error:
-        print(f"Interview Assistant is not running: {error}", file=sys.stderr)
-        return 1
-    finally:
-        client.close()
-    return 0
 
 
 # GNOME의 전역 단축키 명령은 이 경로만 실행한다. 무거운 모듈은 불러오지 않는다.
@@ -38,7 +22,6 @@ if __name__ == "__main__" and "--stop" in sys.argv:
 
 import json
 import queue
-import shlex
 import shutil
 import signal
 import subprocess
@@ -55,6 +38,12 @@ from codex_app_server import (
 from context_manager import CONTEXT_STATUS_SYNCED, ContextManager
 from interview_thread_backend import InterviewThreadBackend
 from moonshine_streaming_worker import MoonshineStreamingWorker
+from platform_backend import (
+    PULSEAUDIO_AUDIO_BACKEND,
+    SUPPORTED_AUDIO_BACKENDS,
+    WINDOWS_BRIDGE_AUDIO_BACKEND,
+    create_platform_backend,
+)
 from session_store import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
@@ -105,13 +94,6 @@ STT_DIAGNOSTICS_ENABLED = (
 TEST_LABEL = os.environ.get("INTERVIEW_TEST_LABEL")
 TEXT_WIDTH_CHARS = shutil.get_terminal_size(fallback=(100, 24)).columns
 SAMPLE_RATE = 16_000
-SAMPLE_WIDTH = 2
-PULSEAUDIO_AUDIO_BACKEND = "pulseaudio"
-WINDOWS_BRIDGE_AUDIO_BACKEND = "windows_bridge"
-SUPPORTED_AUDIO_BACKENDS = frozenset({
-    PULSEAUDIO_AUDIO_BACKEND,
-    WINDOWS_BRIDGE_AUDIO_BACKEND,
-})
 LOG_WRITE_LOCK = threading.Lock()
 BOUNDARY_STATUS_LISTENING = "● LISTENING"
 BOUNDARY_STATUS_AUTO = "✓ AUTO"
@@ -202,43 +184,6 @@ FALLBACK_CODEX_MODELS = [
         ],
     },
 ]
-HOTKEY_PATH = (
-    "/org/gnome/settings-daemon/plugins/media-keys/"
-    "custom-keybindings/interview-assistant/"
-)
-HOTKEY_F9_PATH = (
-    "/org/gnome/settings-daemon/plugins/media-keys/"
-    "custom-keybindings/interview-assistant-continuation/"
-)
-
-
-def get_interviewer_audio_source():
-    sink = subprocess.check_output(
-        ["pactl", "get-default-sink"], text=True
-    ).strip()
-    return f"{sink}.monitor"
-
-
-def start_audio_capture(source):
-    return subprocess.Popen(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-loglevel", "error",
-            "-f", "pulse",
-            "-fragment_size", "640",
-            "-sample_rate", str(SAMPLE_RATE),
-            "-channels", "1",
-            "-i", source,
-            "-f", "s16le",
-            "pipe:1",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-    )
-
-
 def append_log(log_path, event):
     if log_path is None:
         return
@@ -262,129 +207,6 @@ def create_app_session():
     log_path.touch(mode=0o600)
     log_path.chmod(0o600)
     return session_dir, log_path
-
-
-class AudioStream:
-    """Capture raw PCM and forward it with an absolute sample cursor."""
-
-    def __init__(self, role, source, on_pcm, on_error):
-        self.role = role
-        self.source = source
-        self.on_pcm = on_pcm
-        self.on_error = on_error
-        self.process = None
-        self.thread = None
-        self.stderr_thread = None
-        self.stderr_tail = deque(maxlen=20)
-        self.stopped = threading.Event()
-        self.condition = threading.Condition()
-        self.total_samples = 0
-
-    def start(self):
-        self.process = start_audio_capture(self.source)
-        self.stderr_thread = threading.Thread(
-            target=self._read_stderr,
-            daemon=True,
-        )
-        self.stderr_thread.start()
-        self.thread = threading.Thread(target=self._read_loop, daemon=True)
-        self.thread.start()
-
-    def abort(self):
-        """Stop capture without joining the current PCM reader thread."""
-        self.stopped.set()
-        process = self.process
-        if process is not None and process.poll() is None:
-            process.terminate()
-        with self.condition:
-            self.condition.notify_all()
-
-    def stop(self):
-        self.abort()
-        if self.process is not None and self.process.poll() is None:
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=2)
-        if self.thread is not None:
-            self.thread.join(timeout=2)
-        if self.stderr_thread is not None:
-            self.stderr_thread.join(timeout=2)
-
-    def capture_sample_cursor_and(self, enqueue):
-        """Record the absolute cursor and enqueue F8 before future PCM."""
-        with self.condition:
-            cursor = self.total_samples
-            accepted = enqueue(cursor)
-            return cursor, accepted
-
-    def _read_loop(self):
-        try:
-            while not self.stopped.is_set():
-                data = self.process.stdout.read(320)
-                if not data:
-                    if not self.stopped.is_set():
-                        if self.stderr_thread is not None:
-                            self.stderr_thread.join(timeout=0.2)
-                        return_code = self.process.poll()
-                        detail = "\n".join(self.stderr_tail).strip()
-                        suffix = f": {detail}" if detail else ""
-                        raise RuntimeError(
-                            "Audio capture stopped unexpectedly "
-                            f"(exit code {return_code}){suffix}"
-                        )
-                    break
-                if len(data) % SAMPLE_WIDTH:
-                    raise RuntimeError("Capture returned an incomplete s16le sample")
-
-                with self.condition:
-                    chunk_start = self.total_samples
-                    self.total_samples += len(data) // SAMPLE_WIDTH
-                    chunk_end = self.total_samples
-                    self.on_pcm(data, chunk_start, chunk_end)
-                    self.condition.notify_all()
-        except Exception as error:
-            self.on_error(self.role, error)
-
-    def _read_stderr(self):
-        stream = None if self.process is None else self.process.stderr
-        if stream is None:
-            return
-        for line in stream:
-            if isinstance(line, bytes):
-                line = line.decode("utf-8", errors="replace")
-            self.stderr_tail.append(line.rstrip())
-
-
-def create_remote_audio_stream(
-    backend,
-    worker,
-    on_pcm,
-    on_error,
-    on_hotkey=None,
-    on_status=None,
-):
-    """Construct the explicitly selected interviewer-audio backend.
-
-    The PulseAudio branch is intentionally the pre-existing path.  The Windows
-    bridge is imported only when requested so normal Linux startup has no WSL
-    interop dependency or Windows helper setup requirement.
-    """
-    if backend == PULSEAUDIO_AUDIO_BACKEND:
-        source = get_interviewer_audio_source()
-        return AudioStream("INTERVIEWER", source, on_pcm, on_error), source
-    if backend == WINDOWS_BRIDGE_AUDIO_BACKEND:
-        from windows_port.app_backend import WindowsBridgeAudioStream
-
-        return WindowsBridgeAudioStream(
-            "INTERVIEWER",
-            worker,
-            on_error,
-            on_hotkey,
-            on_status or (lambda _status: None),
-        ), None
-    raise ValueError(f"unsupported audio backend: {backend}")
 
 
 class CodexWorker:
@@ -3120,9 +2942,6 @@ class InterviewApp:
         self.live_windows_hidden = False
         self.moonshine_ready = False
         self.audio_started = False
-        self.socket_thread = None
-        self.trigger_socket = None
-        self.trigger_lock_file = None
         self.audio_failure_reported = False
         self.audio_backend = self.runtime["audio_backend"]
         self.bridge_statuses = []
@@ -3189,14 +3008,6 @@ class InterviewApp:
             "Codex loading…" if self.codex_enabled
             else "Codex disabled · STT Diagnostic mode"
         )
-        if self.audio_backend == PULSEAUDIO_AUDIO_BACKEND:
-            self._start_trigger_listener()
-            hotkey_status = self._install_global_f8()
-            f9_hotkey_status = self._install_global_f9()
-        else:
-            hotkey_status = "windows_bridge_pending"
-            f9_hotkey_status = "windows_bridge_pending"
-
         self.asr_worker = MoonshineStreamingWorker(
             self._moonshine_ready,
             self._moonshine_preview,
@@ -3205,14 +3016,25 @@ class InterviewApp:
             dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
             language=self.stt_language,
         )
-        self.remote_audio, remote_source = create_remote_audio_stream(
+        self.platform_backend = create_platform_backend(
             self.audio_backend,
-            self.asr_worker,
-            self._moonshine_pcm,
-            self._audio_error,
-            self._on_windows_bridge_hotkey,
-            self._windows_bridge_status,
+            worker=self.asr_worker,
+            on_pcm=self._moonshine_pcm,
+            on_error=self._audio_error,
+            on_f8=self._on_f8,
+            on_f9=self._on_f9,
+            on_stop=self.shutdown,
+            on_status=self._platform_status,
+            gio=Gio,
+            idle_add=GLib.idle_add,
+            app_command_path=Path(__file__).resolve(),
+            is_running=lambda: self.running,
         )
+        self.remote_audio = self.platform_backend
+        platform_start = self.platform_backend.prepare()
+        remote_source = platform_start["remote_source"]
+        hotkey_status = platform_start["global_f8"]
+        f9_hotkey_status = platform_start["global_f9"]
         append_log(self.log_path, {
             "event": "app_session_start",
             "app_version": APP_VERSION,
@@ -3283,128 +3105,6 @@ class InterviewApp:
         )
         WINDOW_STATE_PATH.chmod(0o600)
 
-    def _install_global_f8(self):
-        return self._install_global_hotkey(
-            key="F8",
-            path=HOTKEY_PATH,
-            name="Interview Assistant: Capture Question",
-            trigger_argument="--trigger",
-        )
-
-    def _install_global_f9(self):
-        return self._install_global_hotkey(
-            key="F9",
-            path=HOTKEY_F9_PATH,
-            name="Interview Assistant: Continue Previous Question",
-            trigger_argument="--trigger-f9",
-        )
-
-    def _install_global_hotkey(self, key, path, name, trigger_argument):
-        try:
-            media_keys = Gio.Settings.new(
-                "org.gnome.settings-daemon.plugins.media-keys"
-            )
-            paths = list(media_keys.get_strv("custom-keybindings"))
-            for existing_path in paths:
-                setting = Gio.Settings.new_with_path(
-                    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding",
-                    existing_path,
-                )
-                if (
-                    setting.get_string("binding") == key
-                    and existing_path != path
-                ):
-                    return "conflict"
-
-            setting = Gio.Settings.new_with_path(
-                "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding",
-                path,
-            )
-            command = (
-                f"{shlex.quote(sys.executable)} "
-                f"{shlex.quote(str(Path(__file__).resolve()))} {trigger_argument}"
-            )
-            setting.set_string("name", name)
-            setting.set_string("command", command)
-            setting.set_string("binding", key)
-            if path not in paths:
-                paths.append(path)
-                media_keys.set_strv("custom-keybindings", paths)
-            Gio.Settings.sync()
-            return "installed"
-        except Exception as error:
-            append_log(self.log_path, {
-                "event": "hotkey_error",
-                "key": key,
-                "error": str(error),
-            })
-            return f"error: {error}"
-
-    def _start_trigger_listener(self):
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        lock_file = TRIGGER_LOCK_PATH.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(
-                lock_file.fileno(),
-                fcntl.LOCK_EX | fcntl.LOCK_NB,
-            )
-        except BlockingIOError as error:
-            lock_file.close()
-            raise RuntimeError(
-                "Interview Assistant is already running"
-            ) from error
-
-        self.trigger_lock_file = lock_file
-        try:
-            TRIGGER_SOCKET.unlink(missing_ok=True)
-            self.trigger_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            self.trigger_socket.bind(str(TRIGGER_SOCKET))
-            os.chmod(TRIGGER_SOCKET, 0o600)
-            self.trigger_socket.settimeout(0.5)
-        except OSError as error:
-            self._close_trigger_listener()
-            raise RuntimeError(f"Cannot create F8 trigger socket: {error}") from error
-
-        def listen():
-            while self.running:
-                try:
-                    data = self.trigger_socket.recv(32)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    return
-                if data == b"F8":
-                    GLib.idle_add(self._on_f8)
-                elif data == b"F9":
-                    GLib.idle_add(self._on_f9)
-                elif data == b"STOP":
-                    GLib.idle_add(self.shutdown)
-
-        self.socket_thread = threading.Thread(target=listen, daemon=True)
-        self.socket_thread.start()
-
-    def _close_trigger_listener(self):
-        socket_error = None
-        try:
-            if self.trigger_socket is not None:
-                self.trigger_socket.close()
-        except OSError as error:
-            socket_error = error
-        finally:
-            self.trigger_socket = None
-            if self.trigger_lock_file is not None:
-                try:
-                    TRIGGER_SOCKET.unlink(missing_ok=True)
-                finally:
-                    fcntl.flock(
-                        self.trigger_lock_file.fileno(),
-                        fcntl.LOCK_UN,
-                    )
-                    self.trigger_lock_file.close()
-                    self.trigger_lock_file = None
-        if socket_error is not None:
-            raise socket_error
-
     def _key_pressed(self, _window, event):
         if event.keyval == Gdk.KEY_F8:
             self._on_f8()
@@ -3438,7 +3138,7 @@ class InterviewApp:
             "update_interval_ms": result["update_interval_ms"],
         })
         if not self.audio_started:
-            self.remote_audio.start()
+            self.platform_backend.start()
             self.audio_started = True
         return False
 
@@ -3864,6 +3564,7 @@ PREVIOUS INCOMPLETE QUESTION:
             "request": request_number,
             "question": question_number,
             "generation": generation,
+            "thread_id": getattr(self, "codex_thread_id", None),
             "model": getattr(self, "codex_model", CODEX_MODEL),
             "reasoning_effort": getattr(
                 self,
@@ -3895,6 +3596,7 @@ PREVIOUS INCOMPLETE QUESTION:
                 "request": request_number,
                 "question": question_number,
                 "generation": generation,
+                "thread_id": getattr(self, "codex_thread_id", None),
             })
 
         def streamed(delta, elapsed):
@@ -4080,37 +3782,10 @@ PREVIOUS INCOMPLETE QUESTION:
             })
         return False
 
-    def _windows_bridge_status(self, status):
-        """Record native-helper lifecycle information without GTK-thread work."""
+    def _platform_status(self, status):
+        """Record status already normalized by the selected platform backend."""
         self.bridge_statuses.append(dict(status))
-        event = status.get("event", "unknown")
-        append_log(self.log_path, {
-            "event": "windows_bridge_status",
-            "bridge_event": event,
-            "audio_backend": WINDOWS_BRIDGE_AUDIO_BACKEND,
-            "device": status.get("device"),
-            "audio_enabled": status.get("audio_enabled"),
-            "hotkeys_enabled": status.get("hotkeys_enabled"),
-            "error": status.get("error"),
-        })
-        if event in {"error", "audio_error", "hotkey_error"}:
-            self._audio_error("INTERVIEWER", RuntimeError(status.get("error", event)))
-
-    def _on_windows_bridge_hotkey(self, event, capture_sample_cursor_and):
-        """Request the F8/F9 snapshot in the bridge reader's cursor lock."""
-        key = event.get("key")
-        if key == "F8":
-            return self._on_f8(
-                capture_sample_cursor_and=capture_sample_cursor_and,
-                hotkey_event=event,
-            )
-        if key == "F9":
-            return self._on_f9(
-                capture_sample_cursor_and=capture_sample_cursor_and,
-                hotkey_event=event,
-            )
-        self._audio_error("INTERVIEWER", ValueError(f"unexpected bridge hotkey: {key!r}"))
-        return False
+        append_log(self.log_path, status)
 
     def _hotkey_status(self, text, hotkey_event):
         if hotkey_event is None:
@@ -4355,11 +4030,10 @@ PREVIOUS INCOMPLETE QUESTION:
                 cleanup_errors.append(("audio_cursor_state", error))
 
         run_cleanup("window_state", self._save_window_state)
-        run_cleanup("audio", self.remote_audio.stop)
+        run_cleanup("audio", self.platform_backend.stop)
         run_cleanup("moonshine", self.asr_worker.stop)
         if self.codex_worker is not None:
             run_cleanup("codex", self.codex_worker.stop)
-        run_cleanup("trigger_socket", self._close_trigger_listener)
         run_cleanup("session_log", lambda: append_log(self.log_path, {
             "event": "app_session_end",
             "exit_action": exit_action,
