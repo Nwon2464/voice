@@ -1,0 +1,6 @@
+# Installed only into the native Windows helper virtual environment.
+# NumPy 2.4.2 publishes CPython 3.14 wheels for Windows x86, x86-64 and ARM64.
+# This is intentionally independent from the Linux/Moonshine requirements.txt.
+numpy==2.4.2
+# 0.4.6 includes upstream compatibility fixes for current NumPy releases.
+SoundCard==0.4.6
