@@ -2008,7 +2008,7 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
 class AudioStreamTest(unittest.TestCase):
     def test_streaming_only_capture_forwards_each_raw_pcm_sample_once(self):
         forwarded = []
-        stream = interview_app.AudioStream(
+        stream = linux_backend.AudioStream(
             "INTERVIEWER",
             "unused",
             lambda pcm, start, end: forwarded.append(
@@ -2026,7 +2026,7 @@ class AudioStreamTest(unittest.TestCase):
         self.assertEqual(stream.total_samples, 320)
 
     def test_f8_cursor_and_enqueue_are_atomic_under_audio_lock(self):
-        stream = interview_app.AudioStream(
+        stream = linux_backend.AudioStream(
             "INTERVIEWER",
             "unused",
             lambda *_args: None,
@@ -2050,7 +2050,7 @@ class AudioStreamTest(unittest.TestCase):
             stderr=io.BytesIO(b"pulse input failed\n"),
             poll=lambda: 1,
         )
-        stream = interview_app.AudioStream(
+        stream = linux_backend.AudioStream(
             "INTERVIEWER",
             "unused",
             lambda *_args: None,

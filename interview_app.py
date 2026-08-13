@@ -5,18 +5,21 @@ import os
 import sys
 from pathlib import Path
 
-from linux_port.backend import AudioStream, send_app_command
-
-
 APP_DIR = Path(__file__).resolve().parent
 
 
 # GNOME의 전역 단축키 명령은 이 경로만 실행한다. 무거운 모듈은 불러오지 않는다.
 if __name__ == "__main__" and "--trigger" in sys.argv:
+    from linux_port.backend import send_app_command
+
     raise SystemExit(send_app_command(b"F8"))
 if __name__ == "__main__" and "--trigger-f9" in sys.argv:
+    from linux_port.backend import send_app_command
+
     raise SystemExit(send_app_command(b"F9"))
 if __name__ == "__main__" and "--stop" in sys.argv:
+    from linux_port.backend import send_app_command
+
     raise SystemExit(send_app_command(b"STOP"))
 
 
