@@ -1883,6 +1883,36 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         self.assertEqual(captured, [20_000])
         self.assertEqual(requested[0][0], 20_000)
 
+    def test_windows_bridge_f8_uses_the_same_atomic_semantic_snapshot(self):
+        app = self._app()
+        app.last_f8_at = None
+        app.moonshine_ready = True
+        app.audio_started = True
+        requested = []
+        app.asr_worker = SimpleNamespace(
+            request_snapshot=lambda cursor, callback: (
+                requested.append((cursor, callback)),
+                True,
+            )[1],
+        )
+        captured = []
+
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            app._on_windows_bridge_hotkey(
+                {"key": "F8", "sequence": 4, "timestamp_ns": 99},
+                lambda enqueue: (
+                    captured.append(32_000),
+                    (32_000, enqueue(32_000)),
+                )[1],
+            )
+
+        self.assertEqual(captured, [32_000])
+        self.assertEqual(requested[0][0], 32_000)
+
 
 class AudioStreamTest(unittest.TestCase):
     def test_streaming_only_capture_forwards_each_raw_pcm_sample_once(self):

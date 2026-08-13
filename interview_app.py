@@ -106,6 +106,12 @@ TEST_LABEL = os.environ.get("INTERVIEW_TEST_LABEL")
 TEXT_WIDTH_CHARS = shutil.get_terminal_size(fallback=(100, 24)).columns
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2
+PULSEAUDIO_AUDIO_BACKEND = "pulseaudio"
+WINDOWS_BRIDGE_AUDIO_BACKEND = "windows_bridge"
+SUPPORTED_AUDIO_BACKENDS = frozenset({
+    PULSEAUDIO_AUDIO_BACKEND,
+    WINDOWS_BRIDGE_AUDIO_BACKEND,
+})
 LOG_WRITE_LOCK = threading.Lock()
 BOUNDARY_STATUS_LISTENING = "● LISTENING"
 BOUNDARY_STATUS_AUTO = "✓ AUTO"
@@ -349,6 +355,36 @@ class AudioStream:
             if isinstance(line, bytes):
                 line = line.decode("utf-8", errors="replace")
             self.stderr_tail.append(line.rstrip())
+
+
+def create_remote_audio_stream(
+    backend,
+    worker,
+    on_pcm,
+    on_error,
+    on_hotkey=None,
+    on_status=None,
+):
+    """Construct the explicitly selected interviewer-audio backend.
+
+    The PulseAudio branch is intentionally the pre-existing path.  The Windows
+    bridge is imported only when requested so normal Linux startup has no WSL
+    interop dependency or Windows helper setup requirement.
+    """
+    if backend == PULSEAUDIO_AUDIO_BACKEND:
+        source = get_interviewer_audio_source()
+        return AudioStream("INTERVIEWER", source, on_pcm, on_error), source
+    if backend == WINDOWS_BRIDGE_AUDIO_BACKEND:
+        from windows_port.app_backend import WindowsBridgeAudioStream
+
+        return WindowsBridgeAudioStream(
+            "INTERVIEWER",
+            worker,
+            on_error,
+            on_hotkey,
+            on_status or (lambda _status: None),
+        ), None
+    raise ValueError(f"unsupported audio backend: {backend}")
 
 
 class CodexWorker:
@@ -809,6 +845,15 @@ def stt_status_summary(language):
 
 def runtime_options(environment=None):
     environment = os.environ if environment is None else environment
+    audio_backend = environment.get(
+        "INTERVIEW_AUDIO_BACKEND", PULSEAUDIO_AUDIO_BACKEND
+    ).strip().lower()
+    if audio_backend not in SUPPORTED_AUDIO_BACKENDS:
+        supported = ", ".join(sorted(SUPPORTED_AUDIO_BACKENDS))
+        raise ValueError(
+            f"unsupported INTERVIEW_AUDIO_BACKEND={audio_backend!r}; "
+            f"expected one of: {supported}"
+        )
     return {
         "mode": environment.get("INTERVIEW_APP_MODE", "normal"),
         "codex_enabled": environment.get("INTERVIEW_DISABLE_CODEX", "0")
@@ -819,6 +864,7 @@ def runtime_options(environment=None):
             "INTERVIEW_STT_DIAGNOSTICS", "0"
         )
         != "0",
+        "audio_backend": audio_backend,
     }
 
 
@@ -2533,13 +2579,17 @@ class InterviewControlWindow(Gtk.Window):
     def __init__(self, position, on_back, on_close, on_toggle_visibility):
         super().__init__(title="INTERVIEW CONTROLS")
         self.on_close = on_close
-        self.set_decorated(False)
+        # A non-focusable UTILITY window can display in WSLg but not receive
+        # reliable pointer input after focus moves to a native Windows app.
+        # Keep this compact, but let the normal window manager own movement
+        # and input delivery.
+        self.set_decorated(True)
+        self.set_resizable(False)
         self.set_keep_above(True)
-        self.set_accept_focus(False)
-        self.set_focus_on_map(False)
+        self.set_accept_focus(True)
+        self.set_focus_on_map(True)
         self.set_skip_taskbar_hint(False)
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.stick()
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
         self.set_size_request(132, 44)
         self.move(*position)
         self.connect("delete-event", self._delete)
@@ -2640,13 +2690,16 @@ class TranscriptWindow(Gtk.Window):
         self.focus_placeholder = ""
         self.latest_answer_mark = None
         self.set_default_size(width, height)
-        self.set_decorated(False)
+        # WSLg does not reliably retain undecorated UTILITY overlays after a
+        # native Windows application takes focus.  These are real persistent
+        # top-level windows: give them normal decorations and WM resize grips.
+        self.set_decorated(True)
+        self.set_resizable(True)
         self.set_keep_above(True)
-        self.set_accept_focus(False)
-        self.set_focus_on_map(False)
+        self.set_accept_focus(True)
+        self.set_focus_on_map(True)
         self.set_skip_taskbar_hint(False)
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.stick()
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
         self.set_size_request(320, 100)
         self.move(*position)
         self.connect("delete-event", self._delete)
@@ -2669,10 +2722,9 @@ class TranscriptWindow(Gtk.Window):
             close_button.set_tooltip_text("Close")
             close_button.get_style_context().add_class("close-button")
             close_button.connect("clicked", lambda _button: self.on_close())
-        if not self.focus_mode:
-            header.pack_start(heading, True, True, 0)
-            if close_button is not None:
-                header.pack_end(close_button, False, False, 0)
+        header.pack_start(heading, True, True, 0)
+        if close_button is not None:
+            header.pack_end(close_button, False, False, 0)
 
         if self.focus_mode:
             self.text = Gtk.TextView()
@@ -2701,8 +2753,7 @@ class TranscriptWindow(Gtk.Window):
         scroller.set_shadow_type(Gtk.ShadowType.NONE)
         scroller.add(self.text)
 
-        if not self.focus_mode:
-            box.pack_start(header, False, False, 0)
+        box.pack_start(header, False, False, 0)
         if self.focus_mode:
             self.focus_scroller = scroller
             answer_overlay = Gtk.Overlay()
@@ -3073,6 +3124,8 @@ class InterviewApp:
         self.trigger_socket = None
         self.trigger_lock_file = None
         self.audio_failure_reported = False
+        self.audio_backend = self.runtime["audio_backend"]
+        self.bridge_statuses = []
         self.window_state = self._load_window_state()
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
@@ -3111,7 +3164,7 @@ class InterviewApp:
         )
         self.answer_window = TranscriptWindow(
             "ANSWER",
-            "ANSWER",
+            "CODEX",
             answer_state[2],
             answer_state[3],
             answer_state[:2],
@@ -3132,15 +3185,39 @@ class InterviewApp:
         self.remote_window.show_all()
         self.answer_window.show_all()
         self.control_window.show_all()
-        self._start_trigger_listener()
-        hotkey_status = self._install_global_f8()
-        f9_hotkey_status = self._install_global_f9()
+        self.answer_window.set_status(
+            "Codex loading…" if self.codex_enabled
+            else "Codex disabled · STT Diagnostic mode"
+        )
+        if self.audio_backend == PULSEAUDIO_AUDIO_BACKEND:
+            self._start_trigger_listener()
+            hotkey_status = self._install_global_f8()
+            f9_hotkey_status = self._install_global_f9()
+        else:
+            hotkey_status = "windows_bridge_pending"
+            f9_hotkey_status = "windows_bridge_pending"
 
-        remote_source = get_interviewer_audio_source()
+        self.asr_worker = MoonshineStreamingWorker(
+            self._moonshine_ready,
+            self._moonshine_preview,
+            self._moonshine_error,
+            on_auto_commit=self._moonshine_auto_commit,
+            dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
+            language=self.stt_language,
+        )
+        self.remote_audio, remote_source = create_remote_audio_stream(
+            self.audio_backend,
+            self.asr_worker,
+            self._moonshine_pcm,
+            self._audio_error,
+            self._on_windows_bridge_hotkey,
+            self._windows_bridge_status,
+        )
         append_log(self.log_path, {
             "event": "app_session_start",
             "app_version": APP_VERSION,
             "remote_source": remote_source,
+            "audio_backend": self.audio_backend,
             "microphone_capture": False,
             "asr_backend": moonshine_asr_backend(self.stt_language),
             "moonshine_update_interval_ms": 500,
@@ -3166,20 +3243,6 @@ class InterviewApp:
             "global_f9": f9_hotkey_status,
             "test_label": TEST_LABEL,
         })
-        self.remote_audio = AudioStream(
-            "INTERVIEWER",
-            remote_source,
-            self._moonshine_pcm,
-            self._audio_error,
-        )
-        self.asr_worker = MoonshineStreamingWorker(
-            self._moonshine_ready,
-            self._moonshine_preview,
-            self._moonshine_error,
-            on_auto_commit=self._moonshine_auto_commit,
-            dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
-            language=self.stt_language,
-        )
         self.codex_worker = None
         if self.codex_enabled:
             self.codex_worker = create_live_codex_worker(
@@ -4017,7 +4080,88 @@ PREVIOUS INCOMPLETE QUESTION:
             })
         return False
 
-    def _on_f8(self):
+    def _windows_bridge_status(self, status):
+        """Record native-helper lifecycle information without GTK-thread work."""
+        self.bridge_statuses.append(dict(status))
+        event = status.get("event", "unknown")
+        append_log(self.log_path, {
+            "event": "windows_bridge_status",
+            "bridge_event": event,
+            "audio_backend": WINDOWS_BRIDGE_AUDIO_BACKEND,
+            "device": status.get("device"),
+            "audio_enabled": status.get("audio_enabled"),
+            "hotkeys_enabled": status.get("hotkeys_enabled"),
+            "error": status.get("error"),
+        })
+        if event in {"error", "audio_error", "hotkey_error"}:
+            self._audio_error("INTERVIEWER", RuntimeError(status.get("error", event)))
+
+    def _on_windows_bridge_hotkey(self, event, capture_sample_cursor_and):
+        """Request the F8/F9 snapshot in the bridge reader's cursor lock."""
+        key = event.get("key")
+        if key == "F8":
+            return self._on_f8(
+                capture_sample_cursor_and=capture_sample_cursor_and,
+                hotkey_event=event,
+            )
+        if key == "F9":
+            return self._on_f9(
+                capture_sample_cursor_and=capture_sample_cursor_and,
+                hotkey_event=event,
+            )
+        self._audio_error("INTERVIEWER", ValueError(f"unexpected bridge hotkey: {key!r}"))
+        return False
+
+    def _hotkey_status(self, text, hotkey_event):
+        if hotkey_event is None:
+            self.answer_window.set_status(text)
+        else:
+            GLib.idle_add(self.answer_window.set_status, text)
+
+    @staticmethod
+    def _hotkey_log_fields(hotkey_event):
+        if hotkey_event is None:
+            return {}
+        return {
+            "hotkey_transport": WINDOWS_BRIDGE_AUDIO_BACKEND,
+            "hotkey_sequence": hotkey_event.get("sequence"),
+            "hotkey_timestamp_ns": hotkey_event.get("timestamp_ns"),
+        }
+
+    @staticmethod
+    def _capture_result(capture, enqueue):
+        """Accept both the legacy cursor pair and bridge press-time state."""
+        result = capture(enqueue)
+        target_cursor, accepted = result[:2]
+        state = result[2] if len(result) > 2 else {
+            "received_cursor": target_cursor,
+            "queued_cursor": None,
+            "consumed_cursor": None,
+            "audio_drop_samples": None,
+        }
+        return target_cursor, accepted, state
+
+    @staticmethod
+    def _press_cursor_log_fields(target_cursor, state):
+        received_cursor = state.get("received_cursor", target_cursor)
+        consumed_cursor = state.get("consumed_cursor")
+        backlog_samples = (
+            None if consumed_cursor is None
+            else max(received_cursor - consumed_cursor, 0)
+        )
+        return {
+            "received_sample_cursor_at_press": received_cursor,
+            "queued_sample_cursor_at_press": state.get("queued_cursor"),
+            "consumed_sample_cursor_at_press": consumed_cursor,
+            "backlog_samples_at_press": backlog_samples,
+            "backlog_ms_at_press": (
+                None if backlog_samples is None
+                else round(backlog_samples / SAMPLE_RATE * 1000, 1)
+            ),
+            "audio_drop_samples_at_press": state.get("audio_drop_samples"),
+        }
+
+    def _on_f8(self, *, capture_sample_cursor_and=None, hotkey_event=None):
         now = time.perf_counter()
         if self.last_f8_at is not None and now - self.last_f8_at < ENTER_DEBOUNCE_MS / 1000:
             append_log(self.log_path, {
@@ -4032,7 +4176,12 @@ PREVIOUS INCOMPLETE QUESTION:
                 "event": "f8_ignored",
                 "reason": "moonshine_not_ready",
             })
-            self.remote_window.set_status("Moonshine is still loading…")
+            if hotkey_event is None:
+                self.remote_window.set_status("Moonshine is still loading…")
+            else:
+                GLib.idle_add(
+                    self.remote_window.set_status, "Moonshine is still loading…"
+                )
             return False
         callback = lambda result, error: self._moonshine_question_ready(
             None,
@@ -4042,24 +4191,22 @@ PREVIOUS INCOMPLETE QUESTION:
             commit_source="f8",
         )
         try:
-            target_cursor, accepted = self.remote_audio.capture_sample_cursor_and(
+            capture = capture_sample_cursor_and or self.remote_audio.capture_sample_cursor_and
+            target_cursor, accepted, press_state = self._capture_result(capture,
                 lambda cursor: self.asr_worker.request_snapshot(cursor, callback)
             )
         except Exception as error:
-            self._moonshine_question_ready(
-                None,
-                now,
-                None,
-                error,
-            )
+            if hotkey_event is None:
+                self._moonshine_question_ready(None, now, None, error)
+            else:
+                GLib.idle_add(self._moonshine_question_ready, None, now, None, error)
             return False
         if not accepted:
-            self._moonshine_question_ready(
-                None,
-                now,
-                None,
-                RuntimeError("Moonshine worker rejected F8 snapshot"),
-            )
+            error = RuntimeError("Moonshine worker rejected F8 snapshot")
+            if hotkey_event is None:
+                self._moonshine_question_ready(None, now, None, error)
+            else:
+                GLib.idle_add(self._moonshine_question_ready, None, now, None, error)
             return False
         append_log(self.log_path, {
             "event": "f8_trigger",
@@ -4069,11 +4216,13 @@ PREVIOUS INCOMPLETE QUESTION:
             "asr_backend": moonshine_asr_backend(
                 getattr(self, "stt_language", "en")
             ),
+            **self._press_cursor_log_fields(target_cursor, press_state),
+            **self._hotkey_log_fields(hotkey_event),
         })
-        self.answer_window.set_status("Transcribing question…")
+        self._hotkey_status("Transcribing question…", hotkey_event)
         return False
 
-    def _on_f9(self):
+    def _on_f9(self, *, capture_sample_cursor_and=None, hotkey_event=None):
         now = time.perf_counter()
         if self.last_f9_at is not None and now - self.last_f9_at < ENTER_DEBOUNCE_MS / 1000:
             append_log(self.log_path, {
@@ -4088,7 +4237,12 @@ PREVIOUS INCOMPLETE QUESTION:
                 "event": "f9_ignored",
                 "reason": "moonshine_not_ready",
             })
-            self.remote_window.set_status("Moonshine is still loading…")
+            if hotkey_event is None:
+                self.remote_window.set_status("Moonshine is still loading…")
+            else:
+                GLib.idle_add(
+                    self.remote_window.set_status, "Moonshine is still loading…"
+                )
             return False
         base = getattr(self, "last_commit_state", None)
         if not self._continuation_base_is_valid(base):
@@ -4096,7 +4250,7 @@ PREVIOUS INCOMPLETE QUESTION:
                 "event": "f9_ignored",
                 "reason": "no_valid_previous_question",
             })
-            self.answer_window.set_status("No previous question to continue")
+            self._hotkey_status("No previous question to continue", hotkey_event)
             return False
         base = dict(base)
         callback = lambda result, error: self._moonshine_continuation_ready(
@@ -4106,19 +4260,26 @@ PREVIOUS INCOMPLETE QUESTION:
             error,
         )
         try:
-            target_cursor, accepted = self.remote_audio.capture_sample_cursor_and(
+            capture = capture_sample_cursor_and or self.remote_audio.capture_sample_cursor_and
+            target_cursor, accepted, press_state = self._capture_result(capture,
                 lambda cursor: self.asr_worker.request_snapshot(cursor, callback)
             )
         except Exception as error:
-            self._moonshine_continuation_ready(base, now, None, error)
+            if hotkey_event is None:
+                self._moonshine_continuation_ready(base, now, None, error)
+            else:
+                GLib.idle_add(
+                    self._moonshine_continuation_ready, base, now, None, error
+                )
             return False
         if not accepted:
-            self._moonshine_continuation_ready(
-                base,
-                now,
-                None,
-                RuntimeError("Moonshine worker rejected F9 snapshot"),
-            )
+            error = RuntimeError("Moonshine worker rejected F9 snapshot")
+            if hotkey_event is None:
+                self._moonshine_continuation_ready(base, now, None, error)
+            else:
+                GLib.idle_add(
+                    self._moonshine_continuation_ready, base, now, None, error
+                )
             return False
         append_log(self.log_path, {
             "event": "f9_trigger",
@@ -4130,8 +4291,10 @@ PREVIOUS INCOMPLETE QUESTION:
             "asr_backend": moonshine_asr_backend(
                 getattr(self, "stt_language", "en")
             ),
+            **self._press_cursor_log_fields(target_cursor, press_state),
+            **self._hotkey_log_fields(hotkey_event),
         })
-        self.answer_window.set_status("Transcribing continuation…")
+        self._hotkey_status("Transcribing continuation…", hotkey_event)
         return False
 
     def _audio_error(self, role, error):
@@ -4183,6 +4346,14 @@ PREVIOUS INCOMPLETE QUESTION:
             except Exception as error:
                 cleanup_errors.append((name, error))
 
+        cursor_state = None
+        cursor_snapshot = getattr(self.remote_audio, "cursor_state", None)
+        if cursor_snapshot is not None:
+            try:
+                cursor_state = cursor_snapshot()
+            except Exception as error:
+                cleanup_errors.append(("audio_cursor_state", error))
+
         run_cleanup("window_state", self._save_window_state)
         run_cleanup("audio", self.remote_audio.stop)
         run_cleanup("moonshine", self.asr_worker.stop)
@@ -4194,6 +4365,12 @@ PREVIOUS INCOMPLETE QUESTION:
             "exit_action": exit_action,
             "questions": self.question_count,
             "codex_requests": self.codex_request_count,
+            "audio_backend": getattr(self, "audio_backend", PULSEAUDIO_AUDIO_BACKEND),
+            "final_audio_cursor_state": cursor_state,
+            "windows_bridge_stopped": (
+                getattr(self, "audio_backend", None)
+                == WINDOWS_BRIDGE_AUDIO_BACKEND
+            ),
             "cleanup_errors": [
                 {"resource": name, "error": str(error)}
                 for name, error in cleanup_errors

@@ -201,9 +201,32 @@ Close or reconfigure the application holding the shortcut and run the probe
 again.  The helper unregisters every successfully registered key during normal
 shutdown and partial-registration cleanup.
 
-## Scope boundary
+## STEP 4: WSLg Interview Assistant integration
 
-No production application module imports `windows_port` in this stage.  Do not
-wire this probe into `MoonshineStreamingWorker`, F8/F9 semantic handling, the
-launcher, sessions, or `interview_app.py` until the transport result has been
-manually verified on a Windows host.
+The normal Linux backend remains the default. Select the Windows bridge only
+explicitly, with `INTERVIEW_AUDIO_BACKEND=windows_bridge`; supported values are
+`pulseaudio` and `windows_bridge`. The Windows backend uses the existing WSLg
+GTK Session → Preparation → Interview UI and the existing Moonshine semantic
+path, but it does not start ffmpeg/PulseAudio capture, install GNOME keybindings,
+or create the Linux trigger socket. Instead, it starts one `WindowsBridgeClient`
+for WASAPI PCM and native F8/F9 events.
+
+For the first actual-app smoke test, run the Codex-off diagnostic flow:
+
+```bash
+cd /home/won/voice
+./start_wsl_windows_app.sh
+```
+
+This wrapper sets `INTERVIEW_AUDIO_BACKEND=windows_bridge` and reuses the
+existing `stt_diagnostic` mode, so Session and Preparation still appear but no
+Codex request is made. Choose/create a Session, continue through Preparation,
+and start Interview. The runtime log (and diagnostic session JSONL) records the
+selected playback device, bridge readiness/hotkey state, F8/F9 sequence and
+cursor/barrier diagnostics, and final bridge cursor state at shutdown.
+
+With a Windows native application such as Chrome focused, play audio and press
+F8 at the question boundary. The Interviewer window should commit one question.
+Play the continuation and press F9; it should update that same question number.
+Close the app and confirm the log contains `windows_bridge_stopped: true` and
+that no Windows helper remains running.
