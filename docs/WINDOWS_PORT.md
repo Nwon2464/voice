@@ -116,6 +116,59 @@ is one of `completed_within_timeout`,
 `audio_drop_samples` and `audio_loss_detected` remain separate from a drain
 deadline miss.
 
+## STEP 3B: Windows PCM + F8/F9 semantic probe
+
+This standalone probe combines WASAPI PCM and the native global F8/F9 bridge
+with the existing `MoonshineStreamingWorker`.  It has no UI, Session, launcher,
+or Codex integration.
+
+```bash
+.venv/bin/python -m windows_port.semantic_probe --language en --seconds 60
+.venv/bin/python -m windows_port.semantic_probe --language ja --seconds 60
+```
+
+Play a Windows-output question and press F8 at its boundary.  The probe fixes
+the current received PCM cursor while the bridge callback is executing and
+passes that exact cursor to `request_snapshot`.  Moonshine retains its normal
+barrier, force-update, silence accumulator, and stream-reset behavior; it does
+not skip the backlog or move the F8 target forward.  Later PCM belongs to later
+snapshots.
+
+F8 is the only new semantic question action.  A valid F8 increments the
+semantic question number; empty/duplicate F8 does not.  After a valid F8, play
+the correction/continuation and press F9.  F9 updates the same question number;
+without a valid prior F8/F9 question it is rejected before a snapshot is
+requested.  Per-key terminal JSON contains target/backlog-at-press, barrier and
+force-update timings, accept/reject state, and committed text.  The final JSON
+includes all ordered semantic events and aggregate counts.
+
+## Deterministic WAV semantic probe
+
+Use this after the live probes to validate F8/F9 semantics without human audio
+playback or key timing. It feeds a WAV directly into the same worker in 10 ms
+chunks, injects semantic F8/F9 events at exact PCM cursors, and never attempts
+to automate a physical Windows keypress.
+
+```bash
+.venv/bin/python -m windows_port.semantic_file_probe --language ja --wav /path/to/japanese.wav
+.venv/bin/python -m windows_port.semantic_file_probe --language en --wav /path/to/english.wav
+```
+
+The probe prints source WAV metadata. Non-16 kHz mono s16le PCM input is
+resampled to a `/tmp` 16 kHz mono s16le test WAV while leaving the source file
+unchanged. It records a full-audio reference snapshot, then supplies the same
+file again and injects F8 immediately after the final chunk is submitted. The
+F8 received/target cursor must equal the total WAV samples; the worker barrier
+must consume through that target before committing. Fast file feed is labelled
+`synthetic_backlog_stress_fast_10ms_feed`, so its backlog measurements are not
+mixed with live realtime performance measurements.
+
+It also searches for a low-RMS silence boundary between 50% and 70% of the WAV
+to run F8→F9 continuation, and separately verifies F9-without-F8 rejection.
+Reference/F8 transcripts, normalized comparison, similarity, and tail-suffix
+comparison are diagnostics only: cursor/barrier invariants determine transport
+correctness, while a small ASR revision difference is not treated as tail loss.
+
 ## STEP 3A: Windows global F8/F9 transport probe
 
 This standalone probe registers F8 and F9 through native Win32

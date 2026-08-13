@@ -55,6 +55,22 @@ class PcmCursorForwarder:
         with self.lock:
             return self.next_sample_cursor
 
+    def capture_sample_cursor_and(self, enqueue):
+        """Atomically bind a semantic snapshot request to the current PCM cursor."""
+        with self.lock:
+            target_cursor = self.next_sample_cursor
+            return target_cursor, enqueue(target_cursor)
+
+    def cursor_state(self) -> dict[str, int]:
+        """Read cursor/backlog state using the same lock order as PCM submission."""
+        with self.lock, self.worker.lock:
+            return {
+                "received_cursor": self.next_sample_cursor,
+                "queued_cursor": self.worker.queued_sample_cursor,
+                "consumed_cursor": self.worker.consumed_sample_cursor,
+                "audio_drop_samples": self.worker.audio_drop_samples,
+            }
+
 
 def drain_worker(worker, target_cursor: int, timeout: float, *, poll_interval=0.01):
     """Wait for the existing worker to consume every sample through *target_cursor*."""
