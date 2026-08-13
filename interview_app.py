@@ -4024,17 +4024,28 @@ PREVIOUS INCOMPLETE QUESTION:
             except Exception as error:
                 cleanup_errors.append((name, error))
 
+        audio_stop_succeeded = False
+
+        def stop_audio():
+            nonlocal audio_stop_succeeded
+            self.platform_backend.stop()
+            audio_stop_succeeded = True
+
+        run_cleanup("window_state", self._save_window_state)
+        run_cleanup("audio", stop_audio)
+        run_cleanup("moonshine", self.asr_worker.stop)
+
+        # PCM ingress is stopped before Moonshine receives its stop sentinel,
+        # so this observes the terminal ingress/worker cursor state after all
+        # PCM accepted before backend shutdown has had its FIFO drain chance.
         cursor_state = None
-        cursor_snapshot = getattr(self.remote_audio, "cursor_state", None)
+        cursor_snapshot = getattr(self.platform_backend, "cursor_state", None)
         if cursor_snapshot is not None:
             try:
                 cursor_state = cursor_snapshot()
             except Exception as error:
                 cleanup_errors.append(("audio_cursor_state", error))
 
-        run_cleanup("window_state", self._save_window_state)
-        run_cleanup("audio", self.platform_backend.stop)
-        run_cleanup("moonshine", self.asr_worker.stop)
         if self.codex_worker is not None:
             run_cleanup("codex", self.codex_worker.stop)
         run_cleanup("session_log", lambda: append_log(self.log_path, {
@@ -4047,6 +4058,7 @@ PREVIOUS INCOMPLETE QUESTION:
             "windows_bridge_stopped": (
                 getattr(self, "audio_backend", None)
                 == WINDOWS_BRIDGE_AUDIO_BACKEND
+                and audio_stop_succeeded
             ),
             "cleanup_errors": [
                 {"resource": name, "error": str(error)}

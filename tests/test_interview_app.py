@@ -2068,6 +2068,161 @@ class AudioStreamTest(unittest.TestCase):
 
 
 class RuntimeLifecycleRegressionTest(unittest.TestCase):
+    def _stop_with_session_event(
+        self,
+        backend,
+        moonshine,
+        codex,
+        *,
+        audio_backend,
+    ):
+        class Window:
+            def hide(self):
+                pass
+
+        app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
+        app.running = True
+        app.exit_action = None
+        app._save_window_state = lambda: None
+        app.platform_backend = backend
+        app.remote_audio = backend
+        app.asr_worker = moonshine
+        app.codex_worker = codex
+        app.log_path = Path("session.jsonl")
+        app.question_count = 0
+        app.codex_request_count = 0
+        app.audio_backend = audio_backend
+        app.remote_window = Window()
+        app.answer_window = Window()
+        app.control_window = Window()
+        events = []
+
+        with patch.object(
+            interview_app,
+            "append_log",
+            side_effect=lambda _path, event: events.append(event),
+        ), patch.object(interview_app.Gtk, "main_quit"):
+            app._stop("quit")
+
+        return events[-1]
+
+    def test_final_audio_cursor_state_is_read_after_backend_and_moonshine_stop(self):
+        calls = []
+
+        class Backend:
+            def stop(self):
+                calls.append("audio")
+
+            def cursor_state(self):
+                calls.append("cursor_state")
+                return {
+                    "received_cursor": 320,
+                    "queued_cursor": 320,
+                    "consumed_cursor": 320,
+                    "moonshine_stopped": moonshine.stopped,
+                }
+
+        class Worker:
+            stopped = False
+
+            def stop(self):
+                calls.append("moonshine")
+                self.stopped = True
+
+        class Codex:
+            def stop(self):
+                calls.append("codex")
+
+        moonshine = Worker()
+        event = self._stop_with_session_event(
+            Backend(),
+            moonshine,
+            Codex(),
+            audio_backend=interview_app.WINDOWS_BRIDGE_AUDIO_BACKEND,
+        )
+
+        self.assertEqual(calls, ["audio", "moonshine", "cursor_state", "codex"])
+        self.assertTrue(event["windows_bridge_stopped"])
+        self.assertTrue(event["final_audio_cursor_state"]["moonshine_stopped"])
+        self.assertEqual(event["cleanup_errors"], [])
+
+    def test_windows_bridge_stop_failure_is_recorded_and_not_reported_as_stopped(self):
+        calls = []
+
+        class Backend:
+            def stop(self):
+                calls.append("audio")
+                raise RuntimeError("bridge stop failed")
+
+            def cursor_state(self):
+                calls.append("cursor_state")
+                return {"received_cursor": 320}
+
+        class Resource:
+            def __init__(self, name):
+                self.name = name
+
+            def stop(self):
+                calls.append(self.name)
+
+        event = self._stop_with_session_event(
+            Backend(),
+            Resource("moonshine"),
+            Resource("codex"),
+            audio_backend=interview_app.WINDOWS_BRIDGE_AUDIO_BACKEND,
+        )
+
+        self.assertEqual(calls, ["audio", "moonshine", "cursor_state", "codex"])
+        self.assertFalse(event["windows_bridge_stopped"])
+        self.assertEqual(
+            event["cleanup_errors"],
+            [{"resource": "audio", "error": "bridge stop failed"}],
+        )
+
+    def test_linux_shutdown_never_reports_windows_bridge_as_stopped(self):
+        class Backend:
+            def stop(self):
+                pass
+
+        class Resource:
+            def stop(self):
+                pass
+
+        event = self._stop_with_session_event(
+            Backend(),
+            Resource(),
+            Resource(),
+            audio_backend=interview_app.PULSEAUDIO_AUDIO_BACKEND,
+        )
+
+        self.assertFalse(event["windows_bridge_stopped"])
+        self.assertIsNone(event["final_audio_cursor_state"])
+
+    def test_cleanup_failures_are_individually_recorded_without_stopping_later_cleanup(self):
+        calls = []
+
+        class Resource:
+            def __init__(self, name):
+                self.name = name
+
+            def stop(self):
+                calls.append(self.name)
+                raise RuntimeError(f"{self.name} failed")
+
+        event = self._stop_with_session_event(
+            Resource("audio"),
+            Resource("moonshine"),
+            Resource("codex"),
+            audio_backend=interview_app.WINDOWS_BRIDGE_AUDIO_BACKEND,
+        )
+
+        self.assertEqual(calls, ["audio", "moonshine", "codex"])
+        self.assertFalse(event["windows_bridge_stopped"])
+        self.assertEqual(
+            {entry["resource"] for entry in event["cleanup_errors"]},
+            {"audio", "moonshine", "codex"},
+        )
+
     def test_shutdown_continues_cleanup_after_individual_failures(self):
         calls = []
 
