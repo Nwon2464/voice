@@ -83,6 +83,38 @@ export INTERVIEW_AUDIO_DEVICE_ID='SoundCard device id'
 Windows helper Python executable when the helper environment is installed in a
 different location.
 
+## Moonshine streaming probe
+
+After the WAV probe succeeds, validate the next boundary without changing the
+interview application.  This probe starts the existing
+`MoonshineStreamingWorker`, forwards every bridge PCM chunk with a contiguous
+sample cursor, and prints changing preview text to the terminal.
+
+```bash
+.venv/bin/python -m windows_port.moonshine_probe --language en --seconds 20
+.venv/bin/python -m windows_port.moonshine_probe --language ja --seconds 20
+```
+
+Play matching English or Japanese speech through the Windows output device.
+At the end, confirm `preview_text` and `transcript_detected`, along with a
+nonzero `pcm_bytes_forwarded`, contiguous `received`/`queued`/`consumed`
+sample cursors, and `audio_drop_samples: 0`.  This remains a standalone
+validation: it does not route PCM into the interview application's worker or
+connect F8/F9.
+
+At the end of the requested capture duration, the probe first stops the bridge
+and fixes its final received cursor.  It then waits up to `--drain-timeout`
+(10 seconds by default) for Moonshine to consume that cursor before printing
+its JSON report.  A normal report has matching received, queued, and consumed
+cursors; a drain timeout is reported explicitly instead of silently dropping
+the queued tail.  The report distinguishes the cursor observed at the deadline
+(`drain_consumed_at_deadline_sample_cursor`) from the cursor after `worker.stop`
+has joined (`final_consumed_after_shutdown_sample_cursor`).  Its `drain_status`
+is one of `completed_within_timeout`,
+`timed_out_but_completed_during_shutdown`, or `incomplete_after_shutdown`.
+`audio_drop_samples` and `audio_loss_detected` remain separate from a drain
+deadline miss.
+
 ## Scope boundary
 
 No production application module imports `windows_port` in this stage.  Do not
