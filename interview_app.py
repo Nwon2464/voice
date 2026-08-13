@@ -40,7 +40,10 @@ from codex_app_server import (
 )
 from context_manager import CONTEXT_STATUS_SYNCED, ContextManager
 from interview_thread_backend import InterviewThreadBackend
-from moonshine_streaming_worker import MoonshineStreamingWorker
+from moonshine_streaming_worker import (
+    MoonshineStreamingWorker,
+    STOP_JOIN_TIMEOUT_SECONDS,
+)
 from platform_backend import (
     PULSEAUDIO_AUDIO_BACKEND,
     SUPPORTED_AUDIO_BACKENDS,
@@ -4031,9 +4034,16 @@ PREVIOUS INCOMPLETE QUESTION:
             self.platform_backend.stop()
             audio_stop_succeeded = True
 
+        def stop_moonshine():
+            if self.asr_worker.stop() is False:
+                raise RuntimeError(
+                    "Moonshine worker did not stop within "
+                    f"{STOP_JOIN_TIMEOUT_SECONDS:g} seconds"
+                )
+
         run_cleanup("window_state", self._save_window_state)
         run_cleanup("audio", stop_audio)
-        run_cleanup("moonshine", self.asr_worker.stop)
+        run_cleanup("moonshine", stop_moonshine)
 
         # PCM ingress is stopped before Moonshine receives its stop sentinel,
         # so this observes the terminal ingress/worker cursor state after all

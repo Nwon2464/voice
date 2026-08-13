@@ -2128,6 +2128,7 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
             def stop(self):
                 calls.append("moonshine")
                 self.stopped = True
+                return True
 
         class Codex:
             def stop(self):
@@ -2145,6 +2146,51 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
         self.assertTrue(event["windows_bridge_stopped"])
         self.assertTrue(event["final_audio_cursor_state"]["moonshine_stopped"])
         self.assertEqual(event["cleanup_errors"], [])
+
+    def test_moonshine_timeout_is_logged_before_cursor_snapshot_and_codex_cleanup(self):
+        calls = []
+
+        class Backend:
+            def stop(self):
+                calls.append("audio")
+
+            def cursor_state(self):
+                calls.append("cursor_state")
+                return {
+                    "received_cursor": 320,
+                    "queued_cursor": 320,
+                    "consumed_cursor": 160,
+                }
+
+        class Moonshine:
+            def stop(self):
+                calls.append("moonshine")
+                return False
+
+        class Codex:
+            def stop(self):
+                calls.append("codex")
+
+        event = self._stop_with_session_event(
+            Backend(),
+            Moonshine(),
+            Codex(),
+            audio_backend=interview_app.WINDOWS_BRIDGE_AUDIO_BACKEND,
+        )
+
+        self.assertEqual(calls, ["audio", "moonshine", "cursor_state", "codex"])
+        self.assertTrue(event["windows_bridge_stopped"])
+        self.assertEqual(
+            event["final_audio_cursor_state"]["consumed_cursor"],
+            160,
+        )
+        self.assertEqual(
+            event["cleanup_errors"],
+            [{
+                "resource": "moonshine",
+                "error": "Moonshine worker did not stop within 5 seconds",
+            }],
+        )
 
     def test_windows_bridge_stop_failure_is_recorded_and_not_reported_as_stopped(self):
         calls = []

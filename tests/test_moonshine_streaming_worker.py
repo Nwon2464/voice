@@ -491,13 +491,32 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
         worker.thread = stuck
         worker.accepting = True
 
-        worker.stop()
+        self.assertFalse(worker.stop())
 
         self.assertEqual(stuck.join_timeout, 5.0)
         self.assertFalse(worker.accepting)
         self.assertIs(worker.thread, stuck)
         self.assertEqual(len(errors), 1)
         self.assertIn("did not stop within 5 seconds", str(errors[0]))
+
+    def test_stop_reports_success_after_worker_thread_terminates(self):
+        class FinishedThread:
+            def join(self, timeout=None):
+                self.join_timeout = timeout
+
+            def is_alive(self):
+                return False
+
+        worker = MoonshineStreamingWorker(
+            lambda *_args: None,
+            lambda *_args: None,
+            lambda *_args: None,
+        )
+        worker.thread = FinishedThread()
+        worker.accepting = True
+
+        self.assertTrue(worker.stop())
+        self.assertIsNone(worker.thread)
 
 
 if __name__ == "__main__":

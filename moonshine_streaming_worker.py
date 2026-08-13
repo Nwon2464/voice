@@ -161,10 +161,11 @@ class MoonshineStreamingWorker:
             self.jobs.put(("snapshot", request))
         return True
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Stop after queued PCM; report whether the worker actually exited."""
         with self.lock:
             if not self.accepting and self.thread is None:
-                return
+                return True
             self.accepting = False
             thread = self.thread
             self.jobs.put(("stop",))
@@ -178,9 +179,10 @@ class MoonshineStreamingWorker:
                         f"{STOP_JOIN_TIMEOUT_SECONDS:g} seconds"
                     ),
                 )
-                return
+                return False
         with self.lock:
             self.thread = None
+        return True
 
     def _default_engine_factory(self):
         from moonshine_voice import ModelArch, Transcriber, get_model_for_language
