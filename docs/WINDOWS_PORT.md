@@ -16,10 +16,11 @@ Windows default output device
     WSL audio_probe.py → wasapi_probe.wav
 ```
 
-The Windows helper has no GUI, microphone capture, hotkey, Whisper, Moonshine,
-or Codex dependencies.  It requests the default Windows output endpoint from
-SoundCard and sends two binary frame types: `A` for PCM and `S` for UTF-8 JSON
-status.  WSL sends `Q` on stdin to stop it.
+The Windows helper has no GUI, microphone capture, Whisper, Moonshine, or
+Codex dependencies.  It requests the default Windows output endpoint from
+SoundCard and sends `A` PCM frames and `S` UTF-8 JSON status frames.  When the
+WSL client requests global hotkeys, it also sends `H` UTF-8 JSON event frames.
+WSL sends `Q` on stdin to stop it.
 
 ## Setup
 
@@ -115,9 +116,41 @@ is one of `completed_within_timeout`,
 `audio_drop_samples` and `audio_loss_detected` remain separate from a drain
 deadline miss.
 
+## STEP 3A: Windows global F8/F9 transport probe
+
+This standalone probe registers F8 and F9 through native Win32
+`RegisterHotKey`, then transfers every press through the same binary bridge.
+It does not start WASAPI capture, Moonshine, F8/F9 semantic commits, or the
+interview application.
+
+```bash
+.venv/bin/python -m windows_port.hotkey_probe --seconds 30
+```
+
+After the ready message, focus Chrome, Zoom, or another native Windows
+application—not the WSL terminal—and press F8/F9.  The WSL terminal should
+print each event in order:
+
+```text
+[hotkey] F8
+[hotkey] F9
+```
+
+The final JSON includes `f8_count`, `f9_count`, and ordered `hotkey_events`.
+Each event is an `H` binary frame containing JSON with `event: "hotkey"`,
+`key`, increasing `sequence`, and `timestamp_ns`.  Existing `A` audio and `S`
+status frames are unchanged.  `FrameWriter` serializes audio/status/hotkey
+writes so concurrently generated frames cannot interleave on stdout.
+
+If F8 or F9 is already registered by another application, the helper emits a
+`hotkey_error` status, the probe reports it in `errors`, and exits nonzero.
+Close or reconfigure the application holding the shortcut and run the probe
+again.  The helper unregisters every successfully registered key during normal
+shutdown and partial-registration cleanup.
+
 ## Scope boundary
 
 No production application module imports `windows_port` in this stage.  Do not
-wire this probe into `MoonshineStreamingWorker`, F8/F9, the launcher, sessions,
-or `interview_app.py` until the capture result has been manually verified on a
-Windows host.
+wire this probe into `MoonshineStreamingWorker`, F8/F9 semantic handling, the
+launcher, sessions, or `interview_app.py` until the transport result has been
+manually verified on a Windows host.

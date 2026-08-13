@@ -9,16 +9,26 @@ import threading
 from collections import deque
 from pathlib import Path
 
-from windows_port.bridge_protocol import AUDIO, STATUS, read_frame
+from windows_port.bridge_protocol import AUDIO, HOTKEY, STATUS, decode_hotkey, read_frame
 
 
 class WindowsBridgeClient:
     """Launch the Windows helper through WSL interop and dispatch its frames."""
 
-    def __init__(self, on_pcm, on_status, on_error):
+    def __init__(
+        self,
+        on_pcm,
+        on_status,
+        on_error,
+        *,
+        on_hotkey=None,
+        capture_audio=True,
+    ):
         self.on_pcm = on_pcm
         self.on_status = on_status
         self.on_error = on_error
+        self.on_hotkey = on_hotkey
+        self.capture_audio = capture_audio
         self.process = None
         self.reader = None
         self.stderr_reader = None
@@ -34,6 +44,10 @@ class WindowsBridgeClient:
             Path(__file__).resolve().parents[1] / "windows_bridge_helper.py"
         )
         command = [python_path, helper_path]
+        if self.on_hotkey is not None:
+            command.append("--hotkeys")
+        if not self.capture_audio:
+            command.append("--no-audio")
         device_id = os.environ.get("INTERVIEW_AUDIO_DEVICE_ID")
         if device_id:
             command.extend(["--device-id", device_id])
@@ -85,6 +99,10 @@ class WindowsBridgeClient:
                 kind, payload = read_frame(process.stdout)
                 if kind == AUDIO:
                     self.on_pcm(payload)
+                elif kind == HOTKEY:
+                    if self.on_hotkey is None:
+                        raise RuntimeError("received an unexpected Windows hotkey frame")
+                    self.on_hotkey(decode_hotkey(payload))
                 elif kind == STATUS:
                     self.on_status(json.loads(payload.decode("utf-8")))
                 else:
