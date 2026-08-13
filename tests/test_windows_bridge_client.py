@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,12 +18,119 @@ from windows_port.bridge_protocol import (
     encode_status,
     read_frame,
 )
+from windows_port.app_backend import WindowsBridgeAudioStream
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class WindowsBridgeClientTests(unittest.TestCase):
+    @staticmethod
+    def _stopped_process():
+        return SimpleNamespace(
+            stdin=None,
+            poll=lambda: 0,
+        )
+
+    def test_reader_pcm_callback_can_abort_without_self_join(self):
+        worker = SimpleNamespace(lock=threading.Lock())
+        stream = WindowsBridgeAudioStream(
+            "INTERVIEWER",
+            worker,
+            lambda *_args: None,
+            lambda *_args: None,
+            lambda _status: None,
+            on_pcm=lambda *_args: stream.abort(),
+        )
+        client = WindowsBridgeClient(
+            stream._on_pcm,
+            stream._on_status,
+            stream._on_error,
+        )
+        stream.client = client
+        client.process = SimpleNamespace(
+            stdin=None,
+            stdout=io.BytesIO(encode_frame(AUDIO, b"\x01\x00")),
+            stderr=io.BytesIO(),
+            poll=lambda: 0,
+        )
+        stderr_joins = []
+        client.stderr_reader = SimpleNamespace(
+            join=lambda timeout: stderr_joins.append(timeout),
+        )
+        errors = []
+
+        def run_reader():
+            client.reader = threading.current_thread()
+            try:
+                client._read()
+            except Exception as error:
+                errors.append(error)
+
+        reader = threading.Thread(target=run_reader)
+        reader.start()
+        reader.join(timeout=1)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(stderr_joins, [1])
+        self.assertTrue(client.stopped.is_set())
+        self.assertIsNone(client.process)
+
+    def test_external_stop_joins_reader_and_stderr_reader_once(self):
+        client = WindowsBridgeClient(
+            lambda _pcm: None,
+            lambda _status: None,
+            lambda _error: None,
+        )
+        client.process = self._stopped_process()
+        reader_joins = []
+        stderr_joins = []
+        client.reader = SimpleNamespace(
+            join=lambda timeout: reader_joins.append(timeout),
+        )
+        client.stderr_reader = SimpleNamespace(
+            join=lambda timeout: stderr_joins.append(timeout),
+        )
+
+        client.stop()
+        client.stop()
+
+        self.assertEqual(reader_joins, [1])
+        self.assertEqual(stderr_joins, [1])
+        self.assertTrue(client.stopped.is_set())
+        self.assertIsNone(client.process)
+
+    def test_stop_from_stderr_reader_skips_its_own_join(self):
+        client = WindowsBridgeClient(
+            lambda _pcm: None,
+            lambda _status: None,
+            lambda _error: None,
+        )
+        client.process = self._stopped_process()
+        reader_joins = []
+        client.reader = SimpleNamespace(
+            join=lambda timeout: reader_joins.append(timeout),
+        )
+        errors = []
+
+        def stop_from_stderr_reader():
+            client.stderr_reader = threading.current_thread()
+            try:
+                client.stop()
+            except Exception as error:
+                errors.append(error)
+
+        stderr_reader = threading.Thread(target=stop_from_stderr_reader)
+        stderr_reader.start()
+        stderr_reader.join(timeout=1)
+
+        self.assertFalse(stderr_reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(reader_joins, [1])
+        self.assertTrue(client.stopped.is_set())
+        self.assertIsNone(client.process)
+
     def test_reader_dispatches_pcm_and_status_frames(self):
         received_pcm = []
         statuses = []

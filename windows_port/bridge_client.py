@@ -84,9 +84,13 @@ class WindowsBridgeClient:
                         process.kill()
                         process.wait(timeout=2)
         self.stopped.set()
-        if self.reader is not None:
+        current_thread = threading.current_thread()
+        if self.reader is not None and self.reader is not current_thread:
             self.reader.join(timeout=1)
-        if self.stderr_reader is not None:
+        if (
+            self.stderr_reader is not None
+            and self.stderr_reader is not current_thread
+        ):
             self.stderr_reader.join(timeout=1)
         self.process = None
 
