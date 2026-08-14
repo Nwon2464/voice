@@ -482,6 +482,8 @@ class CodexLatestOnlyTest(unittest.TestCase):
         dialog = SimpleNamespace(
             run=lambda: interview_app.SESSION_RESPONSE_BACK,
             selected_session=lambda: None,
+            selected_sessions=lambda: [],
+            all_sessions=lambda: [],
             destroy=lambda: None,
         )
         store = SimpleNamespace(active=lambda: [])
@@ -497,6 +499,52 @@ class CodexLatestOnlyTest(unittest.TestCase):
             )
 
         self.assertEqual(result, interview_app.SESSION_RESPONSE_BACK)
+
+    def test_bulk_archive_marks_each_selected_session(self):
+        archived = []
+        store = SimpleNamespace(
+            mark_archived=lambda session_id: archived.append(session_id),
+        )
+        sessions = [
+            {"session_id": "session-a", "name": "A"},
+            {"session_id": "session-b", "name": "B"},
+        ]
+
+        failures = interview_app._archive_sessions(
+            store,
+            sessions,
+            codex_enabled=False,
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(archived, ["session-a", "session-b"])
+
+    def test_bulk_archive_continues_after_individual_failure(self):
+        archived = []
+        store = SimpleNamespace(
+            mark_archived=lambda session_id: archived.append(session_id),
+        )
+        sessions = [
+            {"session_id": "session-a", "name": "A"},
+            {"session_id": "session-b", "name": "B"},
+        ]
+
+        with patch.object(
+            interview_app,
+            "_archive_session",
+            side_effect=[RuntimeError("failed"), None],
+        ) as archive_session:
+            failures = interview_app._archive_sessions(
+                store,
+                sessions,
+                codex_enabled=True,
+            )
+
+        self.assertEqual(archive_session.call_count, 2)
+        self.assertEqual([session["session_id"] for session, _ in failures], [
+            "session-a",
+        ])
+        self.assertEqual(archived, [])
 
     def test_session_back_relaunches_mode_selector_detached(self):
         with patch.object(interview_app.subprocess, "Popen") as popen:

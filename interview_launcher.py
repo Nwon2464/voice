@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import gi
@@ -54,6 +55,14 @@ def runtime_log_path(environment=None):
     environment = os.environ if environment is None else environment
     runtime_dir = environment.get("XDG_RUNTIME_DIR") or "/tmp"
     return Path(runtime_dir) / "interview-assistant.log"
+
+
+def default_test_label(mode, now=None):
+    """Build the prefilled session-log label for modes that require one."""
+    if mode not in LABEL_REQUIRED_MODES:
+        raise ValueError(f"mode does not require a test label: {mode}")
+    now = datetime.now().astimezone() if now is None else now
+    return f"{mode}-{now.strftime('%Y%m%d-%H%M%S')}"
 
 
 def application_argv(app_dir=APP_DIR):
@@ -166,6 +175,7 @@ class ModeCard(Gtk.Frame):
         on_launch,
         label_prompt=None,
         placeholder=None,
+        initial_label=None,
     ):
         super().__init__()
         self.mode = mode
@@ -193,6 +203,8 @@ class ModeCard(Gtk.Frame):
             body.pack_start(prompt, False, False, 1)
             self.label_entry = Gtk.Entry()
             self.label_entry.set_placeholder_text(placeholder)
+            if initial_label:
+                self.label_entry.set_text(initial_label)
             self.label_entry.connect("changed", self._label_changed)
             body.pack_start(self.label_entry, False, False, 0)
             self.validation_label = Gtk.Label(
@@ -326,6 +338,10 @@ class InterviewLauncher(Gtk.Window):
             self.launch,
             label_prompt,
             placeholder,
+            (
+                default_test_label(mode)
+                if mode in LABEL_REQUIRED_MODES else None
+            ),
         )
         self.mode_cards.append(card)
         return card

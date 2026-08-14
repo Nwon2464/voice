@@ -781,6 +781,7 @@ SESSION_RESPONSE_NEW = 1
 SESSION_RESPONSE_ARCHIVE = 2
 SESSION_RESPONSE_RENAME = 3
 SESSION_RESPONSE_BACK = 4
+SESSION_RESPONSE_ARCHIVE_ALL = 5
 
 
 def moonshine_asr_backend(language):
@@ -1167,15 +1168,27 @@ class SessionChooserDialog(Gtk.Dialog):
         )
         self.rename_button.set_sensitive(False)
         self.archive_button = self.add_button(
-            "삭제",
+            "선택 삭제",
             SESSION_RESPONSE_ARCHIVE,
         )
         self.archive_button.set_sensitive(False)
         self.archive_button.get_style_context().add_class(
             "destructive-action"
         )
+        self.archive_all_button = self.add_button(
+            "전체 삭제",
+            SESSION_RESPONSE_ARCHIVE_ALL,
+        )
+        self.archive_all_button.set_sensitive(bool(sessions))
+        self.archive_all_button.get_style_context().add_class(
+            "destructive-action"
+        )
         self.get_action_area().set_child_secondary(
             self.archive_button,
+            True,
+        )
+        self.get_action_area().set_child_secondary(
+            self.archive_all_button,
             True,
         )
         self.add_button("뒤로가기", SESSION_RESPONSE_BACK)
@@ -1194,7 +1207,8 @@ class SessionChooserDialog(Gtk.Dialog):
         help_text = Gtk.Label(
             label=(
                 "최근 사용한 면접 세션부터 표시됩니다.\n"
-                "세션을 선택하고 열기를 누르거나 Enter를 눌러주세요."
+                "세션 하나를 선택해 열거나 이름을 변경할 수 있습니다.\n"
+                "Ctrl/Shift로 여러 세션을 선택해 삭제할 수 있습니다."
             )
         )
         help_text.set_xalign(0)
@@ -1239,7 +1253,7 @@ class SessionChooserDialog(Gtk.Dialog):
         self.tree.connect("row-activated", self._row_activated)
         self.tree.connect("key-press-event", self._key_pressed)
         selection = self.tree.get_selection()
-        selection.set_mode(Gtk.SelectionMode.SINGLE)
+        selection.set_mode(Gtk.SelectionMode.MULTIPLE)
         selection.connect("changed", self._selection_changed)
 
         scroller = Gtk.ScrolledWindow()
@@ -1264,12 +1278,25 @@ class SessionChooserDialog(Gtk.Dialog):
         self.tree.grab_focus()
 
     def selected_session(self):
-        model, tree_iter = self.tree.get_selection().get_selected()
-        if tree_iter is None:
-            return None
-        return self.sessions_by_session_id[model[tree_iter][3]]
+        sessions = self.selected_sessions()
+        return sessions[0] if len(sessions) == 1 else None
 
-    def _row_activated(self, *_args):
+    def selected_sessions(self):
+        model, paths = self.tree.get_selection().get_selected_rows()
+        return [
+            self.sessions_by_session_id[model[path][3]]
+            for path in paths
+        ]
+
+    def all_sessions(self):
+        return list(self.sessions_by_session_id.values())
+
+    def _row_activated(self, _tree, path, *_args):
+        selection = self.tree.get_selection()
+        selection.unselect_all()
+        selection.select_path(path)
+        if self.selected_session() is None:
+            return None
         self.response(Gtk.ResponseType.OK)
 
     def _key_pressed(self, _widget, event):
@@ -1280,10 +1307,12 @@ class SessionChooserDialog(Gtk.Dialog):
         return False
 
     def _selection_changed(self, selection):
-        has_selection = selection.get_selected()[1] is not None
-        self.open_button.set_sensitive(has_selection)
-        self.rename_button.set_sensitive(has_selection)
-        self.archive_button.set_sensitive(has_selection)
+        _model, paths = selection.get_selected_rows()
+        selection_count = len(paths)
+        self.open_button.set_sensitive(selection_count == 1)
+        self.rename_button.set_sensitive(selection_count == 1)
+        self.archive_button.set_sensitive(selection_count > 0)
+        self.archive_all_button.set_sensitive(len(self.model) > 0)
 
     def _render_stt_cell(self, _column, cell, model, tree_iter, _data):
         color = (
@@ -1329,21 +1358,57 @@ def _show_session_error(error):
     dialog.destroy()
 
 
-def _confirm_archive(session):
+def _confirm_archive(sessions):
+    sessions = list(sessions)
+    if len(sessions) == 1:
+        text = "선택한 세션을 삭제할까요?"
+        detail = (
+            f"{sessions[0]['name']}\n\n"
+            "이 세션은 활성 목록에서 제거됩니다."
+        )
+    else:
+        text = f"{len(sessions)}개의 세션을 삭제할까요?"
+        names = "\n".join(
+            session.get("name") or "Unnamed Session"
+            for session in sessions[:5]
+        )
+        remaining = len(sessions) - 5
+        if remaining > 0:
+            names += f"\n외 {remaining}개"
+        detail = f"{names}\n\n선택한 세션은 활성 목록에서 제거됩니다."
     dialog = Gtk.MessageDialog(
         message_type=Gtk.MessageType.QUESTION,
         buttons=Gtk.ButtonsType.NONE,
-        text="선택한 세션을 삭제할까요?",
+        text=text,
     )
-    dialog.format_secondary_text(
-        f"{session['name']}\n\n이 세션은 활성 목록에서 제거됩니다."
-    )
+    dialog.format_secondary_text(detail)
     dialog.add_button("취소", Gtk.ResponseType.CANCEL)
     delete_button = dialog.add_button("삭제", Gtk.ResponseType.OK)
     delete_button.get_style_context().add_class("destructive-action")
     response = dialog.run()
     dialog.destroy()
     return response == Gtk.ResponseType.OK
+
+
+def _archive_session(store, session, codex_enabled):
+    interview_thread_id = session.get("interview_thread_id")
+    try:
+        if codex_enabled and interview_thread_id:
+            archive_persisted_codex_session(interview_thread_id)
+    except CodexAppServerError as error:
+        if "no rollout found" not in str(error).lower():
+            raise
+    store.mark_archived(session["session_id"])
+
+
+def _archive_sessions(store, sessions, codex_enabled):
+    failures = []
+    for session in sessions:
+        try:
+            _archive_session(store, session, codex_enabled)
+        except Exception as error:
+            failures.append((session, error))
+    return failures
 
 
 def choose_interview_session(store, context_manager, codex_enabled=True):
@@ -1355,6 +1420,8 @@ def choose_interview_session(store, context_manager, codex_enabled=True):
         )
         response = dialog.run()
         selected = dialog.selected_session()
+        selected_sessions = dialog.selected_sessions()
+        all_sessions = dialog.all_sessions()
         dialog.destroy()
 
         if response == SESSION_RESPONSE_BACK:
@@ -1388,22 +1455,35 @@ def choose_interview_session(store, context_manager, codex_enabled=True):
                     _show_session_error(error)
             continue
 
-        if response == SESSION_RESPONSE_ARCHIVE and selected is not None:
-            if _confirm_archive(selected):
-                try:
-                    interview_thread_id = selected.get("interview_thread_id")
-                    if codex_enabled and interview_thread_id:
-                        archive_persisted_codex_session(interview_thread_id)
-                    store.mark_archived(selected["session_id"])
-                    preferred_session_id = None
-                except Exception as error:
-                    if isinstance(error, CodexAppServerError) and (
-                        "no rollout found" in str(error).lower()
-                    ):
-                        store.mark_archived(selected["session_id"])
-                        preferred_session_id = None
-                    else:
-                        _show_session_error(error)
+        sessions_to_archive = (
+            selected_sessions
+            if response == SESSION_RESPONSE_ARCHIVE else all_sessions
+        )
+        if (
+            response in {
+                SESSION_RESPONSE_ARCHIVE,
+                SESSION_RESPONSE_ARCHIVE_ALL,
+            }
+            and sessions_to_archive
+        ):
+            if _confirm_archive(sessions_to_archive):
+                failures = _archive_sessions(
+                    store,
+                    sessions_to_archive,
+                    codex_enabled,
+                )
+                preferred_session_id = None
+                if failures:
+                    failure_lines = "\n".join(
+                        f"{session.get('name')}: {error}"
+                        for session, error in failures
+                    )
+                    _show_session_error(
+                        RuntimeError(
+                            "일부 세션을 삭제하지 못했습니다:\n"
+                            f"{failure_lines}"
+                        )
+                    )
             continue
 
         if response == Gtk.ResponseType.OK and selected is not None:

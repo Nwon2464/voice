@@ -1,11 +1,34 @@
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import interview_launcher
 
 
 class InterviewLauncherTest(unittest.TestCase):
+    def test_label_modes_have_timestamped_prefill(self):
+        now = datetime(2026, 8, 14, 12, 34, 56)
+        self.assertEqual(
+            interview_launcher.default_test_label(
+                interview_launcher.PERFORMANCE_MODE,
+                now,
+            ),
+            "performance-20260814-123456",
+        )
+        self.assertEqual(
+            interview_launcher.default_test_label(
+                interview_launcher.STT_DIAGNOSTIC_MODE,
+                now,
+            ),
+            "stt_diagnostic-20260814-123456",
+        )
+        with self.assertRaises(ValueError):
+            interview_launcher.default_test_label(
+                interview_launcher.NORMAL_MODE,
+                now,
+            )
+
     def test_mode_matrix_separates_codex_logging_and_diagnostics(self):
         expected = {
             interview_launcher.NORMAL_MODE: (True, False, False),
