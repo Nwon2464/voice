@@ -27,6 +27,15 @@ def send_app_command(command):
     return 0
 
 
+def send_benchmark_wav_start(wav_name):
+    """Record the external playback boundary in the active session log."""
+    encoded_name = wav_name.encode("utf-8")
+    if not encoded_name or b"\x00" in encoded_name:
+        print("Benchmark WAV name must be non-empty text", file=sys.stderr)
+        return 2
+    return send_app_command(b"BENCHMARK_WAV_START:" + encoded_name)
+
+
 # GNOME의 전역 단축키 명령은 이 경로만 실행한다. 무거운 모듈은 불러오지 않는다.
 if __name__ == "__main__" and "--trigger" in sys.argv:
     raise SystemExit(send_app_command(b"F8"))
@@ -34,6 +43,11 @@ if __name__ == "__main__" and "--trigger-f9" in sys.argv:
     raise SystemExit(send_app_command(b"F9"))
 if __name__ == "__main__" and "--stop" in sys.argv:
     raise SystemExit(send_app_command(b"STOP"))
+if __name__ == "__main__" and "--benchmark-wav-start" in sys.argv:
+    if len(sys.argv) != 3:
+        print("Usage: interview_app.py --benchmark-wav-start <wav-name>")
+        raise SystemExit(2)
+    raise SystemExit(send_benchmark_wav_start(sys.argv[2]))
 
 
 import json
@@ -245,11 +259,30 @@ def append_log(log_path, event):
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def create_app_session():
-    if not TEST_LOGGING:
+def create_app_session(test_logging=None, benchmark_type=None):
+    if test_logging is None:
+        test_logging = TEST_LOGGING
+    if not test_logging:
         return None, None
     session_id = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    session_dir = APP_DIR / "test_runs" / f"app_session_{session_id}_{os.getpid()}"
+    if benchmark_type is None:
+        benchmark_type = os.environ.get(
+            "INTERVIEW_BENCHMARK_TYPE", ""
+        ).strip()
+    if benchmark_type and not all(
+        character.isascii() and (
+            character.isalnum() or character in {"_", "-"}
+        )
+        for character in benchmark_type
+    ):
+        raise ValueError(
+            "INTERVIEW_BENCHMARK_TYPE must use letters, digits, '_' or '-'"
+        )
+    name_parts = ["app_session"]
+    if benchmark_type:
+        name_parts.append(benchmark_type)
+    name_parts.extend([session_id, str(os.getpid())])
+    session_dir = APP_DIR / "test_runs" / "_".join(name_parts)
     session_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
     session_dir.chmod(0o700)
     log_path = session_dir / "session.jsonl"
@@ -822,6 +855,30 @@ def runtime_options(environment=None):
     }
 
 
+def initial_session_settings(environment=None):
+    """Read optional benchmark-only settings for a newly created session.
+
+    Normal sessions keep the existing defaults.  Benchmark automation supplies
+    this value so each new session is configured before Context Sync creates
+    its fresh Codex thread.
+    """
+    environment = os.environ if environment is None else environment
+    raw = environment.get("INTERVIEW_BENCHMARK_INITIAL_SETTINGS")
+    if not raw:
+        return normalize_codex_settings()
+    try:
+        settings = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "INTERVIEW_BENCHMARK_INITIAL_SETTINGS must be JSON object"
+        ) from error
+    if not isinstance(settings, dict):
+        raise ValueError(
+            "INTERVIEW_BENCHMARK_INITIAL_SETTINGS must be JSON object"
+        )
+    return normalize_codex_settings(settings)
+
+
 def preparation_runtime_summary(options, language):
     title = APP_MODE_TITLES.get(options["mode"], options["mode"])
     presentation = stt_presentation(language)
@@ -1309,7 +1366,7 @@ def choose_interview_session(store, context_manager, codex_enabled=True):
                 session = store.create(
                     created.strftime("%Y-%m-%d %H:%M"),
                     created.isoformat(timespec="seconds"),
-                    normalize_codex_settings(),
+                    initial_session_settings(),
                 )
                 session_id = session["session_id"]
                 context_manager.ensure_session(session_id)
@@ -2639,6 +2696,8 @@ class TranscriptWindow(Gtk.Window):
         self.active_answer = ""
         self.focus_placeholder = ""
         self.latest_answer_mark = None
+        self._pending_answer_ui_diagnostics = None
+        self._answer_ui_diagnostics_by_mark = {}
         self.set_default_size(width, height)
         self.set_decorated(False)
         self.set_keep_above(True)
@@ -2852,6 +2911,69 @@ class TranscriptWindow(Gtk.Window):
             self.answer_history.pop()
         self._render_focus_answers()
 
+    def prepare_corrected_answer_alignment(self):
+        """Keep F9's pending corrected answer at its future stream position."""
+        if not self.focus_mode:
+            return
+        buffer = self.text.get_buffer()
+        if self.answer_history:
+            buffer.insert(buffer.get_end_iter(), "\n\n")
+        self._set_latest_answer_mark(buffer.get_end_iter())
+        # Align now, then once more after GTK has processed the buffer resize.
+        self._align_latest_answer_once(self.latest_answer_mark)
+        GLib.idle_add(
+            self._align_latest_answer_once,
+            self.latest_answer_mark,
+        )
+
+    def configure_answer_ui_diagnostics(self, context, logger):
+        """Attach one diagnostic record to the next streamed answer only."""
+        self._pending_answer_ui_diagnostics = (dict(context), logger)
+
+    def answer_ui_diagnostic_snapshot(self, mark=None):
+        """Return UI state for logs without mutating the displayed answer."""
+        snapshot = {
+            "history_count": len(self.answer_history),
+            "latest_answer_mark_offset": None,
+            "latest_answer_y": None,
+            "scroll_value": None,
+            "vadjustment_lower": None,
+            "vadjustment_upper": None,
+            "vadjustment_page_size": None,
+            "maximum_scroll": None,
+            "mark_is_current": None,
+        }
+        if not self.focus_mode:
+            return snapshot
+        selected_mark = self.latest_answer_mark if mark is None else mark
+        snapshot["mark_is_current"] = (
+            selected_mark is not None
+            and selected_mark is self.latest_answer_mark
+        )
+        if selected_mark is not None:
+            try:
+                answer_start = self.text.get_buffer().get_iter_at_mark(
+                    selected_mark
+                )
+                snapshot["latest_answer_mark_offset"] = answer_start.get_offset()
+                snapshot["latest_answer_y"] = self.text.get_iter_location(
+                    answer_start
+                ).y
+            except (TypeError, ValueError):
+                pass
+        adjustment = self.focus_scroller.get_vadjustment()
+        lower = adjustment.get_lower()
+        upper = adjustment.get_upper()
+        page_size = adjustment.get_page_size()
+        snapshot.update({
+            "scroll_value": adjustment.get_value(),
+            "vadjustment_lower": lower,
+            "vadjustment_upper": upper,
+            "vadjustment_page_size": page_size,
+            "maximum_scroll": max(lower, upper - page_size),
+        })
+        return snapshot
+
     def set_status(self, text):
         if self.focus_mode:
             self.focus_placeholder = text
@@ -2881,6 +3003,20 @@ class TranscriptWindow(Gtk.Window):
         self._set_latest_answer_mark(buffer.get_end_iter())
         buffer.insert(buffer.get_end_iter(), text)
         self.active_answer = text
+        diagnostic = getattr(self, "_pending_answer_ui_diagnostics", None)
+        self._pending_answer_ui_diagnostics = None
+        if diagnostic is not None:
+            diagnostics_by_mark = getattr(
+                self,
+                "_answer_ui_diagnostics_by_mark",
+                None,
+            )
+            if diagnostics_by_mark is None:
+                diagnostics_by_mark = {}
+                self._answer_ui_diagnostics_by_mark = diagnostics_by_mark
+            diagnostics_by_mark[id(self.latest_answer_mark)] = (
+                diagnostic
+            )
         GLib.idle_add(
             self._align_latest_answer_once,
             self.latest_answer_mark,
@@ -2941,18 +3077,28 @@ class TranscriptWindow(Gtk.Window):
         )
 
     def _align_latest_answer_once(self, mark):
-        if mark is not self.latest_answer_mark:
-            return False
-        buffer = self.text.get_buffer()
-        answer_start = buffer.get_iter_at_mark(mark)
-        answer_rect = self.text.get_iter_location(answer_start)
-        adjustment = self.focus_scroller.get_vadjustment()
-        minimum = adjustment.get_lower()
-        maximum = max(
-            minimum,
-            adjustment.get_upper() - adjustment.get_page_size(),
-        )
-        adjustment.set_value(max(minimum, min(answer_rect.y, maximum)))
+        diagnostic = getattr(
+            self,
+            "_answer_ui_diagnostics_by_mark",
+            {},
+        ).pop(id(mark), None)
+        snapshot = getattr(self, "answer_ui_diagnostic_snapshot", None)
+        before = snapshot(mark) if snapshot is not None else None
+        if mark is self.latest_answer_mark:
+            buffer = self.text.get_buffer()
+            answer_start = buffer.get_iter_at_mark(mark)
+            answer_rect = self.text.get_iter_location(answer_start)
+            adjustment = self.focus_scroller.get_vadjustment()
+            minimum = adjustment.get_lower()
+            maximum = max(
+                minimum,
+                adjustment.get_upper() - adjustment.get_page_size(),
+            )
+            adjustment.set_value(max(minimum, min(answer_rect.y, maximum)))
+        after = snapshot(mark) if snapshot is not None else None
+        if diagnostic is not None:
+            context, logger = diagnostic
+            logger("answer_scroll_align", context, before, after)
         return False
 
     def _focus_scroll(self, _widget, event):
@@ -3305,7 +3451,7 @@ class InterviewApp:
         def listen():
             while self.running:
                 try:
-                    data = self.trigger_socket.recv(32)
+                    data = self.trigger_socket.recv(512)
                 except socket.timeout:
                     continue
                 except OSError:
@@ -3316,9 +3462,41 @@ class InterviewApp:
                     GLib.idle_add(self._on_f9)
                 elif data == b"STOP":
                     GLib.idle_add(self.shutdown)
+                elif data.startswith(b"BENCHMARK_WAV_START:"):
+                    raw_payload = data.partition(b":")[2].decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                    try:
+                        payload = json.loads(raw_payload)
+                    except ValueError:
+                        payload = {"wav": raw_payload}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    wav_name = str(payload.get("wav") or "").strip()
+                    if wav_name:
+                        GLib.idle_add(
+                            self._benchmark_wav_start,
+                            wav_name,
+                            payload.get("playback_command_started_at_unix_ns"),
+                        )
 
         self.socket_thread = threading.Thread(target=listen, daemon=True)
         self.socket_thread.start()
+
+    def _benchmark_wav_start(self, wav_name, started_at_unix_ns=None):
+        """Keep benchmark playback timing in the existing JSONL session log."""
+        if self.running:
+            event = {
+                "event": "benchmark_wav_start",
+                "wav": wav_name,
+                "next_question": self.question_count + 1,
+            }
+            if isinstance(started_at_unix_ns, int):
+                event["playback_command_started_at_unix_ns"] = (
+                    started_at_unix_ns
+                )
+            append_log(self.log_path, event)
+        return False
 
     def _close_trigger_listener(self):
         socket_error = None
@@ -3502,10 +3680,14 @@ class InterviewApp:
         self.conversation_context.append(("INTERVIEWER", question_text))
         codex_generation = None
         if self.codex_enabled:
-            codex_generation = self._request_codex_answer(
-                question_number,
-                question_text,
-            )
+            self._answer_ui_trigger = commit_source
+            try:
+                codex_generation = self._request_codex_answer(
+                    question_number,
+                    question_text,
+                )
+            finally:
+                self._answer_ui_trigger = None
         else:
             self.answer_window.set_status(
                 "Codex disabled · question logged only"
@@ -3656,12 +3838,16 @@ class InterviewApp:
         self.remote_window.set_boundary_status(BOUNDARY_STATUS_F9)
         codex_generation = None
         if self.codex_enabled:
-            codex_generation = self._request_codex_answer(
-                question_number,
-                combined_text,
-                supersedes_generation=base["codex_generation"],
-                correction={"previous_text": base["text"]},
-            )
+            self._answer_ui_trigger = "f9"
+            try:
+                codex_generation = self._request_codex_answer(
+                    question_number,
+                    combined_text,
+                    supersedes_generation=base["codex_generation"],
+                    correction={"previous_text": base["text"]},
+                )
+            finally:
+                self._answer_ui_trigger = None
         else:
             self.answer_window.set_status(
                 "Codex disabled · corrected question logged only"
@@ -3682,12 +3868,53 @@ class InterviewApp:
         }
         return False
 
+    def _answer_ui_snapshot(self):
+        fields = {
+            "history_count": None,
+            "latest_answer_mark_offset": None,
+            "latest_answer_y": None,
+            "scroll_value": None,
+            "vadjustment_lower": None,
+            "vadjustment_upper": None,
+            "vadjustment_page_size": None,
+            "maximum_scroll": None,
+            "mark_is_current": None,
+        }
+        snapshot = getattr(
+            self.answer_window,
+            "answer_ui_diagnostic_snapshot",
+            None,
+        )
+        if snapshot is not None:
+            fields.update(snapshot())
+        return fields
+
+    def _log_answer_ui(self, event, context, before=None, after=None):
+        """Write diagnostics only; never change the Answer window state."""
+        before = self._answer_ui_snapshot() if before is None else before
+        after = self._answer_ui_snapshot() if after is None else after
+        payload = {
+            "event": event,
+            **context,
+            **after,
+            "scroll_value_before": before["scroll_value"],
+            "scroll_value_after": after["scroll_value"],
+            "vadjustment_lower_before": before["vadjustment_lower"],
+            "vadjustment_upper_before": before["vadjustment_upper"],
+            "vadjustment_page_size_before": (
+                before["vadjustment_page_size"]
+            ),
+            "maximum_scroll_before": before["maximum_scroll"],
+        }
+        append_log(self.log_path, payload)
+
     def _request_codex_answer(
         self,
         question_number,
         question_text,
         supersedes_generation=None,
         correction=None,
+        trigger=None,
     ):
         with self.codex_state_lock:
             context_end = len(self.conversation_context)
@@ -3750,6 +3977,15 @@ CURRENT INTERVIEWER QUESTION:
                 "status": "pending",
                 "spoken": None,
             }
+        ui_trigger = trigger or getattr(self, "_answer_ui_trigger", None) or "unknown"
+        ui_context = {
+            "generation": generation,
+            "question": question_number,
+            "trigger": ui_trigger,
+            "f8_or_f9": (
+                ui_trigger if ui_trigger in {"f8", "f9"} else None
+            ),
+        }
         for old in superseded:
             append_log(self.log_path, {
                 "event": "codex_request_superseded",
@@ -3795,7 +4031,22 @@ PREVIOUS INCOMPLETE QUESTION:
             if discard is None:
                 self.answer_window.set_text("")
             else:
+                discard_before = self._answer_ui_snapshot()
                 discard(remove_completed=remove_completed)
+                if correction is not None:
+                    prepare_alignment = getattr(
+                        self.answer_window,
+                        "prepare_corrected_answer_alignment",
+                        None,
+                    )
+                    if prepare_alignment is not None:
+                        prepare_alignment()
+                    self._log_answer_ui(
+                        "answer_discard",
+                        ui_context,
+                        discard_before,
+                        self._answer_ui_snapshot(),
+                    )
         append_log(self.log_path, {
             "event": "codex_request",
             "request": request_number,
@@ -3859,7 +4110,21 @@ PREVIOUS INCOMPLETE QUESTION:
             else:
                 stream_started = True
                 self.answer_window.set_response_status(RESPONSE_STATUS_READY)
+                stream_before = self._answer_ui_snapshot()
+                configure_diagnostics = getattr(
+                    self.answer_window,
+                    "configure_answer_ui_diagnostics",
+                    None,
+                )
+                if configure_diagnostics is not None:
+                    configure_diagnostics(ui_context, self._log_answer_ui)
                 self.answer_window.start_stream(delta)
+                self._log_answer_ui(
+                    "answer_stream_start",
+                    ui_context,
+                    stream_before,
+                    self._answer_ui_snapshot(),
+                )
                 append_log(self.log_path, {
                     "event": "codex_stream_start",
                     "request": request_number,
@@ -4206,6 +4471,171 @@ PREVIOUS INCOMPLETE QUESTION:
         ):
             run_cleanup("window_hide", window.hide)
         run_cleanup("gtk_quit", Gtk.main_quit)
+        return False
+
+
+class _HeadlessTranscriptWindow:
+    """No-op live window preserving InterviewApp's streaming callbacks."""
+
+    def set_text(self, _text):
+        pass
+
+    def set_status(self, _text):
+        pass
+
+    def set_boundary_status(self, _text):
+        pass
+
+    def set_response_status(self, _text):
+        pass
+
+    def discard_current_answer(self, **_kwargs):
+        pass
+
+    def start_stream(self, _text):
+        pass
+
+    def append_stream(self, _text):
+        pass
+
+    def finish_stream(self, _text):
+        pass
+
+    def hide(self):
+        pass
+
+
+class HeadlessInterviewApp(InterviewApp):
+    """Run the existing live audio/F8/Codex flow without GTK windows.
+
+    Benchmark helpers call ``trigger_f8`` directly after WAV playback.  The
+    remaining question commit and Codex streaming path is inherited from
+    ``InterviewApp`` unchanged.
+    """
+
+    def __init__(self, codex_thread_id, codex_settings, test_label):
+        self.session_dir, self.log_path = create_app_session(
+            test_logging=True,
+            benchmark_type="benchmark_a",
+        )
+        self.runtime = {
+            "mode": "performance",
+            "codex_enabled": True,
+            "logging_enabled": True,
+            "diagnostics_enabled": False,
+        }
+        self.test_label = test_label
+        self.codex_thread_id = codex_thread_id
+        live_codex_settings = normalize_codex_settings(codex_settings)
+        self.codex_model = live_codex_settings["codex_model"]
+        self.codex_reasoning_effort = live_codex_settings[
+            "codex_reasoning_effort"
+        ]
+        self.codex_fast_mode = live_codex_settings["codex_fast_mode"]
+        self.stt_language = live_codex_settings["stt_language"]
+        self.codex_enabled = True
+        self.exit_action = None
+        self.running = True
+        self.question_count = 0
+        self.codex_request_count = 0
+        self.active_codex_generation = 0
+        self.codex_request_states = {}
+        self.conversation_context = []
+        self.codex_context_cursor = 0
+        self.codex_state_lock = threading.Lock()
+        self.last_f8_at = None
+        self.last_f9_at = None
+        self.last_commit_state = None
+        self.live_windows_hidden = True
+        self.moonshine_ready = False
+        self.audio_started = False
+        self.audio_failure_reported = False
+        self.remote_window = _HeadlessTranscriptWindow()
+        self.answer_window = _HeadlessTranscriptWindow()
+        remote_source = get_interviewer_audio_source()
+        append_log(self.log_path, {
+            "event": "app_session_start",
+            "app_version": APP_VERSION,
+            "remote_source": remote_source,
+            "microphone_capture": False,
+            "asr_backend": moonshine_asr_backend(self.stt_language),
+            "moonshine_update_interval_ms": 500,
+            "moonshine_word_timestamps": False,
+            "language": self.stt_language,
+            "app_mode": self.runtime["mode"],
+            "logging_enabled": True,
+            "stt_diagnostics_enabled": False,
+            "codex_enabled": True,
+            "codex_model": self.codex_model,
+            "codex_reasoning_effort": self.codex_reasoning_effort,
+            "codex_fast_mode": self.codex_fast_mode,
+            "codex_transport": "app_server_stdio",
+            "codex_session_scope": "persistent_selected_thread",
+            "codex_thread_id": self.codex_thread_id,
+            "candidate_response_source": (
+                "completed_codex_answer_assumed_spoken_"
+                "superseded_answer_not_spoken"
+            ),
+            "question_transcript_mode": "f8_cursor_barrier_force_snapshot",
+            "preview_transcription": "moonshine_transcript_lines",
+            "global_f8": "headless_direct",
+            "global_f9": "disabled_headless",
+            "test_label": self.test_label,
+        })
+        self.remote_audio = AudioStream(
+            "INTERVIEWER",
+            remote_source,
+            self._moonshine_pcm,
+            self._audio_error,
+        )
+        self.asr_worker = MoonshineStreamingWorker(
+            self._moonshine_ready,
+            self._moonshine_preview,
+            self._moonshine_error,
+            on_auto_commit=self._moonshine_auto_commit,
+            dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
+            language=self.stt_language,
+        )
+        self.codex_worker = create_live_codex_worker(
+            self._codex_ready,
+            self.codex_thread_id,
+            live_codex_settings,
+        )
+        self.asr_worker.start()
+
+    def trigger_f8(self):
+        """Use the same F8 handler as the live GUI without a human keypress."""
+        return self._on_f8()
+
+    def record_benchmark_wav_start(self, wav_name, started_at_unix_ns):
+        return self._benchmark_wav_start(wav_name, started_at_unix_ns)
+
+    def _stop(self, exit_action):
+        if not self.running:
+            return False
+        self.running = False
+        self.exit_action = exit_action
+        cleanup_errors = []
+
+        def run_cleanup(name, callback):
+            try:
+                callback()
+            except Exception as error:
+                cleanup_errors.append((name, error))
+
+        run_cleanup("audio", self.remote_audio.stop)
+        run_cleanup("moonshine", self.asr_worker.stop)
+        run_cleanup("codex", self.codex_worker.stop)
+        append_log(self.log_path, {
+            "event": "app_session_end",
+            "exit_action": exit_action,
+            "questions": self.question_count,
+            "codex_requests": self.codex_request_count,
+            "cleanup_errors": [
+                {"resource": name, "error": str(error)}
+                for name, error in cleanup_errors
+            ],
+        })
         return False
 
 
