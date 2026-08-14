@@ -276,6 +276,10 @@ class _FocusScroller:
 
 
 class _FocusHistoryHarness:
+    discard_current_answer = interview_app.TranscriptWindow.discard_current_answer
+    prepare_corrected_answer_alignment = (
+        interview_app.TranscriptWindow.prepare_corrected_answer_alignment
+    )
     start_stream = interview_app.TranscriptWindow.start_stream
     append_stream = interview_app.TranscriptWindow.append_stream
     finish_stream = interview_app.TranscriptWindow.finish_stream
@@ -360,6 +364,23 @@ def _wait_until(predicate, timeout=2):
 
 
 class CodexLatestOnlyTest(unittest.TestCase):
+    def test_benchmark_initial_session_settings_override_new_session_defaults(self):
+        settings = interview_app.initial_session_settings({
+            "INTERVIEW_BENCHMARK_INITIAL_SETTINGS": json.dumps({
+                "codex_model": "gpt-5.4",
+                "codex_reasoning_effort": "medium",
+                "codex_fast_mode": False,
+                "stt_language": "ja",
+            }),
+        })
+
+        self.assertEqual(settings, {
+            "codex_model": "gpt-5.4",
+            "codex_reasoning_effort": "medium",
+            "codex_fast_mode": False,
+            "stt_language": "ja",
+        })
+
     def setUp(self):
         _LatestOnlyCodexClient.instances.clear()
         _RecoveryCodexClient.instances.clear()
@@ -1414,6 +1435,41 @@ class CodexLatestOnlyTest(unittest.TestCase):
 
 
 class AnswerHistoryScrollTest(unittest.TestCase):
+    def test_f9_prepares_next_answer_position_before_first_stream_delta(self):
+        idle_callbacks = []
+        window = _FocusHistoryHarness(["Older answer", "Discard me"])
+        with patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: idle_callbacks.append(
+                (callback, args)
+            ),
+        ):
+            window.discard_current_answer(remove_completed=True)
+            window.prepare_corrected_answer_alignment()
+
+            expected_start = len("Older answer\n\n")
+            self.assertEqual(window.latest_answer_mark.offset, expected_start)
+            self.assertEqual(
+                window.focus_scroller.adjustment.get_value(),
+                expected_start,
+            )
+            self.assertEqual(window.text.buffer.text, "Older answer\n\n")
+
+            window.start_stream("Corrected")
+            stale_callback, stale_args = idle_callbacks.pop(0)
+            stale_callback(*stale_args)
+            callback, args = idle_callbacks.pop(0)
+            callback(*args)
+            self.assertEqual(
+                window.focus_scroller.adjustment.get_value(),
+                expected_start,
+            )
+            self.assertEqual(
+                window.text.buffer.text,
+                "Older answer\n\nCorrected",
+            )
+
     def test_new_answer_aligns_once_and_streaming_preserves_manual_scroll(self):
         idle_callbacks = []
         window = _FocusHistoryHarness(["First answer", "Second answer"])
@@ -2151,6 +2207,20 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
 
             self.assertEqual(session_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+
+    def test_benchmark_session_log_directory_includes_benchmark_type(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            interview_app,
+            "APP_DIR",
+            Path(directory),
+        ), patch.object(interview_app, "TEST_LOGGING", True), patch.dict(
+            interview_app.os.environ,
+            {"INTERVIEW_BENCHMARK_TYPE": "benchmark_a"},
+            clear=False,
+        ):
+            session_dir, _log_path = interview_app.create_app_session()
+
+        self.assertTrue(session_dir.name.startswith("app_session_benchmark_a_"))
 
 
 class LiveWindowVisibilityTest(unittest.TestCase):

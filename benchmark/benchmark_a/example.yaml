@@ -1,0 +1,68 @@
+benchmark_name: candidate-crossed-20260814
+
+# Paths are resolved relative to this YAML file.
+contexts:
+   - ~/.config/interview-assistant/global_contexts/profile.md
+   - ~/.config/interview-assistant/global_contexts/answer_style.md
+
+audio:
+  directory: ../../voice_tests
+  warmup: warmup.wav
+  questions:
+    - q01.wav
+    - q02.wav
+    - q03.wav
+    - q04.wav
+    - q05.wav
+    - q06.wav
+    - q07.wav
+    - q08.wav
+    - q09.wav
+    - q10.wav
+
+timeouts:
+  startup_seconds: 90
+  response_seconds: 90
+
+# Each candidate runs five times. execution_sequence below controls the order
+# of individual runs, while keeping every warmup/Q01..Q10 sequence intact.
+configurations:
+  - name: luna-low
+    model: gpt-5.6-luna
+    reasoning: low
+    fast_mode: false
+    stt_language: en
+    runs: 5
+  - name: terra-low
+    model: gpt-5.6-terra
+    reasoning: low
+    fast_mode: false
+    stt_language: en
+    runs: 5
+  - name: terra-medium
+    model: gpt-5.6-terra
+    reasoning: medium
+    fast_mode: false
+    stt_language: en
+    runs: 5
+
+# Run 1: Luna → Terra medium → Terra low
+# Run 2: Terra low → Luna → Terra medium
+# Run 3: Terra medium → Terra low → Luna
+# Runs 4 and 5 repeat runs 1 and 2, respectively.
+execution_sequence:
+  - luna-low
+  - terra-medium
+  - terra-low
+  - terra-low
+  - luna-low
+  - terra-medium
+  - terra-medium
+  - terra-low
+  - luna-low
+  - luna-low
+  - terra-medium
+  - terra-low
+  - terra-low
+  - luna-low
+  - terra-medium
