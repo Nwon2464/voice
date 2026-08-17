@@ -1,4 +1,4 @@
-benchmark_name: candidate-crossed-20260814
+benchmark_name: luna-fast-20260814
 
 # Paths are resolved relative to this YAML file.
 contexts:
@@ -24,45 +24,27 @@ timeouts:
   startup_seconds: 90
   response_seconds: 90
 
-# Each candidate runs five times. execution_sequence below controls the order
-# of individual runs, while keeping every warmup/Q01..Q10 sequence intact.
+# Each configuration runs three times. Each run keeps the warmup/Q01..Q10
+# sequence intact.
 configurations:
   - name: luna-low
     model: gpt-5.6-luna
     reasoning: low
     fast_mode: false
     stt_language: en
-    runs: 5
-  - name: terra-low
-    model: gpt-5.6-terra
-    reasoning: low
-    fast_mode: false
-    stt_language: en
-    runs: 5
-  - name: terra-medium
-    model: gpt-5.6-terra
+    runs: 3
+  - name: luna-medium
+    model: gpt-5.6-luna
     reasoning: medium
-    fast_mode: false
+    fast_mode: true
     stt_language: en
-    runs: 5
+    runs: 3
 
-# Run 1: Luna → Terra medium → Terra low
-# Run 2: Terra low → Luna → Terra medium
-# Run 3: Terra medium → Terra low → Luna
-# Runs 4 and 5 repeat runs 1 and 2, respectively.
+# Alternate Luna low (normal mode) and Luna medium (Fast Mode).
 execution_sequence:
   - luna-low
-  - terra-medium
-  - terra-low
-  - terra-low
+  - luna-medium
   - luna-low
-  - terra-medium
-  - terra-medium
-  - terra-low
+  - luna-medium
   - luna-low
-  - luna-low
-  - terra-medium
-  - terra-low
-  - terra-low
-  - luna-low
-  - terra-medium
+  - luna-medium

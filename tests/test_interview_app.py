@@ -737,6 +737,61 @@ class CodexLatestOnlyTest(unittest.TestCase):
             },
         ])
 
+    def test_interview_conversation_keeps_preparation_question_and_answer(self):
+        thread = {
+            "turns": [{
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                f"{interview_app.PREPARATION_MESSAGE_MARKER}\n"
+                                "What should I emphasize for this role?"
+                            ),
+                        }],
+                    },
+                    {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "Emphasize a relevant, measurable result.",
+                    },
+                ],
+            }],
+        }
+
+        messages = interview_app.interview_conversation_messages(thread)
+
+        self.assertEqual(messages, [
+            {
+                "role": "candidate",
+                "text": "What should I emphasize for this role?",
+            },
+            {
+                "role": "codex",
+                "text": "Emphasize a relevant, measurable result.",
+            },
+        ])
+
+    def test_preparation_chat_requires_synced_context_and_thread(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.active = True
+        dialog.codex_enabled = True
+        dialog.context_sync_in_progress = False
+        dialog.session = {"interview_thread_id": "thread-interview"}
+        dialog.context_rows = [{"status": "SYNCED"}]
+
+        self.assertEqual(
+            dialog._preparation_chat_thread_id(),
+            "thread-interview",
+        )
+
+        dialog.context_rows = [{"status": "CHANGED"}]
+
+        self.assertIsNone(dialog._preparation_chat_thread_id())
+
     def test_conversation_without_interview_thread_shows_guidance(self):
         dialog = interview_app.PreparationDialog.__new__(
             interview_app.PreparationDialog
