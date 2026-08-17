@@ -103,6 +103,7 @@ CODEX_TIMEOUT_SECONDS = 60
 BACKGROUND_JOIN_TIMEOUT_SECONDS = 5
 CODEX_DEVELOPER_INSTRUCTIONS = """You assist a job candidate with interview preparation and live answers.
 Follow the candidate's preferences, background, speaking style, and answer format established in the conversation.
+When a turn starts with PREPARATION MESSAGE:, treat it as a direct preparation question from the candidate. Answer helpfully, and use the exchange to establish preferences and background for later live answers.
 When a turn contains CURRENT INTERVIEWER QUESTION, return an immediately speakable answer draft in the same language as that question.
 Do not invent specific personal facts; ask during preparation or use adaptable wording when details are missing.
 During the live interview, assume the candidate spoke your previous live-answer draft unless the later interviewer transcript indicates otherwise.
@@ -133,6 +134,7 @@ RESPONSE_STATUS_ERROR = "ERROR"
 NO_INTERVIEW_THREAD_TEXT = "아직 Interview Thread가 없습니다."
 NO_INTERVIEW_CONVERSATION_TEXT = "아직 면접 대화가 없습니다."
 INTERVIEW_QUESTION_MARKER = "CURRENT INTERVIEWER QUESTION:"
+PREPARATION_MESSAGE_MARKER = "PREPARATION MESSAGE:"
 STT_PRESENTATION = {
     "en": {
         "language": "English",
@@ -1082,11 +1084,23 @@ def interview_conversation_messages(thread):
                 text = CodexAppServerClient._content_text(
                     item.get("content", [])
                 )
-                if INTERVIEW_QUESTION_MARKER not in text:
-                    continue
-                question = text.rsplit(INTERVIEW_QUESTION_MARKER, 1)[1].strip()
-                if question:
-                    messages.append({"role": "interviewer", "text": question})
+                if INTERVIEW_QUESTION_MARKER in text:
+                    question = text.rsplit(
+                        INTERVIEW_QUESTION_MARKER,
+                        1,
+                    )[1].strip()
+                    if question:
+                        messages.append({
+                            "role": "interviewer",
+                            "text": question,
+                        })
+                elif text.startswith(PREPARATION_MESSAGE_MARKER):
+                    question = text[len(PREPARATION_MESSAGE_MARKER):].strip()
+                    if question:
+                        messages.append({
+                            "role": "candidate",
+                            "text": question,
+                        })
             elif (
                 item_type == "agentMessage"
                 and item.get("phase") == "final_answer"
@@ -1658,6 +1672,10 @@ class PreparationDialog(Gtk.Dialog):
         self.context_sync_generation = 0
         self.model_catalog_load_generation = 0
         self.conversation_load_generation = 0
+        self.preparation_worker = None
+        self.preparation_ready = False
+        self.preparation_busy = False
+        self.preparation_stream_started = False
         self.background_stop = threading.Event()
         self.background_lock = threading.Lock()
         self.background_threads = set()
@@ -1932,6 +1950,11 @@ class PreparationDialog(Gtk.Dialog):
             foreground="#ffc75c",
             weight=Pango.Weight.BOLD,
         )
+        self.conversation_candidate_tag = self.conversation_buffer.create_tag(
+            "conversation-candidate",
+            foreground="#9dccff",
+            weight=Pango.Weight.BOLD,
+        )
         self.conversation_body_tag = self.conversation_buffer.create_tag(
             "conversation-body",
             foreground="#f2f4f7",
@@ -1944,6 +1967,62 @@ class PreparationDialog(Gtk.Dialog):
         conversation_scroller.set_shadow_type(Gtk.ShadowType.IN)
         conversation_scroller.add(self.conversation_view)
         conversation_box.pack_start(conversation_scroller, True, True, 0)
+        self.preparation_chat_status = Gtk.Label()
+        self.preparation_chat_status.set_xalign(0)
+        self.preparation_chat_status.set_line_wrap(True)
+        self.preparation_chat_status.get_style_context().add_class(
+            "section-description"
+        )
+        conversation_box.pack_start(
+            self.preparation_chat_status,
+            False,
+            False,
+            0,
+        )
+        preparation_input_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+        preparation_input_scroller = Gtk.ScrolledWindow()
+        preparation_input_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        preparation_input_scroller.set_size_request(-1, 76)
+        self.preparation_input = Gtk.TextView()
+        self.preparation_input.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.preparation_input.set_left_margin(10)
+        self.preparation_input.set_right_margin(10)
+        self.preparation_input.set_top_margin(8)
+        self.preparation_input.set_bottom_margin(8)
+        self.preparation_input.set_sensitive(False)
+        self.preparation_input.set_tooltip_text(
+            "Context를 Sync한 뒤 준비 질문을 입력할 수 있습니다."
+        )
+        self.preparation_input.connect(
+            "key-press-event",
+            self._preparation_input_key_pressed,
+        )
+        preparation_input_scroller.add(self.preparation_input)
+        preparation_input_row.pack_start(
+            preparation_input_scroller,
+            True,
+            True,
+            0,
+        )
+        self.preparation_send_button = Gtk.Button(label="질문 보내기")
+        self.preparation_send_button.set_sensitive(False)
+        self.preparation_send_button.connect(
+            "clicked",
+            self._send_preparation_message,
+        )
+        preparation_input_row.pack_end(
+            self.preparation_send_button,
+            False,
+            False,
+            0,
+        )
+        conversation_box.pack_start(preparation_input_row, False, False, 0)
         conversation_frame.add(conversation_box)
         workspace.pack1(conversation_frame, resize=True, shrink=False)
 
@@ -2093,6 +2172,7 @@ class PreparationDialog(Gtk.Dialog):
         self.context_list_box.show_all()
         self._update_context_summary()
         self._update_start_button()
+        self._update_preparation_chat()
 
     def _update_context_summary(self):
         if not hasattr(self, "context_panel_button"):
@@ -2160,12 +2240,14 @@ class PreparationDialog(Gtk.Dialog):
             )
             return
         self._ensure_background_state()
+        self._stop_preparation_worker()
         self.context_sync_in_progress = True
         self.context_sync_generation += 1
         generation = self.context_sync_generation
         self.sync_context_button.set_sensitive(False)
         self._update_context_summary()
         self._update_start_button()
+        self._update_preparation_chat()
         self._start_background_task(
             self._run_context_sync,
             session,
@@ -2212,6 +2294,7 @@ class PreparationDialog(Gtk.Dialog):
         if error is not None:
             self._update_context_summary()
             self._update_start_button()
+            self._update_preparation_chat()
             self._show_context_error(
                 "Context sync에 실패했습니다.",
                 str(error),
@@ -2320,6 +2403,9 @@ class PreparationDialog(Gtk.Dialog):
         if role == "interviewer":
             label = "INTERVIEWER\n"
             tag = self.conversation_interviewer_tag
+        elif role == "candidate":
+            label = "YOU\n"
+            tag = self.conversation_candidate_tag
         else:
             label = "CODEX\n"
             tag = self.conversation_codex_tag
@@ -2330,6 +2416,189 @@ class PreparationDialog(Gtk.Dialog):
             text,
             self.conversation_body_tag,
         )
+
+    def _preparation_chat_thread_id(self):
+        if not (
+            self.active
+            and getattr(self, "codex_enabled", True)
+            and not self.context_sync_in_progress
+            and can_start_interview(self.session, self.context_rows)
+        ):
+            return None
+        return self.session.get("interview_thread_id")
+
+    def _stop_preparation_worker(self):
+        worker = getattr(self, "preparation_worker", None)
+        self.preparation_worker = None
+        self.preparation_ready = False
+        self.preparation_busy = False
+        self.preparation_stream_started = False
+        if worker is not None:
+            worker.stop()
+
+    def _update_preparation_chat(self):
+        if not hasattr(self, "preparation_input"):
+            return
+        thread_id = self._preparation_chat_thread_id()
+        worker = self.preparation_worker
+        if not thread_id:
+            if worker is not None:
+                self._stop_preparation_worker()
+            self.preparation_input.set_sensitive(False)
+            self.preparation_send_button.set_sensitive(False)
+            if not getattr(self, "codex_enabled", True):
+                status = "Codex is disabled in this mode."
+            elif self.context_sync_in_progress:
+                status = "Context를 Sync하는 중입니다…"
+            else:
+                status = "Context를 Sync한 뒤 준비 질문을 입력할 수 있습니다."
+            self.preparation_chat_status.set_text(status)
+            return
+        if worker is not None and worker.thread_id != thread_id:
+            self._stop_preparation_worker()
+            worker = None
+        if worker is None:
+            self.preparation_ready = False
+            self.preparation_busy = False
+            self.preparation_stream_started = False
+            self.preparation_input.set_sensitive(False)
+            self.preparation_send_button.set_sensitive(False)
+            self.preparation_chat_status.set_text(
+                "준비 대화에 연결하는 중입니다…"
+            )
+            settings = self.settings_snapshot()
+            self.preparation_worker = CodexWorker(
+                self._preparation_chat_ready,
+                thread_id=thread_id,
+                model=settings["codex_model"],
+                effort=settings["codex_reasoning_effort"],
+                fast_mode=settings["codex_fast_mode"],
+            )
+            return
+        self._set_preparation_chat_busy(self.preparation_busy)
+
+    def _preparation_chat_ready(self, result, error):
+        if not self.active or self.preparation_worker is None:
+            return False
+        if error is not None:
+            self.preparation_ready = False
+            self.preparation_input.set_sensitive(False)
+            self.preparation_send_button.set_sensitive(False)
+            self.preparation_chat_status.set_text(
+                f"준비 대화에 연결할 수 없습니다: {error}"
+            )
+            return False
+        expected_thread_id = self._preparation_chat_thread_id()
+        if not expected_thread_id or result.get("thread_id") != expected_thread_id:
+            self._stop_preparation_worker()
+            self._update_preparation_chat()
+            return False
+        self.preparation_ready = True
+        self.preparation_chat_status.set_text(
+            "준비 질문을 입력하세요. Enter 전송 · Shift+Enter 줄바꿈"
+        )
+        self._set_preparation_chat_busy(False)
+        self.preparation_input.grab_focus()
+        return False
+
+    def _set_preparation_chat_busy(self, busy):
+        self.preparation_busy = busy
+        enabled = self.preparation_ready and not busy
+        self.preparation_input.set_sensitive(enabled)
+        self.preparation_send_button.set_sensitive(enabled)
+
+    def _send_preparation_message(self, *_args):
+        if (
+            not self.preparation_ready
+            or self.preparation_busy
+            or self.preparation_worker is None
+        ):
+            return
+        buffer = self.preparation_input.get_buffer()
+        text = buffer.get_text(
+            buffer.get_start_iter(),
+            buffer.get_end_iter(),
+            True,
+        ).strip()
+        if not text:
+            return
+        buffer.set_text("")
+        self._append_conversation_message("candidate", text)
+        self.preparation_stream_started = False
+        self._set_preparation_chat_busy(True)
+        self.preparation_chat_status.set_text("Codex가 답변을 작성 중입니다…")
+
+        def streamed(delta, _elapsed):
+            if not self.active or not self.preparation_busy:
+                return False
+            if self.preparation_stream_started:
+                end = self.conversation_buffer.get_end_iter()
+                self.conversation_buffer.insert_with_tags(
+                    end,
+                    delta,
+                    self.conversation_body_tag,
+                )
+            else:
+                self.preparation_stream_started = True
+                self._append_conversation_message("codex", delta)
+            return False
+
+        def finished(result, error):
+            if not self.active:
+                return False
+            if error is not None:
+                self.preparation_chat_status.set_text(
+                    f"준비 질문을 전송할 수 없습니다: {error}"
+                )
+            elif not self.preparation_stream_started:
+                self._append_conversation_message("codex", result["text"])
+            self._set_preparation_chat_busy(False)
+            if error is None:
+                self.preparation_chat_status.set_text(
+                    "준비 질문을 입력하세요. Enter 전송 · Shift+Enter 줄바꿈"
+                )
+                self._refresh_conversation()
+            self.preparation_input.grab_focus()
+            return False
+
+        self.preparation_worker.submit(
+            f"{PREPARATION_MESSAGE_MARKER}\n{text}",
+            finished,
+            streamed,
+            interactive=True,
+            on_approval=self._approve_preparation_tool,
+        )
+
+    def _preparation_input_key_pressed(self, _widget, event):
+        if event.keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            return False
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            return False
+        self._send_preparation_message()
+        return True
+
+    def _approve_preparation_tool(self, method, params):
+        is_command = method == "item/commandExecution/requestApproval"
+        title = "명령 실행을 허용할까요?" if is_command else "파일 변경을 허용할까요?"
+        detail = params.get("reason") or "Codex가 작업 승인을 요청했습니다."
+        if is_command and params.get("command"):
+            command = params["command"]
+            if isinstance(command, list):
+                command = " ".join(str(part) for part in command)
+            detail = f"{detail}\n\n{command}"
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=title,
+        )
+        dialog.format_secondary_text(detail)
+        dialog.add_button("거부", Gtk.ResponseType.CANCEL)
+        dialog.add_button("허용", Gtk.ResponseType.OK)
+        response = dialog.run()
+        dialog.destroy()
+        return "accept" if response == Gtk.ResponseType.OK else "decline"
 
     def interview_thread_id(self):
         if not can_start_interview(
@@ -2381,6 +2650,7 @@ class PreparationDialog(Gtk.Dialog):
             and self.session_store is not None
         )
         self.active = True
+        self._update_preparation_chat()
         if getattr(self, "codex_enabled", True):
             self._load_model_catalog()
         self._refresh_conversation()
@@ -2389,6 +2659,7 @@ class PreparationDialog(Gtk.Dialog):
         self.context_sync_generation += 1
         self.model_catalog_load_generation += 1
         self.conversation_load_generation += 1
+        self._stop_preparation_worker()
         self._stop_background_tasks()
         self.hide()
         return response
@@ -2648,6 +2919,12 @@ class PreparationDialog(Gtk.Dialog):
                 self.session_id,
                 self.codex_settings,
             )
+        worker = getattr(self, "preparation_worker", None)
+        if worker is not None:
+            worker.set_model_and_effort(
+                self.codex_settings["codex_model"],
+                self.codex_settings["codex_reasoning_effort"],
+            )
 
     def _update_start_button(self):
         self.start_button.set_sensitive(
@@ -2786,7 +3063,9 @@ class TranscriptWindow(Gtk.Window):
         self.set_skip_taskbar_hint(False)
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         self.stick()
-        self.set_size_request(320, 100)
+        # Do not impose an application-level minimum size.  The window
+        # manager and GTK's content requirements remain the only limits, so
+        # the resize handles can adjust the live windows freely.
         self.move(*position)
         self.connect("delete-event", self._delete)
         self.connect("button-press-event", self._drag)
