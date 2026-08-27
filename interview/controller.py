@@ -56,10 +56,10 @@ BOUNDARY_STATUS_F7 = "✓ F7 CHECKPOINT"
 BOUNDARY_STATUS_F8 = "✓ F8 NEW"
 BOUNDARY_STATUS_F9 = "✓ F9 CONTINUED"
 BOUNDARY_STATUS_ERROR = "ERROR"
-RESPONSE_STATUS_READY = "● READY"
-RESPONSE_STATUS_THINKING = "◌ THINKING..."
-RESPONSE_STATUS_UPDATING = "◌ UPDATING..."
-RESPONSE_STATUS_ERROR = "ERROR"
+RESPONSE_STATUS_READY = "●"
+RESPONSE_STATUS_THINKING = "◌"
+RESPONSE_STATUS_UPDATING = "◌"
+RESPONSE_STATUS_ERROR = "×"
 INTERVIEW_CHECKPOINT_MARKER = "INTERVIEWER CONTEXT CHECKPOINT:"
 HOTKEY_PATH = (
     "/org/gnome/settings-daemon/plugins/media-keys/"
@@ -573,6 +573,7 @@ class InterviewApp:
         )
         if error:
             self.answer_window.set_status(f"Moonshine error: {error}")
+            self.answer_window.set_response_status(RESPONSE_STATUS_ERROR)
             append_log(self.log_path, {
                 "event": "question_error",
                 "question": pending_question_number,
@@ -583,6 +584,7 @@ class InterviewApp:
 
         if not result.get("committed", True):
             self.answer_window.set_status("Waiting for question…")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             append_log(self.log_path, {
                 "event": "question_duplicate_suppressed",
                 "question": pending_question_number,
@@ -599,6 +601,7 @@ class InterviewApp:
         latency_field = {"f8_to_question_ms": round(elapsed * 1000, 1)}
         if not question_text:
             self.answer_window.set_status("No question detected")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             return False
 
         if question_number is None:
@@ -672,6 +675,7 @@ class InterviewApp:
             return False
         if error:
             self.remote_window.set_status(f"Moonshine error: {error}")
+            self.answer_window.set_response_status(RESPONSE_STATUS_ERROR)
             append_log(self.log_path, {
                 "event": "checkpoint_error",
                 "commit_source": "f7",
@@ -717,7 +721,7 @@ class InterviewApp:
             self.remote_window.set_text(result["display_text"] or result["text"])
             self.remote_window.set_boundary_status(BOUNDARY_STATUS_F7)
             if self.codex_enabled:
-                self.answer_window.set_status("Checkpoint saved · syncing context…")
+                self.answer_window.set_response_status(RESPONSE_STATUS_THINKING)
                 items = [{
                     "type": "message",
                     "role": "user",
@@ -749,8 +753,10 @@ class InterviewApp:
                 self.answer_window.set_status(
                     "Codex disabled · checkpoint stored locally"
                 )
+                self.answer_window.set_response_status(RESPONSE_STATUS_READY)
         else:
             self.answer_window.set_status("No new checkpoint detected")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
         return False
 
     def _checkpoint_inject_finished(self, checkpoint, result, error):
@@ -768,8 +774,10 @@ class InterviewApp:
             self.answer_window.set_status(
                 "Checkpoint inject failed · will include with next question"
             )
+            self.answer_window.set_response_status(RESPONSE_STATUS_ERROR)
         elif not self._checkpoint_inject_pending():
             self.answer_window.set_status("Checkpoint context synced")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
         self._flush_checkpoint_barrier()
         return False
 
@@ -835,6 +843,7 @@ class InterviewApp:
         question_number = base["question_number"]
         if error:
             self.answer_window.set_status(f"Moonshine error: {error}")
+            self.answer_window.set_response_status(RESPONSE_STATUS_ERROR)
             append_log(self.log_path, {
                 "event": "question_error",
                 "question": question_number,
@@ -844,6 +853,7 @@ class InterviewApp:
             return False
         if not result.get("committed", True):
             self.answer_window.set_status("Waiting for question…")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             append_log(self.log_path, {
                 "event": "question_duplicate_suppressed",
                 "question": question_number,
@@ -865,6 +875,7 @@ class InterviewApp:
             rejection_reason = "previous_question_changed"
         if rejection_reason is not None:
             self.answer_window.set_status("No continuation applied")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             append_log(self.log_path, {
                 "event": "question_continuation_rejected",
                 "commit_source": "f9_continuation",
@@ -1418,6 +1429,7 @@ PREVIOUS INCOMPLETE QUESTION:
             ),
         })
         self.answer_window.set_status("Saving checkpoint…")
+        self.answer_window.set_response_status(RESPONSE_STATUS_THINKING)
         return False
 
     def _on_f8(self):
@@ -1474,6 +1486,7 @@ PREVIOUS INCOMPLETE QUESTION:
             ),
         })
         self.answer_window.set_status("Transcribing question…")
+        self.answer_window.set_response_status(RESPONSE_STATUS_THINKING)
         return False
 
     def _on_f9(self):
@@ -1500,6 +1513,7 @@ PREVIOUS INCOMPLETE QUESTION:
                 "reason": "no_valid_previous_question",
             })
             self.answer_window.set_status("No previous question to continue")
+            self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             return False
         base = dict(base)
         callback = lambda result, error: self._moonshine_continuation_ready(
@@ -1535,6 +1549,7 @@ PREVIOUS INCOMPLETE QUESTION:
             ),
         })
         self.answer_window.set_status("Transcribing continuation…")
+        self.answer_window.set_response_status(RESPONSE_STATUS_UPDATING)
         return False
 
     def _audio_error(self, role, error):

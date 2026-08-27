@@ -247,6 +247,8 @@ class TranscriptWindow(Gtk.Window):
                 self.response_status = Gtk.Label(label="")
                 self.response_status.set_xalign(0)
                 self.response_status.set_single_line_mode(True)
+                self.response_status.set_ellipsize(Pango.EllipsizeMode.END)
+                self.response_status.set_width_chars(1)
                 self.response_status.get_style_context().add_class(
                     "response-status"
                 )
@@ -261,6 +263,8 @@ class TranscriptWindow(Gtk.Window):
                 )
                 shortcut_reminder.set_xalign(1)
                 shortcut_reminder.set_single_line_mode(True)
+                shortcut_reminder.set_ellipsize(Pango.EllipsizeMode.END)
+                shortcut_reminder.set_width_chars(1)
                 shortcut_reminder.get_style_context().add_class(
                     "shortcut-reminder"
                 )

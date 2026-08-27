@@ -376,6 +376,12 @@ def _wait_until(predicate, timeout=2):
 
 
 class CodexLatestOnlyTest(unittest.TestCase):
+    def test_response_status_uses_compact_indicators(self):
+        self.assertEqual(interview_app.RESPONSE_STATUS_READY, "●")
+        self.assertEqual(interview_app.RESPONSE_STATUS_THINKING, "◌")
+        self.assertEqual(interview_app.RESPONSE_STATUS_UPDATING, "◌")
+        self.assertEqual(interview_app.RESPONSE_STATUS_ERROR, "×")
+
     def test_benchmark_initial_session_settings_override_new_session_defaults(self):
         settings = interview_app.initial_session_settings({
             "INTERVIEW_BENCHMARK_INITIAL_SETTINGS": json.dumps({
@@ -1926,6 +1932,28 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         )
         self.assertNotIn("second context", app.codex_worker.jobs[1]["prompt"])
 
+    def test_f8_transcription_uses_busy_indicator(self):
+        app = self._app()
+        app.last_f8_at = None
+        app.moonshine_ready = True
+        app.audio_started = True
+        app.remote_audio = SimpleNamespace(
+            capture_sample_cursor_and=lambda enqueue: (
+                24_000,
+                enqueue(24_000),
+            )
+        )
+        app.asr_worker = SimpleNamespace(
+            request_snapshot=lambda _cursor, _callback: True,
+        )
+
+        app._on_f8()
+
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_THINKING,
+        )
+
     def test_f7_uses_atomic_cursor_capture_and_checkpoint_request(self):
         app = self._app()
         app.moonshine_ready = True
@@ -1951,6 +1979,10 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         self.assertEqual(app.question_count, 0)
         self.assertEqual(app.conversation_context, [])
         self.assertEqual(app.answer_window.status, "Saving checkpoint…")
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_THINKING,
+        )
 
     def test_successful_f7_ends_previous_f8_f9_continuation_chain(self):
         app = self._app()
@@ -2238,6 +2270,10 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
 
         self.assertEqual(captured, [20_000])
         self.assertEqual(requested[0][0], 20_000)
+        self.assertEqual(
+            app.answer_window.response_status,
+            interview_app.RESPONSE_STATUS_UPDATING,
+        )
 
 
 class AudioStreamTest(unittest.TestCase):
