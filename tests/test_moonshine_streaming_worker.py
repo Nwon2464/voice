@@ -283,191 +283,100 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
         self.assertIsNone(callbacks[0][0])
         self.assertRegex(str(callbacks[0][1]), "force update failed")
 
-    def test_auto_commit_requires_speech_and_1500ms_continuous_silence(self):
+    def test_silence_does_not_reset_stream_without_manual_snapshot(self):
         transcriber = _Transcriber()
         ready = threading.Event()
-        committed = threading.Event()
-        results = []
         worker = MoonshineStreamingWorker(
             lambda _result, _error: ready.set(),
             lambda *_args: None,
             lambda *_args: None,
-            on_auto_commit=lambda result, error: (
-                results.append((result, error)),
-                committed.set(),
-            ),
             engine_factory=lambda: transcriber,
-            force_update_flag=99,
         )
         worker.start()
         self.assertTrue(ready.wait(timeout=2))
 
         cursor = 0
-        for _ in range(150):
+        for _ in range(200):
             worker.submit_pcm(self._pcm(0), cursor, cursor + 160)
             cursor += 160
         self.assertTrue(self._wait_for_cursor(worker, cursor))
-        self.assertFalse(committed.is_set())
-
-        worker.submit_pcm(self._pcm(1000), cursor, cursor + 160)
-        cursor += 160
-        for _ in range(149):
-            worker.submit_pcm(self._pcm(0), cursor, cursor + 160)
-            cursor += 160
-        self.assertTrue(self._wait_for_cursor(worker, cursor))
-        self.assertFalse(committed.is_set())
-
-        worker.submit_pcm(self._pcm(0), cursor, cursor + 160)
-        cursor += 160
-        self.assertTrue(committed.wait(timeout=2))
-        result, error = results[0]
-        self.assertIsNone(error)
-        self.assertEqual(result["commit_source"], "silence")
-        self.assertEqual(result["target_sample_cursor"], cursor)
-        self.assertEqual(result["queued_sample_cursor"], cursor)
-        self.assertEqual(result["consumed_sample_cursor"], cursor)
-        self.assertTrue(result["cursor_complete"])
-        self.assertEqual(result["audio_drop_samples"], 0)
-
-        for _ in range(20):
-            worker.submit_pcm(self._pcm(0), cursor, cursor + 160)
-            cursor += 160
-        self.assertTrue(self._wait_for_cursor(worker, cursor))
-        worker.stop()
-        self.assertEqual(len(results), 1)
-
-    def test_new_speech_resets_auto_silence_counter(self):
-        transcriber = _Transcriber()
-        ready = threading.Event()
-        committed = threading.Event()
-        worker = MoonshineStreamingWorker(
-            lambda _result, _error: ready.set(),
-            lambda *_args: None,
-            lambda *_args: None,
-            on_auto_commit=lambda *_args: committed.set(),
-            engine_factory=lambda: transcriber,
-            auto_silence_ms=30,
-        )
-        worker.start()
-        self.assertTrue(ready.wait(timeout=2))
-        chunks = [1000, 0, 0, 1000, 0, 0]
-        cursor = 0
-        for amplitude in chunks:
-            worker.submit_pcm(self._pcm(amplitude), cursor, cursor + 160)
-            cursor += 160
-        self.assertTrue(self._wait_for_cursor(worker, cursor))
-        self.assertFalse(committed.is_set())
-        worker.submit_pcm(self._pcm(0), cursor, cursor + 160)
-        self.assertTrue(committed.wait(timeout=2))
+        self.assertEqual(len(transcriber.streams), 1)
         worker.stop()
 
-    def test_multiple_japanese_silences_reset_and_accumulate_until_f8(self):
+    def test_f7_checkpoints_reset_stream_but_are_not_merged_into_f8(self):
         transcriber = _SequencedTranscriber([
-            "segment one",
-            "segment two",
-            "active three",
-            "after commit",
+            "checkpoint one",
+            "checkpoint one",
+            "",
+            "current final segment",
+            "after final",
         ])
         ready = threading.Event()
-        auto_done = threading.Event()
-        f8_done = threading.Event()
-        duplicate_done = threading.Event()
-        auto_results = []
-        f8_results = []
-        duplicate_results = []
         worker = MoonshineStreamingWorker(
             lambda _result, _error: ready.set(),
             lambda *_args: None,
             lambda *_args: None,
-            on_auto_commit=lambda result, error: (
-                auto_results.append((result, error)),
-                auto_done.set(),
-            ),
             engine_factory=lambda: transcriber,
-            auto_silence_ms=20,
-            language="ja",
         )
         worker.start()
         self.assertTrue(ready.wait(timeout=2))
+
         cursor = 0
-        for _segment in range(2):
-            auto_done.clear()
-            for amplitude in (1000, 0, 0):
-                worker.submit_pcm(self._pcm(amplitude), cursor, cursor + 160)
-                cursor += 160
-            self.assertTrue(auto_done.wait(timeout=2))
-
-        worker.submit_pcm(self._pcm(1000), cursor, cursor + 160)
-        cursor += 160
-        worker.request_snapshot(
-            cursor,
-            lambda result, error: (
-                f8_results.append((result, error)),
-                f8_done.set(),
-            ),
-        )
-        self.assertTrue(f8_done.wait(timeout=2))
-        worker.request_snapshot(
-            cursor,
-            lambda result, error: (
-                duplicate_results.append((result, error)),
-                duplicate_done.set(),
-            ),
-        )
-        self.assertTrue(duplicate_done.wait(timeout=2))
-        worker.stop()
-
-        self.assertEqual(len(auto_results), 2)
-        self.assertEqual(
-            [item[0]["text"] for item in auto_results],
-            ["segment one", "segment two"],
-        )
-        self.assertTrue(all(item[0]["cursor_complete"] for item in auto_results))
-        self.assertTrue(all(item[0]["audio_drop_samples"] == 0 for item in auto_results))
-        self.assertTrue(f8_results[0][0]["committed"])
-        self.assertEqual(
-            f8_results[0][0]["text"],
-            "segment one segment two active three",
-        )
-        self.assertEqual(f8_results[0][0]["accumulated_segment_count"], 2)
-        self.assertEqual(f8_results[0][0]["commit_source"], "f8")
-        self.assertTrue(f8_results[0][0]["cursor_complete"])
-        self.assertEqual(f8_results[0][0]["audio_drop_samples"], 0)
-        self.assertGreaterEqual(len(transcriber.streams), 4)
-        self.assertTrue(all(stream.closed for stream in transcriber.streams[:3]))
-        self.assertEqual(sum(stream.update_count for stream in transcriber.streams), 3)
-        self.assertFalse(duplicate_results[0][0]["committed"])
-        self.assertTrue(duplicate_results[0][0]["duplicate_suppressed"])
-
-    def test_f8_commit_prevents_later_auto_commit_without_new_speech(self):
-        transcriber = _Transcriber()
-        ready = threading.Event()
-        f8_done = threading.Event()
-        auto_results = []
-        worker = MoonshineStreamingWorker(
-            lambda _result, _error: ready.set(),
-            lambda *_args: None,
-            lambda *_args: None,
-            on_auto_commit=lambda result, error: auto_results.append((result, error)),
-            engine_factory=lambda: transcriber,
-            auto_silence_ms=20,
-        )
-        worker.start()
-        self.assertTrue(ready.wait(timeout=2))
-        cursor = 0
-        worker.submit_pcm(self._pcm(1000), cursor, cursor + 160)
-        cursor += 160
-        worker.request_snapshot(
-            cursor,
-            lambda *_args: f8_done.set(),
-        )
-        self.assertTrue(f8_done.wait(timeout=2))
-        for _ in range(5):
-            worker.submit_pcm(self._pcm(0), cursor, cursor + 160)
+        checkpoint_results = []
+        for _ in range(3):
+            done = threading.Event()
+            worker.submit_pcm(self._pcm(1000), cursor, cursor + 160)
             cursor += 160
-        self.assertTrue(self._wait_for_cursor(worker, cursor))
+            worker.request_checkpoint(
+                cursor,
+                lambda result, error, event=done: (
+                    checkpoint_results.append((result, error)),
+                    event.set(),
+                ),
+            )
+            self.assertTrue(done.wait(timeout=2))
+
+        final_done = threading.Event()
+        final_results = []
+        worker.submit_pcm(self._pcm(1000), cursor, cursor + 160)
+        cursor += 160
+        worker.request_snapshot(
+            cursor,
+            lambda result, error: (
+                final_results.append((result, error)),
+                final_done.set(),
+            ),
+        )
+        self.assertTrue(final_done.wait(timeout=2))
         worker.stop()
-        self.assertEqual(auto_results, [])
+
+        self.assertEqual(
+            [result[0]["checkpoint_saved"] for result in checkpoint_results],
+            [True, True, False],
+        )
+        self.assertEqual(
+            [result[0]["committed"] for result in checkpoint_results],
+            [True, True, False],
+        )
+        self.assertEqual(
+            [result[0]["text"] for result in checkpoint_results[:2]],
+            ["checkpoint one", "checkpoint one"],
+        )
+        self.assertTrue(all(
+            result[0]["cursor_complete"] for result in checkpoint_results
+        ))
+        self.assertTrue(all(
+            result[0]["audio_drop_samples"] == 0
+            for result in checkpoint_results
+        ))
+        final, error = final_results[0]
+        self.assertIsNone(error)
+        self.assertEqual(final["commit_source"], "f8")
+        self.assertEqual(final["text"], "current final segment")
+        self.assertEqual(final["target_sample_cursor"], cursor)
+        self.assertTrue(final["cursor_complete"])
+        self.assertEqual(final["audio_drop_samples"], 0)
+        self.assertGreaterEqual(len(transcriber.streams), 5)
 
     def test_stop_times_out_instead_of_waiting_forever(self):
         errors = []

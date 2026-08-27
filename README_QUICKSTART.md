@@ -4,7 +4,8 @@
 
 - 영어/일본어 면접 음성을 지원하며, Preparation 화면에서 언어를 선택합니다.
 - 영어는 Moonshine Small Streaming, 일본어는 Moonshine Base 모델로 실시간 자막화합니다.
-- 1.5초 무음마다 transcript segment를 보존하고, F8로만 새 질문을 확정합니다.
+- F7은 현재 transcript를 context checkpoint로 주입하고 새 ASR stream을 시작합니다.
+- F8은 마지막 F7 이후 transcript만 새 질문으로 확정합니다.
 - F9으로 직전 질문에 이어진 발화를 합쳐 질문을 교정합니다.
 - Codex 답변은 별도의 Answer 창에 스트리밍합니다.
 - 세션별로 언어, Codex Model, Reasoning, Fast 설정과 대화 이력을 유지합니다.
@@ -78,7 +79,7 @@ GNOME Applications와 현재 사용자의 Desktop에 launcher를 설치합니다
 |---|---|---|
 | Normal Interview | 실제 면접 기본 모드 | `./start_interview_app.sh` |
 | Performance Test | `test_runs/`에 성능 JSONL 기록 | `INTERVIEW_TEST_LOG=1 INTERVIEW_TEST_LABEL=<label> .venv/bin/python interview_app.py` |
-| STT / UI Debug | Codex 없이 STT·무음·F8/F9·UI 확인 | `INTERVIEW_DISABLE_CODEX=1 INTERVIEW_TEST_LOG=1 INTERVIEW_TEST_LABEL=<label> .venv/bin/python interview_app.py` |
+| STT / UI Debug | Codex 없이 STT·F7/F8/F9·UI 확인 | `INTERVIEW_DISABLE_CODEX=1 INTERVIEW_TEST_LOG=1 INTERVIEW_TEST_LABEL=<label> .venv/bin/python interview_app.py` |
 
 Performance와 Debug의 test label은 `test_runs/`에서 실행 로그를 사람이 쉽게 구분하기 위한 이름입니다. 예: `a2z`, `latency-test`, `audio-debug`.
 
@@ -101,8 +102,6 @@ Performance와 Debug의 test label은 `test_runs/`에서 실행 로그를 사람
 주요 환경 변수:
 
 ```text
-INTERVIEW_AUTO_SILENCE_MS
-INTERVIEW_AUTO_SILENCE_RMS_THRESHOLD
 INTERVIEW_CODEX_MODEL
 INTERVIEW_CODEX_REASONING
 INTERVIEW_DISABLE_CODEX
@@ -113,8 +112,6 @@ INTERVIEW_TEST_LABEL
 기본값:
 
 ```text
-INTERVIEW_AUTO_SILENCE_MS=1500
-INTERVIEW_AUTO_SILENCE_RMS_THRESHOLD=250
 INTERVIEW_CODEX_MODEL=gpt-5.6-sol
 INTERVIEW_CODEX_REASONING=low
 INTERVIEW_DISABLE_CODEX=0
@@ -122,14 +119,6 @@ INTERVIEW_TEST_LOG=0
 ```
 
 `INTERVIEW_TEST_LABEL`은 테스트 로그를 구분하기 위한 선택 값입니다.
-
-예:
-
-```bash
-INTERVIEW_AUTO_SILENCE_MS=1800 \
-INTERVIEW_AUTO_SILENCE_RMS_THRESHOLD=300 \
-.venv/bin/python interview_app.py
-```
 
 언어는 환경 변수가 아니라 Preparation 화면에서 선택합니다.
 
@@ -145,7 +134,7 @@ INTERVIEW_TEST_LABEL=debug \
 .venv/bin/python interview_app.py
 ```
 
-Codex 요청 없이 Moonshine, 무음 segment, F8/F9와 UI만 확인하려면:
+Codex 요청 없이 Moonshine, F7/F8/F9와 UI만 확인하려면:
 
 ```bash
 INTERVIEW_DISABLE_CODEX=1 \
@@ -168,7 +157,7 @@ max_backlog_ms
 force_update_ms
 ```
 
-F8/F9 처리 시간과 Codex 응답 시간도 JSONL 로그에서 확인할 수 있습니다.
+F7/F8/F9 처리 시간과 Codex 응답 시간도 JSONL 로그에서 확인할 수 있습니다.
 
 오디오 처리 정상 여부를 볼 때는 특히 다음을 확인합니다.
 
@@ -357,7 +346,8 @@ Kokoro 테스트 환경이 필요한 경우에도 해당 worktree 안에서 `.ve
 
 ## 조작
 
-- `F8`: 현재 발화를 새 질문으로 확정
+- `F7`: 현재 발화를 체크포인트로 보존하고 새 ASR stream에서 계속 전사
+- `F8`: 마지막 F7 이후 현재 발화만 새 질문으로 확정
 - `F9`: 현재 발화를 직전 질문에 이어 붙여 교정
 - `Hide/Restore`: 면접 세션을 유지한 채 두 live 창만 숨김/복원
 - `Back`: Preparation 화면으로 복귀

@@ -39,6 +39,8 @@ def send_benchmark_wav_start(wav_name):
 # GNOME의 전역 단축키 명령은 이 경로만 실행한다. 무거운 모듈은 불러오지 않는다.
 if __name__ == "__main__" and "--trigger" in sys.argv:
     raise SystemExit(send_app_command(b"F8"))
+if __name__ == "__main__" and "--trigger-f7" in sys.argv:
+    raise SystemExit(send_app_command(b"F7"))
 if __name__ == "__main__" and "--trigger-f9" in sys.argv:
     raise SystemExit(send_app_command(b"F9"))
 if __name__ == "__main__" and "--stop" in sys.argv:
@@ -105,6 +107,7 @@ CODEX_DEVELOPER_INSTRUCTIONS = """You assist a job candidate with interview prep
 Follow the candidate's preferences, background, speaking style, and answer format established in the conversation.
 When a turn starts with PREPARATION MESSAGE:, treat it as a direct preparation question from the candidate. Answer helpfully, and use the exchange to establish preferences and background for later live answers.
 When a turn contains CURRENT INTERVIEWER QUESTION, return an immediately speakable answer draft in the same language as that question.
+When history or prompt context contains INTERVIEWER CONTEXT CHECKPOINT:, treat its text as prior interviewer context for the next question, not as a current question or candidate statement.
 Do not invent specific personal facts; ask during preparation or use adaptable wording when details are missing.
 During the live interview, assume the candidate spoke your previous live-answer draft unless the later interviewer transcript indicates otherwise.
 Each live-interview turn contains only conversation transcribed since the previous request plus the current interviewer question."""
@@ -123,7 +126,7 @@ SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2
 LOG_WRITE_LOCK = threading.Lock()
 BOUNDARY_STATUS_LISTENING = "● LISTENING"
-BOUNDARY_STATUS_AUTO = "✓ AUTO"
+BOUNDARY_STATUS_F7 = "✓ F7 CHECKPOINT"
 BOUNDARY_STATUS_F8 = "✓ F8 NEW"
 BOUNDARY_STATUS_F9 = "✓ F9 CONTINUED"
 BOUNDARY_STATUS_ERROR = "ERROR"
@@ -134,6 +137,7 @@ RESPONSE_STATUS_ERROR = "ERROR"
 NO_INTERVIEW_THREAD_TEXT = "아직 Interview Thread가 없습니다."
 NO_INTERVIEW_CONVERSATION_TEXT = "아직 면접 대화가 없습니다."
 INTERVIEW_QUESTION_MARKER = "CURRENT INTERVIEWER QUESTION:"
+INTERVIEW_CHECKPOINT_MARKER = "INTERVIEWER CONTEXT CHECKPOINT:"
 PREPARATION_MESSAGE_MARKER = "PREPARATION MESSAGE:"
 STT_PRESENTATION = {
     "en": {
@@ -215,6 +219,10 @@ FALLBACK_CODEX_MODELS = [
 HOTKEY_PATH = (
     "/org/gnome/settings-daemon/plugins/media-keys/"
     "custom-keybindings/interview-assistant/"
+)
+HOTKEY_F7_PATH = (
+    "/org/gnome/settings-daemon/plugins/media-keys/"
+    "custom-keybindings/interview-assistant-checkpoint/"
 )
 HOTKEY_F9_PATH = (
     "/org/gnome/settings-daemon/plugins/media-keys/"
@@ -387,9 +395,10 @@ class AudioStream:
 
 
 class CodexWorker:
-    """Run queued turns on one persistent App Server thread."""
+    """Run ordered context injections and turns on one App Server thread."""
 
     _LATEST_JOB = object()
+    _INJECT_JOB = object()
 
     def __init__(
         self,
@@ -491,6 +500,13 @@ class CodexWorker:
                 client.request_interrupt()
         return True
 
+    def submit_inject_items(self, items, callback):
+        """Queue context injection in order with live turns."""
+        if not self.accepting:
+            return False
+        self.jobs.put((self._INJECT_JOB, items, callback))
+        return True
+
     def stop(self):
         self.accepting = False
         with self.latest_lock:
@@ -525,6 +541,25 @@ class CodexWorker:
             job = self.jobs.get()
             if job is None:
                 return
+            if isinstance(job, tuple) and job[0] is self._INJECT_JOB:
+                _, items, callback = job
+                with self.client_lock:
+                    client = self.client
+                if client is None:
+                    result = None
+                    error = startup_error or CodexAppServerTransportError(
+                        "Codex App Server is unavailable"
+                    )
+                else:
+                    try:
+                        client.inject_items(items)
+                        result = {"item_count": len(items)}
+                        error = None
+                    except Exception as caught:
+                        result = None
+                        error = caught
+                GLib.idle_add(callback, result, error)
+                continue
             if job is self._LATEST_JOB:
                 with self.latest_lock:
                     job = self.latest_job
@@ -3173,7 +3208,7 @@ class TranscriptWindow(Gtk.Window):
                     0,
                 )
                 shortcut_reminder = Gtk.Label(
-                    label="F8 NEW  ·  F9 CONTINUE"
+                    label="F7 CHECKPOINT · F8 NEW · F9 CONTINUE"
                 )
                 shortcut_reminder.set_xalign(1)
                 shortcut_reminder.set_single_line_mode(True)
@@ -3567,8 +3602,11 @@ class InterviewApp:
         self.codex_request_states = {}
         self.conversation_context = []
         self.codex_context_cursor = 0
+        self.checkpoint_context = []
+        self.checkpoint_barrier_waiters = []
         self.codex_state_lock = threading.Lock()
         self.last_f8_at = None
+        self.last_f7_at = None
         self.last_f9_at = None
         self.last_commit_state = None
         self.live_windows_hidden = False
@@ -3638,6 +3676,7 @@ class InterviewApp:
         self.answer_window.show_all()
         self.control_window.show_all()
         self._start_trigger_listener()
+        f7_hotkey_status = self._install_global_f7()
         hotkey_status = self._install_global_f8()
         f9_hotkey_status = self._install_global_f9()
 
@@ -3665,9 +3704,12 @@ class InterviewApp:
                 "completed_codex_answer_assumed_spoken_"
                 "superseded_answer_not_spoken"
             ),
-            "question_transcript_mode": "f8_cursor_barrier_force_snapshot",
+            "question_transcript_mode": (
+                "f7_inject_f8_current_stream_cursor_barrier"
+            ),
             "preview_transcription": "moonshine_transcript_lines",
             "global_f8": hotkey_status,
+            "global_f7": f7_hotkey_status,
             "global_f9": f9_hotkey_status,
             "test_label": TEST_LABEL,
         })
@@ -3681,7 +3723,6 @@ class InterviewApp:
             self._moonshine_ready,
             self._moonshine_preview,
             self._moonshine_error,
-            on_auto_commit=self._moonshine_auto_commit,
             dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
             language=self.stt_language,
         )
@@ -3731,6 +3772,14 @@ class InterviewApp:
             path=HOTKEY_PATH,
             name="Interview Assistant: Capture Question",
             trigger_argument="--trigger",
+        )
+
+    def _install_global_f7(self):
+        return self._install_global_hotkey(
+            key="F7",
+            path=HOTKEY_F7_PATH,
+            name="Interview Assistant: Checkpoint Question",
+            trigger_argument="--trigger-f7",
         )
 
     def _install_global_f9(self):
@@ -3815,7 +3864,9 @@ class InterviewApp:
                     continue
                 except OSError:
                     return
-                if data == b"F8":
+                if data == b"F7":
+                    GLib.idle_add(self._on_f7)
+                elif data == b"F8":
                     GLib.idle_add(self._on_f8)
                 elif data == b"F9":
                     GLib.idle_add(self._on_f9)
@@ -3880,6 +3931,9 @@ class InterviewApp:
             raise socket_error
 
     def _key_pressed(self, _window, event):
+        if event.keyval == Gdk.KEY_F7:
+            self._on_f7()
+            return True
         if event.keyval == Gdk.KEY_F8:
             self._on_f8()
             return True
@@ -3995,11 +4049,7 @@ class InterviewApp:
 
         question_text = result["text"].strip()
         elapsed = time.perf_counter() - commit_started
-        latency_field = (
-            {"f8_to_question_ms": round(elapsed * 1000, 1)}
-            if commit_source == "f8"
-            else {"silence_commit_to_question_ms": round(elapsed * 1000, 1)}
-        )
+        latency_field = {"f8_to_question_ms": round(elapsed * 1000, 1)}
         if not question_text:
             self.answer_window.set_status("No question detected")
             return False
@@ -4031,22 +4081,34 @@ class InterviewApp:
         })
 
         self.remote_window.set_text(result["display_text"] or question_text)
-        if commit_source == "silence":
-            self.remote_window.set_boundary_status(BOUNDARY_STATUS_AUTO)
-        elif commit_source == "f8":
+        if commit_source == "f8":
             self.remote_window.set_boundary_status(BOUNDARY_STATUS_F8)
         context_index = len(self.conversation_context)
         self.conversation_context.append(("INTERVIEWER", question_text))
-        codex_generation = None
+        commit_state = {
+            "commit_source": commit_source,
+            "text": question_text,
+            "question_number": question_number,
+            "target_sample_cursor": result["target_sample_cursor"],
+            "conversation_context_index": context_index,
+            "codex_generation": None,
+        }
+        self.last_commit_state = commit_state
         if self.codex_enabled:
-            self._answer_ui_trigger = commit_source
-            try:
-                codex_generation = self._request_codex_answer(
-                    question_number,
-                    question_text,
-                )
-            finally:
-                self._answer_ui_trigger = None
+            def request_after_checkpoints(checkpoint_fallbacks):
+                self._answer_ui_trigger = commit_source
+                try:
+                    generation = self._request_codex_answer(
+                        question_number,
+                        question_text,
+                        checkpoint_fallbacks=checkpoint_fallbacks,
+                    )
+                    commit_state["codex_generation"] = generation
+                    return generation
+                finally:
+                    self._answer_ui_trigger = None
+
+            self._after_checkpoint_barrier(request_after_checkpoints)
         else:
             self.answer_window.set_status(
                 "Codex disabled · question logged only"
@@ -4056,40 +4118,146 @@ class InterviewApp:
                 "question": question_number,
                 "reason": "disabled_for_audio_test",
             })
-        self.last_commit_state = {
-            "commit_source": commit_source,
-            "text": question_text,
-            "question_number": question_number,
-            "target_sample_cursor": result["target_sample_cursor"],
-            "conversation_context_index": context_index,
-            "codex_generation": codex_generation,
-        }
         return False
 
-    def _moonshine_auto_commit(self, result, error):
+    def _moonshine_checkpoint_ready(self, commit_started, result, error):
         if not self.running:
             return False
         if error:
-            return self._moonshine_error(error)
+            self.remote_window.set_status(f"Moonshine error: {error}")
+            append_log(self.log_path, {
+                "event": "checkpoint_error",
+                "commit_source": "f7",
+                "error": str(error),
+            })
+            return False
+
+        saved = result.get("checkpoint_saved", False)
+        checkpoint = None
+        if saved:
+            if not hasattr(self, "checkpoint_context"):
+                self.checkpoint_context = []
+            if not hasattr(self, "checkpoint_barrier_waiters"):
+                self.checkpoint_barrier_waiters = []
+            checkpoint = {
+                "sequence": len(self.checkpoint_context) + 1,
+                "text": result["text"].strip(),
+                "status": "pending" if self.codex_enabled else "skipped",
+                "fallback_consumed": False,
+                "target_sample_cursor": result["target_sample_cursor"],
+            }
+            self.checkpoint_context.append(checkpoint)
+            self.last_commit_state = None
         append_log(self.log_path, {
-            "event": "silence_segment",
+            "event": "checkpoint" if saved else "checkpoint_suppressed",
+            "commit_source": "f7",
             "text": result["text"].strip(),
-            "segment_preserved": result.get("segment_preserved", False),
-            "accumulated_segment_count": result.get(
-                "accumulated_segment_count", 0
-            ),
-            "asr_backend": moonshine_asr_backend(
-                getattr(self, "stt_language", "en")
+            "checkpoint_sequence": (
+                checkpoint["sequence"] if checkpoint is not None else None
             ),
             "target_sample_cursor": result["target_sample_cursor"],
             "consumed_sample_cursor": result["consumed_sample_cursor"],
             "cursor_complete": result["cursor_complete"],
             "audio_drop_samples": result["audio_drop_samples"],
             "max_backlog_ms": result["max_backlog_ms"],
+            "barrier_wait_ms": result["barrier_wait_ms"],
             "force_update_ms": result["force_update_ms"],
+            "f7_to_checkpoint_ms": round(
+                (time.perf_counter() - commit_started) * 1000, 1
+            ),
         })
-        self.remote_window.set_boundary_status(BOUNDARY_STATUS_AUTO)
+        if saved:
+            self.remote_window.set_text(result["display_text"] or result["text"])
+            self.remote_window.set_boundary_status(BOUNDARY_STATUS_F7)
+            if self.codex_enabled:
+                self.answer_window.set_status("Checkpoint saved · syncing context…")
+                items = [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": (
+                            f"{INTERVIEW_CHECKPOINT_MARKER}\n"
+                            f"{checkpoint['text']}"
+                        ),
+                    }],
+                }]
+                accepted = self.codex_worker.submit_inject_items(
+                    items,
+                    lambda inject_result, inject_error, saved_checkpoint=checkpoint: (
+                        self._checkpoint_inject_finished(
+                            saved_checkpoint,
+                            inject_result,
+                            inject_error,
+                        )
+                    ),
+                )
+                if not accepted:
+                    self._checkpoint_inject_finished(
+                        checkpoint,
+                        None,
+                        RuntimeError("Codex worker rejected checkpoint injection"),
+                    )
+            else:
+                self.answer_window.set_status(
+                    "Codex disabled · checkpoint stored locally"
+                )
+        else:
+            self.answer_window.set_status("No new checkpoint detected")
         return False
+
+    def _checkpoint_inject_finished(self, checkpoint, result, error):
+        if not self.running:
+            return False
+        checkpoint["status"] = "failed" if error else "injected"
+        append_log(self.log_path, {
+            "event": "checkpoint_inject_error" if error else "checkpoint_injected",
+            "checkpoint_sequence": checkpoint["sequence"],
+            "target_sample_cursor": checkpoint["target_sample_cursor"],
+            "item_count": result.get("item_count") if result else None,
+            "error": str(error) if error else None,
+        })
+        if error:
+            self.answer_window.set_status(
+                "Checkpoint inject failed · will include with next question"
+            )
+        elif not self._checkpoint_inject_pending():
+            self.answer_window.set_status("Checkpoint context synced")
+        self._flush_checkpoint_barrier()
+        return False
+
+    def _checkpoint_inject_pending(self):
+        return any(
+            checkpoint["status"] == "pending"
+            for checkpoint in getattr(self, "checkpoint_context", [])
+        )
+
+    def _failed_checkpoint_fallbacks(self):
+        checkpoint_context = getattr(self, "checkpoint_context", [])
+        return [
+            checkpoint
+            for checkpoint in checkpoint_context
+            if checkpoint["status"] == "failed"
+            and not checkpoint["fallback_consumed"]
+        ]
+
+    def _after_checkpoint_barrier(self, callback):
+        if self._checkpoint_inject_pending():
+            if not hasattr(self, "checkpoint_barrier_waiters"):
+                self.checkpoint_barrier_waiters = []
+            self.checkpoint_barrier_waiters.append(callback)
+            self.answer_window.set_status("Waiting for checkpoint context…")
+            return None
+        return callback(self._failed_checkpoint_fallbacks())
+
+    def _flush_checkpoint_barrier(self):
+        if self._checkpoint_inject_pending():
+            return
+        waiters = getattr(self, "checkpoint_barrier_waiters", [])
+        self.checkpoint_barrier_waiters = []
+        checkpoint_fallbacks = self._failed_checkpoint_fallbacks()
+        for callback in waiters:
+            callback(list(checkpoint_fallbacks))
 
     def _continuation_base_is_valid(self, base):
         if not base or not base.get("text"):
@@ -4195,18 +4363,32 @@ class InterviewApp:
         })
         self.remote_window.set_text(combined_text)
         self.remote_window.set_boundary_status(BOUNDARY_STATUS_F9)
-        codex_generation = None
+        commit_state = {
+            "commit_source": "f9_continuation",
+            "text": combined_text,
+            "question_number": question_number,
+            "target_sample_cursor": result["target_sample_cursor"],
+            "conversation_context_index": context_index,
+            "codex_generation": None,
+        }
+        self.last_commit_state = commit_state
         if self.codex_enabled:
-            self._answer_ui_trigger = "f9"
-            try:
-                codex_generation = self._request_codex_answer(
-                    question_number,
-                    combined_text,
-                    supersedes_generation=base["codex_generation"],
-                    correction={"previous_text": base["text"]},
-                )
-            finally:
-                self._answer_ui_trigger = None
+            def request_after_checkpoints(checkpoint_fallbacks):
+                self._answer_ui_trigger = "f9"
+                try:
+                    generation = self._request_codex_answer(
+                        question_number,
+                        combined_text,
+                        supersedes_generation=base["codex_generation"],
+                        correction={"previous_text": base["text"]},
+                        checkpoint_fallbacks=checkpoint_fallbacks,
+                    )
+                    commit_state["codex_generation"] = generation
+                    return generation
+                finally:
+                    self._answer_ui_trigger = None
+
+            self._after_checkpoint_barrier(request_after_checkpoints)
         else:
             self.answer_window.set_status(
                 "Codex disabled · corrected question logged only"
@@ -4217,14 +4399,6 @@ class InterviewApp:
                 "commit_source": "f9_continuation",
                 "reason": "disabled_for_audio_test",
             })
-        self.last_commit_state = {
-            "commit_source": "f9_continuation",
-            "text": combined_text,
-            "question_number": question_number,
-            "target_sample_cursor": result["target_sample_cursor"],
-            "conversation_context_index": context_index,
-            "codex_generation": codex_generation,
-        }
         return False
 
     def _answer_ui_snapshot(self):
@@ -4274,6 +4448,7 @@ class InterviewApp:
         supersedes_generation=None,
         correction=None,
         trigger=None,
+        checkpoint_fallbacks=None,
     ):
         with self.codex_state_lock:
             context_end = len(self.conversation_context)
@@ -4282,10 +4457,15 @@ class InterviewApp:
             ]
         if context and context[-1] == ("INTERVIEWER", question_text):
             context = context[:-1]
-        context_text = "\n".join(
+        context_lines = [
             f"{role}: {text}"
             for role, text in context
-        ) or "(none)"
+        ]
+        context_lines.extend(
+            f"{INTERVIEW_CHECKPOINT_MARKER}\n{checkpoint['text']}"
+            for checkpoint in (checkpoint_fallbacks or [])
+        )
+        context_text = "\n".join(context_lines) or "(none)"
         prompt = f"""NEW CONVERSATION SINCE THE PREVIOUS REQUEST:
 {context_text}
 
@@ -4423,6 +4603,7 @@ PREVIOUS INCOMPLETE QUESTION:
                 CODEX_FAST_MODE,
             ),
             "context_items": len(context),
+            "checkpoint_fallback_items": len(checkpoint_fallbacks or []),
             "superseded_requests": len(superseded),
             "correction": correction is not None,
             "supersedes_generation": supersedes_generation,
@@ -4537,6 +4718,9 @@ PREVIOUS INCOMPLETE QUESTION:
         def finished(result, error):
             if not self.running:
                 return False
+            if error is None:
+                for checkpoint in checkpoint_fallbacks or []:
+                    checkpoint["fallback_consumed"] = True
             with self.codex_state_lock:
                 state = self.codex_request_states[generation]
                 is_current = (
@@ -4639,6 +4823,54 @@ PREVIOUS INCOMPLETE QUESTION:
                 "startup_seconds": round(result["startup_seconds"], 3),
                 "process_id": result.get("process_id"),
             })
+        return False
+
+    def _on_f7(self):
+        now = time.perf_counter()
+        if (
+            self.last_f7_at is not None
+            and now - self.last_f7_at < ENTER_DEBOUNCE_MS / 1000
+        ):
+            append_log(self.log_path, {
+                "event": "f7_ignored",
+                "reason": "debounce",
+                "interval_ms": round((now - self.last_f7_at) * 1000, 1),
+            })
+            return False
+        self.last_f7_at = now
+        if not self.moonshine_ready or not self.audio_started:
+            append_log(self.log_path, {
+                "event": "f7_ignored",
+                "reason": "moonshine_not_ready",
+            })
+            self.remote_window.set_status("Moonshine is still loading…")
+            return False
+        callback = lambda result, error: self._moonshine_checkpoint_ready(
+            now, result, error
+        )
+        try:
+            target_cursor, accepted = self.remote_audio.capture_sample_cursor_and(
+                lambda cursor: self.asr_worker.request_checkpoint(cursor, callback)
+            )
+        except Exception as error:
+            self._moonshine_checkpoint_ready(now, None, error)
+            return False
+        if not accepted:
+            self._moonshine_checkpoint_ready(
+                now,
+                None,
+                RuntimeError("Moonshine worker rejected F7 checkpoint"),
+            )
+            return False
+        append_log(self.log_path, {
+            "event": "f7_trigger",
+            "target_sample_cursor": target_cursor,
+            "trigger_absolute_seconds": round(target_cursor / SAMPLE_RATE, 3),
+            "asr_backend": moonshine_asr_backend(
+                getattr(self, "stt_language", "en")
+            ),
+        })
+        self.answer_window.set_status("Saving checkpoint…")
         return False
 
     def _on_f8(self):
@@ -4901,8 +5133,11 @@ class HeadlessInterviewApp(InterviewApp):
         self.codex_request_states = {}
         self.conversation_context = []
         self.codex_context_cursor = 0
+        self.checkpoint_context = []
+        self.checkpoint_barrier_waiters = []
         self.codex_state_lock = threading.Lock()
         self.last_f8_at = None
+        self.last_f7_at = None
         self.last_f9_at = None
         self.last_commit_state = None
         self.live_windows_hidden = True
@@ -4935,9 +5170,12 @@ class HeadlessInterviewApp(InterviewApp):
                 "completed_codex_answer_assumed_spoken_"
                 "superseded_answer_not_spoken"
             ),
-            "question_transcript_mode": "f8_cursor_barrier_force_snapshot",
+            "question_transcript_mode": (
+                "f7_inject_f8_current_stream_cursor_barrier"
+            ),
             "preview_transcription": "moonshine_transcript_lines",
             "global_f8": "headless_direct",
+            "global_f7": "disabled_headless",
             "global_f9": "disabled_headless",
             "test_label": self.test_label,
         })
@@ -4951,7 +5189,6 @@ class HeadlessInterviewApp(InterviewApp):
             self._moonshine_ready,
             self._moonshine_preview,
             self._moonshine_error,
-            on_auto_commit=self._moonshine_auto_commit,
             dispatch=lambda callback, *args: GLib.idle_add(callback, *args),
             language=self.stt_language,
         )

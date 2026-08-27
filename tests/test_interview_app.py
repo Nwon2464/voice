@@ -109,6 +109,7 @@ class _RecoveryCodexClient:
 class _CaptureLatestWorker:
     def __init__(self):
         self.jobs = []
+        self.inject_jobs = []
 
     def submit_latest(
         self,
@@ -126,6 +127,13 @@ class _CaptureLatestWorker:
             "on_delta": on_delta,
             "on_start": on_start,
             "on_recovery": on_recovery,
+        })
+        return True
+
+    def submit_inject_items(self, items, callback):
+        self.inject_jobs.append({
+            "items": items,
+            "callback": callback,
         })
         return True
 
@@ -426,6 +434,59 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertGreaterEqual(client.interrupt_calls, 1)
         self.assertEqual(len(callbacks), 1)
         self.assertIsNotNone(callbacks[0][1])
+
+    def test_worker_orders_injections_before_following_live_turn(self):
+        events = []
+        done = threading.Event()
+
+        class OrderedClient(_RecoveryCodexClient):
+            def inject_items(self, items):
+                events.append(("inject", items[0]["content"][0]["text"]))
+
+            def run_turn(self, prompt, **kwargs):
+                events.append(("turn", prompt))
+                return super().run_turn(prompt, **kwargs)
+
+        with patch.object(
+            interview_app,
+            "CodexAppServerClient",
+            OrderedClient,
+        ), patch.object(
+            interview_app.GLib,
+            "idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ):
+            worker = interview_app.CodexWorker(lambda *_args: False)
+            self.assertTrue(_wait_until(lambda: worker.client is not None))
+            worker.submit_inject_items(
+                [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "checkpoint 1"}],
+                }],
+                lambda *_args: None,
+            )
+            worker.submit_inject_items(
+                [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "checkpoint 2"}],
+                }],
+                lambda *_args: None,
+            )
+            worker.submit_latest(
+                1,
+                "question",
+                lambda *_args: done.set(),
+            )
+            self.assertTrue(done.wait(timeout=2))
+            worker.stop()
+
+        self.assertEqual(events, [
+            ("inject", "checkpoint 1"),
+            ("inject", "checkpoint 2"),
+            ("turn", "question"),
+        ])
 
     def test_live_worker_receives_selected_model_and_effort_snapshot(self):
         captured = {}
@@ -1684,7 +1745,10 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         app.remote_window = _FakeAnswerWindow()
         app.answer_window = _FakeAnswerWindow()
         app.conversation_context = []
+        app.checkpoint_context = []
+        app.checkpoint_barrier_waiters = []
         app.last_commit_state = None
+        app.last_f7_at = None
         if codex_enabled:
             app.codex_request_count = 0
             app.active_codex_generation = 0
@@ -1722,8 +1786,8 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         app.answer_window = _FakeAnswerWindow()
         app.conversation_context = []
         requests = []
-        app._request_codex_answer = lambda number, text: requests.append(
-            (number, text)
+        app._request_codex_answer = (
+            lambda number, text, **_kwargs: requests.append((number, text))
         )
         result = {
             "text": "Why this role?",
@@ -1758,6 +1822,182 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             interview_app.BOUNDARY_STATUS_F8,
         )
 
+    def test_f7_checkpoint_does_not_commit_question_or_call_codex(self):
+        app = self._app(codex_enabled=True)
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result("Long interviewer question so far", 16_000),
+                "commit_source": "f7",
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+
+        self.assertEqual(app.question_count, 0)
+        self.assertEqual(app.conversation_context, [])
+        self.assertEqual(app.codex_worker.jobs, [])
+        self.assertEqual(len(app.codex_worker.inject_jobs), 1)
+        self.assertIsNone(app.last_commit_state)
+        self.assertEqual(
+            app.remote_window.boundary_status,
+            interview_app.BOUNDARY_STATUS_F7,
+        )
+
+    def test_f7_inject_order_and_f8_barrier_with_failure_fallback(self):
+        app = self._app(codex_enabled=True)
+        checkpoints = ("first context", "second context")
+        for index, text in enumerate(checkpoints, start=1):
+            app._moonshine_checkpoint_ready(
+                time.perf_counter(),
+                {
+                    **self._result(text, index * 10_000),
+                    "commit_source": "f7",
+                    "checkpoint_saved": True,
+                },
+                None,
+            )
+
+        injected_texts = [
+            job["items"][0]["content"][0]["text"]
+            for job in app.codex_worker.inject_jobs
+        ]
+        self.assertEqual(injected_texts, [
+            f"{interview_app.INTERVIEW_CHECKPOINT_MARKER}\nfirst context",
+            f"{interview_app.INTERVIEW_CHECKPOINT_MARKER}\nsecond context",
+        ])
+        self.assertTrue(all(
+            job["items"][0]["role"] == "user"
+            for job in app.codex_worker.inject_jobs
+        ))
+
+        current_question = "post checkpoint question"
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result(current_question, 30_000),
+            None,
+            commit_source="f8",
+        )
+        self.assertEqual(app.codex_worker.jobs, [])
+
+        first, second = app.codex_worker.inject_jobs
+        first["callback"]({"item_count": 1}, None)
+        self.assertEqual(app.codex_worker.jobs, [])
+        second["callback"](None, RuntimeError("inject failed"))
+
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        prompt = app.codex_worker.jobs[0]["prompt"]
+        self.assertNotIn("first context", prompt)
+        self.assertIn(
+            f"{interview_app.INTERVIEW_CHECKPOINT_MARKER}\nsecond context",
+            prompt,
+        )
+        self.assertIn(
+            f"CURRENT INTERVIEWER QUESTION:\n{current_question}",
+            prompt,
+        )
+        self.assertEqual(
+            [checkpoint["status"] for checkpoint in app.checkpoint_context],
+            ["injected", "failed"],
+        )
+        self.assertFalse(app.checkpoint_context[1]["fallback_consumed"])
+        app.codex_worker.jobs[0]["callback"]({
+            "text": "answer",
+            "elapsed": 0.1,
+            "first_token_seconds": 0.05,
+            "first_visible_seconds": 0.05,
+            "stream_delta_count": 1,
+            "thread_id": "thread-test",
+            "turn_id": "turn-test",
+        }, None)
+        self.assertTrue(app.checkpoint_context[1]["fallback_consumed"])
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result("next question", 40_000),
+            None,
+            commit_source="f8",
+        )
+        self.assertNotIn("second context", app.codex_worker.jobs[1]["prompt"])
+
+    def test_f7_uses_atomic_cursor_capture_and_checkpoint_request(self):
+        app = self._app()
+        app.moonshine_ready = True
+        app.audio_started = True
+        requested = []
+        app.remote_audio = SimpleNamespace(
+            capture_sample_cursor_and=lambda enqueue: (
+                24_000,
+                enqueue(24_000),
+            )
+        )
+        app.asr_worker = SimpleNamespace(
+            request_checkpoint=lambda cursor, callback: (
+                requested.append((cursor, callback)),
+                True,
+            )[1],
+        )
+
+        app._on_f7()
+
+        self.assertEqual(len(requested), 1)
+        self.assertEqual(requested[0][0], 24_000)
+        self.assertEqual(app.question_count, 0)
+        self.assertEqual(app.conversation_context, [])
+        self.assertEqual(app.answer_window.status, "Saving checkpoint…")
+
+    def test_successful_f7_ends_previous_f8_f9_continuation_chain(self):
+        app = self._app()
+        self._commit(app, 1, "previous question", 10_000, "f8")
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result("next question context", 20_000),
+                "commit_source": "f7",
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        app.last_f9_at = None
+        app.moonshine_ready = True
+        app.audio_started = True
+        snapshot_calls = []
+        app.remote_audio = SimpleNamespace(
+            capture_sample_cursor_and=lambda _enqueue: snapshot_calls.append(True)
+        )
+
+        app._on_f9()
+
+        self.assertIsNone(app.last_commit_state)
+        self.assertEqual(snapshot_calls, [])
+        self.assertEqual(app.conversation_context, [
+            ("INTERVIEWER", "previous question"),
+        ])
+        self.assertEqual(
+            app.answer_window.status,
+            "No previous question to continue",
+        )
+
+    def test_final_f8_uses_only_post_checkpoint_transcript_as_question(self):
+        app = self._app(codex_enabled=True)
+        current = "current segment only"
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result(current, 32_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(app.conversation_context, [("INTERVIEWER", current)])
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        prompt = app.codex_worker.jobs[0]["prompt"]
+        self.assertIn(f"CURRENT INTERVIEWER QUESTION:\n{current}", prompt)
+
     def test_moonshine_ready_sets_listening_boundary_status(self):
         app = self._app()
         app.moonshine_ready = False
@@ -1777,7 +2017,7 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
 
     def test_new_transcript_activity_restores_listening_boundary_status(self):
         app = self._app()
-        app.remote_window.set_boundary_status(interview_app.BOUNDARY_STATUS_AUTO)
+        app.remote_window.set_boundary_status(interview_app.BOUNDARY_STATUS_F7)
 
         app._moonshine_preview({"text": "New interviewer speech", "lines": []})
 
@@ -1785,53 +2025,6 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             app.remote_window.boundary_status,
             interview_app.BOUNDARY_STATUS_LISTENING,
         )
-
-    def test_silence_segment_never_commits_question_or_requests_codex(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            app = self._app(
-                codex_enabled=True,
-                log_path=Path(directory) / "session.jsonl",
-            )
-            app.stt_language = "ja"
-            result = {
-                "text": "Why this role?",
-                "display_text": "Why this role?",
-                "lines": [{"text": "Why this role?"}],
-                "commit_requested_at": time.perf_counter(),
-                "committed": True,
-                "captured_sample_cursor": 24_000,
-                "target_sample_cursor": 24_000,
-                "queued_sample_cursor": 24_000,
-                "consumed_sample_cursor": 24_000,
-                "cursor_complete": True,
-                "audio_drop_samples": 0,
-                "max_backlog_ms": 20.0,
-                "barrier_wait_ms": 0.0,
-                "force_update_ms": 2.0,
-                "segment_preserved": True,
-                "accumulated_segment_count": 1,
-            }
-
-            app._moonshine_auto_commit(result, None)
-            result["text"] = "What are your strengths?"
-            result["accumulated_segment_count"] = 2
-            app._moonshine_auto_commit(result, None)
-
-            events = [
-                json.loads(line)
-                for line in app.log_path.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(
-                [event["event"] for event in events],
-                ["silence_segment", "silence_segment"],
-            )
-            self.assertEqual(app.question_count, 0)
-            self.assertEqual(app.conversation_context, [])
-            self.assertEqual(app.codex_worker.jobs, [])
-            self.assertEqual(
-                app.remote_window.boundary_status,
-                interview_app.BOUNDARY_STATUS_AUTO,
-            )
 
     def test_f8_a_then_f9_b_replaces_a_with_combined_question(self):
         app = self._app()

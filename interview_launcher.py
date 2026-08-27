@@ -308,7 +308,7 @@ class InterviewLauncher(Gtk.Window):
         cards.pack_start(self._add_card(
             STT_DIAGNOSTIC_MODE,
             "STT Diagnostic",
-            "Codex 없이 Session과 Preparation을 거쳐 STT/F8/F9 진단",
+            "Codex 없이 Session과 Preparation을 거쳐 STT/F7/F8/F9 진단",
             "디버그 로그를 구분할 이름을 입력하세요.",
             "예: audio-debug, stt-check",
         ), False, False, 0)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import queue
 import threading
 import time
@@ -18,12 +17,6 @@ MOONSHINE_MODEL_BY_LANGUAGE = {
     "en": ("small-streaming-en", "SMALL_STREAMING"),
     "ja": ("base-ja", "BASE"),
 }
-AUTO_SILENCE_MS = int(os.environ.get("INTERVIEW_AUTO_SILENCE_MS", "1500"))
-AUTO_SILENCE_RMS_THRESHOLD = int(
-    os.environ.get("INTERVIEW_AUTO_SILENCE_RMS_THRESHOLD", "250")
-)
-
-
 def transcript_lines_snapshot(transcript) -> list[dict]:
     """Copy Moonshine transcript lines before the native snapshot is released."""
     return [
@@ -48,7 +41,7 @@ def lines_question_text(lines: list[dict]) -> str:
 
 
 class MoonshineStreamingWorker:
-    """Own one model/stream and serialize PCM, Preview and F8 operations."""
+    """Own one model/stream and serialize PCM, preview, and key commits."""
 
     def __init__(
         self,
@@ -56,30 +49,20 @@ class MoonshineStreamingWorker:
         on_preview: Callable,
         on_error: Callable,
         *,
-        on_auto_commit: Callable | None = None,
         dispatch: Callable = lambda callback, *args: callback(*args),
         engine_factory: Callable | None = None,
         force_update_flag: int | None = None,
         language: str = "en",
-        auto_silence_ms: int = AUTO_SILENCE_MS,
-        auto_silence_rms_threshold: int = AUTO_SILENCE_RMS_THRESHOLD,
     ):
         self.on_ready = on_ready
         self.on_preview = on_preview
         self.on_error = on_error
-        self.on_auto_commit = on_auto_commit
         self.dispatch = dispatch
         self.engine_factory = engine_factory
         self.force_update_flag = force_update_flag
         self.language = language
         if language not in MOONSHINE_MODEL_BY_LANGUAGE:
             raise ValueError(f"unsupported Moonshine language: {language}")
-        self.auto_silence_samples = int(SAMPLE_RATE * auto_silence_ms / 1000)
-        self.auto_silence_rms_threshold = auto_silence_rms_threshold
-        if self.auto_silence_samples <= 0:
-            raise ValueError("auto_silence_ms must be positive")
-        if self.auto_silence_rms_threshold < 0:
-            raise ValueError("auto_silence_rms_threshold cannot be negative")
         self.jobs: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
         self.thread = None
@@ -89,7 +72,6 @@ class MoonshineStreamingWorker:
         self.audio_drop_samples = 0
         self.max_backlog_samples = 0
         self.last_committed_sample_cursor = None
-        self.pending_f8_requests = 0
 
     def start(self) -> bool:
         with self.lock:
@@ -137,14 +119,18 @@ class MoonshineStreamingWorker:
         self,
         target_sample_cursor: int,
         callback: Callable,
+        *,
+        commit_source: str = "f8",
     ) -> bool:
-        """Enqueue F8 after PCM through target was atomically queued by capture."""
+        """Enqueue a manual commit after PCM through target was queued."""
+        if commit_source not in {"f7", "f8"}:
+            raise ValueError(f"unsupported manual commit source: {commit_source}")
         with self.lock:
             if not self.accepting:
                 return False
             if target_sample_cursor != self.queued_sample_cursor:
                 raise ValueError(
-                    "F8 target must equal the queued absolute audio cursor: "
+                    "snapshot target must equal the queued absolute audio cursor: "
                     f"target={target_sample_cursor}, queued={self.queued_sample_cursor}"
                 )
             request = {
@@ -154,12 +140,24 @@ class MoonshineStreamingWorker:
                 "max_backlog_samples": self.max_backlog_samples,
                 "requested_at": time.perf_counter(),
                 "callback": callback,
+                "commit_source": commit_source,
             }
             self.audio_drop_samples = 0
             self.max_backlog_samples = 0
-            self.pending_f8_requests += 1
             self.jobs.put(("snapshot", request))
         return True
+
+    def request_checkpoint(
+        self,
+        target_sample_cursor: int,
+        callback: Callable,
+    ) -> bool:
+        """Preserve the current transcript and reset only the ASR stream."""
+        return self.request_snapshot(
+            target_sample_cursor,
+            callback,
+            commit_source="f7",
+        )
 
     def stop(self) -> None:
         with self.lock:
@@ -217,8 +215,7 @@ class MoonshineStreamingWorker:
         preview_lines = {}
         ready_dispatched = False
         active_request = None
-        speech_seen_since_commit = False
-        silence_samples = 0
+        stream_has_audio = False
 
         worker = self
 
@@ -310,11 +307,9 @@ class MoonshineStreamingWorker:
                     "force_update_ms": round(force_update_ms, 1),
                 }
 
-            accumulated_segments = []
-
             def commit_snapshot(request):
-                """Snapshot/reset a silence segment or commit all segments manually."""
-                nonlocal stream, speech_seen_since_commit, silence_samples
+                """Return this stream's exact transcript, then reset the stream."""
+                nonlocal stream, stream_has_audio
                 target = request["target_sample_cursor"]
                 if self.consumed_sample_cursor != target:
                     raise RuntimeError(
@@ -323,10 +318,9 @@ class MoonshineStreamingWorker:
                     )
 
                 if (
-                    request["commit_source"] != "silence"
-                    and not accumulated_segments
+                    request["commit_source"] == "f8"
                     and self.last_committed_sample_cursor is not None
-                    and not speech_seen_since_commit
+                    and not stream_has_audio
                 ):
                     result = snapshot_result(
                         request,
@@ -335,6 +329,11 @@ class MoonshineStreamingWorker:
                             time.perf_counter() - request["requested_at"]
                         ) * 1000,
                     )
+                    stream.remove_listener(listener)
+                    stream.close()
+                    preview_lines.clear()
+                    stream = self._new_stream(transcriber, listener)
+                    stream_has_audio = False
                     self.dispatch(request["callback"], result, None)
                     return
 
@@ -344,45 +343,7 @@ class MoonshineStreamingWorker:
                 lines = transcript_lines_snapshot(transcript)
                 current_text = lines_question_text(lines)
                 current_display_text = lines_display_text(lines)
-                if request["commit_source"] == "silence":
-                    if current_text:
-                        accumulated_segments.append({
-                            "text": current_text,
-                            "display_text": current_display_text,
-                            "lines": lines,
-                        })
-                    committed_lines = lines
-                    committed_text = current_text
-                    committed_display_text = current_display_text
-                else:
-                    committed_lines = [
-                        line
-                        for segment in accumulated_segments
-                        for line in segment["lines"]
-                    ] + lines
-                    committed_text = " ".join(
-                        text
-                        for text in (
-                            *(
-                                segment["text"]
-                                for segment in accumulated_segments
-                            ),
-                            current_text,
-                        )
-                        if text
-                    )
-                    committed_display_text = "\n".join(
-                        text
-                        for text in (
-                            *(
-                                segment["display_text"]
-                                for segment in accumulated_segments
-                            ),
-                            current_display_text,
-                        )
-                        if text
-                    )
-                committed = bool(committed_text)
+                committed = bool(current_text)
                 result = snapshot_result(
                     request,
                     committed=committed,
@@ -392,26 +353,21 @@ class MoonshineStreamingWorker:
                     force_update_ms=(force_done - force_started) * 1000,
                 )
                 result.update({
-                    "text": committed_text,
-                    "display_text": committed_display_text,
-                    "lines": committed_lines,
-                    "accumulated_segment_count": len(accumulated_segments),
-                    "segment_preserved": (
-                        request["commit_source"] == "silence"
-                        and bool(current_text)
+                    "text": current_text,
+                    "display_text": current_display_text,
+                    "lines": lines,
+                    "checkpoint_saved": (
+                        request["commit_source"] == "f7" and committed
                     ),
                 })
-                if request["commit_source"] != "silence" and committed:
+                if request["commit_source"] == "f8" and committed:
                     self.last_committed_sample_cursor = target
-                    accumulated_segments.clear()
-                speech_seen_since_commit = False
-                silence_samples = 0
-                self.dispatch(request["callback"], result, None)
-
                 stream.remove_listener(listener)
                 stream.close()
                 preview_lines.clear()
                 stream = self._new_stream(transcriber, listener)
+                stream_has_audio = False
+                self.dispatch(request["callback"], result, None)
 
             model_name, _arch_name = MOONSHINE_MODEL_BY_LANGUAGE[self.language]
             self.dispatch(self.on_ready, {
@@ -429,51 +385,16 @@ class MoonshineStreamingWorker:
                 if job[0] == "pcm":
                     _, pcm_audio, _start_cursor, end_cursor = job
                     pcm_samples = np.frombuffer(pcm_audio, dtype="<i2")
-                    rms = float(np.sqrt(np.mean(
-                        pcm_samples.astype(np.float32) ** 2
-                    )))
                     audio = pcm_samples.astype(np.float32)
                     audio /= 32768.0
                     stream.add_audio(audio.tolist(), SAMPLE_RATE)
                     with self.lock:
                         self.consumed_sample_cursor = end_cursor
-
-                    if rms >= self.auto_silence_rms_threshold:
-                        speech_seen_since_commit = True
-                        silence_samples = 0
-                    elif speech_seen_since_commit:
-                        silence_samples += len(pcm_samples)
-
-                    with self.lock:
-                        f8_pending = self.pending_f8_requests > 0
-                    if (
-                        self.on_auto_commit is not None
-                        and speech_seen_since_commit
-                        and silence_samples >= self.auto_silence_samples
-                        and not f8_pending
-                    ):
-                        with self.lock:
-                            request = {
-                                "target_sample_cursor": end_cursor,
-                                "queued_sample_cursor": end_cursor,
-                                "audio_drop_samples": self.audio_drop_samples,
-                                "max_backlog_samples": self.max_backlog_samples,
-                                "requested_at": time.perf_counter(),
-                                "callback": self.on_auto_commit,
-                                "commit_source": "silence",
-                            }
-                            self.audio_drop_samples = 0
-                            self.max_backlog_samples = 0
-                        active_request = request
-                        commit_snapshot(request)
-                        active_request = None
+                    stream_has_audio = True
                     continue
 
                 _, request = job
-                with self.lock:
-                    self.pending_f8_requests -= 1
                 active_request = request
-                request["commit_source"] = "f8"
                 commit_snapshot(request)
                 active_request = None
         except Exception as error:

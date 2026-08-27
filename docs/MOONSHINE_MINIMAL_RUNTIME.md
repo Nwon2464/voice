@@ -12,26 +12,32 @@ FFmpeg / PulseAudio monitor
   → transcript.lines mirror
   → 기존 INTERVIEWER 창
 
-F8
+F7 / F8 / F9
   → capture lock 안에서 absolute target cursor 기록
   → 같은 lock 안에서 snapshot request enqueue
   → worker가 target cursor까지 PCM을 순서대로 소비
   → FORCE UPDATE
   → transcript snapshot
-  → question text
-  → 기존 Codex/session/Answer 흐름
+  → 해당 stream의 정확한 transcript snapshot
+  → stream reset
 ```
+
+F7 checkpoint는 user-role `thread/inject_items`로 순서대로 주입한다. F8은
+이전 F7 주입이 모두 끝날 때까지 기다리며, 주입에 실패한 checkpoint만
+이전 context로 fallback한다. F8의 현재 질문에는 마지막 F7 이후 transcript만
+사용한다.
 
 ## 고정 사항
 
 - capture thread와 GTK thread에서는 Moonshine inference를 실행하지 않는다.
 - PCM은 capture에서 worker로 한 번만 전달한다.
 - cursor 단위는 16kHz absolute sample index다.
-- F8 target은 그 순간의 cursor이며 post-context를 추가하지 않는다.
+- F7/F8/F9 target은 그 순간의 cursor이며 post-context를 추가하지 않는다.
 - `captured == queued == consumed == target`일 때만 snapshot을 확정한다.
 - Preview는 500ms update interval의 `transcript.lines` mirror를 줄바꿈으로 표시한다.
 - 질문 text는 같은 snapshot의 non-empty line text를 공백으로 합친 값이다.
-- F8 확정 후 모델은 유지하고 stream만 새로 생성해 다음 질문 transcript와 분리한다.
+- F7/F8/F9 확정 후 모델은 유지하고 stream만 새로 생성한다.
+- 앱 수준 AUTO silence commit/reset은 사용하지 않는다. Moonshine built-in VAD는 유지한다.
 - word timestamp, boundary resolver, Whisper fallback은 이번 runtime에 연결하지 않는다.
 
 ## 계측
