@@ -585,6 +585,11 @@ class InterviewApp:
             return False
 
         if not result.get("committed", True):
+            if (
+                commit_source == "f8"
+                and self._recover_or_retry_empty_f8(result)
+            ):
+                return False
             self.answer_window.set_status("Waiting for question…")
             self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             append_log(self.log_path, {
@@ -602,6 +607,11 @@ class InterviewApp:
         elapsed = time.perf_counter() - commit_started
         latency_field = {"f8_to_question_ms": round(elapsed * 1000, 1)}
         if not question_text:
+            if (
+                commit_source == "f8"
+                and self._recover_or_retry_empty_f8(result)
+            ):
+                return False
             self.answer_window.set_status("No question detected")
             self.answer_window.set_response_status(RESPONSE_STATUS_READY)
             return False
@@ -698,6 +708,9 @@ class InterviewApp:
                 "status": "pending" if self.codex_enabled else "skipped",
                 "fallback_consumed": False,
                 "target_sample_cursor": result["target_sample_cursor"],
+                "promotion_status": "context_only",
+                "promoted_question_number": None,
+                "promoted_codex_generation": None,
             }
             self.checkpoint_context.append(checkpoint)
             self.last_commit_state = None
@@ -816,10 +829,152 @@ class InterviewApp:
         for callback in waiters:
             callback(list(checkpoint_fallbacks))
 
+    def _latest_recoverable_checkpoint(self):
+        checkpoints = getattr(self, "checkpoint_context", [])
+        if not checkpoints:
+            return None
+        checkpoint = checkpoints[-1]
+        if (
+            checkpoint.get("promotion_status", "context_only")
+            != "context_only"
+            or not checkpoint.get("text")
+        ):
+            return None
+        current = getattr(self, "last_commit_state", None)
+        if (
+            current is not None
+            and checkpoint["target_sample_cursor"]
+            <= current.get("target_sample_cursor", -1)
+        ):
+            return None
+        return checkpoint
+
+    def _retryable_commit_state(self):
+        base = getattr(self, "last_commit_state", None)
+        if not self._continuation_base_is_valid(base):
+            return None
+        generation = base.get("codex_generation")
+        if generation is None:
+            return None
+        if generation not in getattr(self, "codex_request_states", {}):
+            return None
+        return base
+
+    def _promote_checkpoint_question(self, checkpoint, result):
+        self.question_count += 1
+        question_number = self.question_count
+        question_text = checkpoint["text"]
+        context_index = len(self.conversation_context)
+        self.conversation_context.append(("INTERVIEWER", question_text))
+        commit_state = {
+            "commit_source": "f7_recovery",
+            "text": question_text,
+            "question_number": question_number,
+            "target_sample_cursor": checkpoint["target_sample_cursor"],
+            "conversation_context_index": context_index,
+            "codex_generation": None,
+            "checkpoint_sequence": checkpoint["sequence"],
+        }
+        self.last_commit_state = commit_state
+        checkpoint["promotion_status"] = "promoting"
+        checkpoint["promoted_question_number"] = question_number
+        self.remote_window.set_boundary_status(BOUNDARY_STATUS_F8)
+        append_log(self.log_path, {
+            "event": "question_promoted_from_checkpoint",
+            "question": question_number,
+            "commit_source": "f7_recovery",
+            "checkpoint_sequence": checkpoint["sequence"],
+            "checkpoint_status": checkpoint["status"],
+            "target_sample_cursor": checkpoint["target_sample_cursor"],
+            "f8_target_sample_cursor": result["target_sample_cursor"],
+        })
+        if self.codex_enabled:
+            def request_after_checkpoints(checkpoint_fallbacks):
+                generation = self._request_codex_answer(
+                    question_number,
+                    question_text,
+                    trigger="f8_recovery",
+                    checkpoint_fallbacks=checkpoint_fallbacks,
+                    current_question_prompt=(
+                        "The immediately preceding INTERVIEWER CONTEXT "
+                        "CHECKPOINT is the current interviewer question. "
+                        "Answer it now as the interview candidate."
+                    ),
+                )
+                commit_state["codex_generation"] = generation
+                checkpoint["promoted_codex_generation"] = generation
+                checkpoint["promotion_status"] = "current"
+                return generation
+
+            self._after_checkpoint_barrier(request_after_checkpoints)
+        else:
+            checkpoint["promotion_status"] = "current"
+            self.answer_window.set_status(
+                "Codex disabled · recovered question logged only"
+            )
+            append_log(self.log_path, {
+                "event": "codex_request_skipped",
+                "question": question_number,
+                "commit_source": "f7_recovery",
+                "reason": "disabled_for_audio_test",
+            })
+        return True
+
+    def _retry_current_question(self, base):
+        question_number = base["question_number"]
+        previous_generation = base["codex_generation"]
+
+        def request_after_checkpoints(checkpoint_fallbacks):
+            generation = self._request_codex_answer(
+                question_number,
+                base["text"],
+                supersedes_generation=previous_generation,
+                retry=True,
+                trigger="f8_retry",
+                checkpoint_fallbacks=checkpoint_fallbacks,
+            )
+            base["codex_generation"] = generation
+            checkpoint_sequence = base.get("checkpoint_sequence")
+            if checkpoint_sequence is not None:
+                checkpoint = next(
+                    (
+                        item
+                        for item in self.checkpoint_context
+                        if item["sequence"] == checkpoint_sequence
+                    ),
+                    None,
+                )
+                if checkpoint is not None:
+                    checkpoint["promoted_codex_generation"] = generation
+            append_log(self.log_path, {
+                "event": "question_retry",
+                "question": question_number,
+                "previous_generation": previous_generation,
+                "new_generation": generation,
+                "reason": "f8_no_new_transcript",
+            })
+            return generation
+
+        self._after_checkpoint_barrier(request_after_checkpoints)
+        return True
+
+    def _recover_or_retry_empty_f8(self, result):
+        checkpoint = self._latest_recoverable_checkpoint()
+        if checkpoint is not None:
+            return self._promote_checkpoint_question(checkpoint, result)
+        base = self._retryable_commit_state()
+        if base is not None:
+            return self._retry_current_question(base)
+        return False
+
     def _continuation_base_is_valid(self, base):
         if not base or not base.get("text"):
             return False
-        if base.get("commit_source") not in {"f8", "f9_continuation"}:
+        if base.get("commit_source") not in {
+            "f8",
+            "f9_continuation",
+            "f7_recovery",
+        }:
             return False
         if getattr(self, "last_commit_state", None) != base:
             return False
@@ -1007,8 +1162,10 @@ class InterviewApp:
         question_text,
         supersedes_generation=None,
         correction=None,
+        retry=False,
         trigger=None,
         checkpoint_fallbacks=None,
+        current_question_prompt=None,
     ):
         with self.codex_state_lock:
             context_end = len(self.conversation_context)
@@ -1030,7 +1187,7 @@ class InterviewApp:
 {context_text}
 
 CURRENT INTERVIEWER QUESTION:
-{question_text}
+{current_question_prompt or question_text}
 """
         self.codex_request_count += 1
         request_number = self.codex_request_count
@@ -1109,15 +1266,38 @@ PREVIOUS INCOMPLETE QUESTION:
 {correction["previous_text"]}
 
 {prompt}"""
+        elif retry:
+            prompt = f"""RETRY ANSWER:
+
+The previous generated answer was NOT SPOKEN by the candidate.
+Ignore it and generate a new answer.
+
+Answer the most recent interviewer question or request directly as the interview candidate.
+
+Priority:
+
+1. If the current interviewer transcript contains a clear question or request, answer it directly.
+
+2. If the latest transcript is conversational, incomplete, phrased indirectly, or does not contain an explicit question, infer the interviewer's likely intended question from the immediately preceding interviewer context and checkpoints, then answer that inferred intent.
+
+3. Only if the intended question genuinely cannot be determined should you ask for clarification.
+
+Do not respond with conversational acknowledgements such as "That's interesting.", "Really?", "That sounds great.", "I can see why...", or similar interviewer-style reactions.
+Do not mention that this is a retry.
+Do not explain your reasoning.
+Respond as the interview candidate.
+
+{prompt}"""
         pending_response_status = (
             RESPONSE_STATUS_UPDATING
-            if correction is not None
+            if correction is not None or retry
             else RESPONSE_STATUS_THINKING
         )
         self.answer_window.set_response_status(pending_response_status)
         self.answer_window.set_status("Thinking…")
-        if superseded or correction is not None:
-            remove_completed = correction is not None and any(
+        if superseded or correction is not None or retry:
+            replace_previous_answer = correction is not None or retry
+            remove_completed = replace_previous_answer and any(
                 item["generation"] == supersedes_generation
                 and item["previous_status"] == "completed"
                 for item in superseded
@@ -1132,7 +1312,7 @@ PREVIOUS INCOMPLETE QUESTION:
             else:
                 discard_before = self._answer_ui_snapshot()
                 discard(remove_completed=remove_completed)
-                if correction is not None:
+                if replace_previous_answer:
                     prepare_alignment = getattr(
                         self.answer_window,
                         "prepare_corrected_answer_alignment",
@@ -1166,6 +1346,7 @@ PREVIOUS INCOMPLETE QUESTION:
             "checkpoint_fallback_items": len(checkpoint_fallbacks or []),
             "superseded_requests": len(superseded),
             "correction": correction is not None,
+            "retry": retry,
             "supersedes_generation": supersedes_generation,
         })
 

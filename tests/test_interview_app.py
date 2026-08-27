@@ -173,6 +173,29 @@ class _FakeAnswerWindow:
         self.stream = text
 
 
+class _ReplacementAnswerWindow(_FakeAnswerWindow):
+    def __init__(self):
+        super().__init__()
+        self.answer_history = []
+        self.discard_calls = []
+        self.prepare_alignment_calls = 0
+
+    def set_text(self, text):
+        super().set_text(text)
+        if text:
+            self.answer_history.append(text)
+
+    def discard_current_answer(self, *, remove_completed=False):
+        self.discard_calls.append(remove_completed)
+        if remove_completed and self.answer_history:
+            self.answer_history.pop()
+        self.text = ""
+        self.stream = ""
+
+    def prepare_corrected_answer_alignment(self):
+        self.prepare_alignment_calls += 1
+
+
 class _FocusTextIter:
     def __init__(self, offset):
         self.offset = offset
@@ -1762,6 +1785,27 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             "force_update_ms": 2.0,
         }
 
+    @classmethod
+    def _empty_result(cls, cursor):
+        result = cls._result("", cursor)
+        result["committed"] = False
+        return result
+
+    @staticmethod
+    def _finish_job(job, text="answer", error=None):
+        result = None
+        if error is None:
+            result = {
+                "text": text,
+                "elapsed": 0.1,
+                "first_token_seconds": 0.05,
+                "first_visible_seconds": 0.05,
+                "stream_delta_count": 1,
+                "thread_id": "thread-test",
+                "turn_id": "turn-test",
+            }
+        job["callback"](result, error)
+
     @staticmethod
     def _app(codex_enabled=False, log_path=None):
         app = interview_app.InterviewApp.__new__(interview_app.InterviewApp)
@@ -2050,6 +2094,361 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
         self.assertEqual(len(app.codex_worker.jobs), 1)
         prompt = app.codex_worker.jobs[0]["prompt"]
         self.assertIn(f"CURRENT INTERVIEWER QUESTION:\n{current}", prompt)
+
+    def test_normal_f7_then_new_speech_f8_is_not_checkpoint_recovery(self):
+        app = self._app(codex_enabled=True)
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result("context before question", 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        app.codex_worker.inject_jobs[0]["callback"]({"item_count": 1}, None)
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result("What did you build next?", 20_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(app.last_commit_state["commit_source"], "f8")
+        self.assertEqual(
+            app.checkpoint_context[0]["promotion_status"],
+            "context_only",
+        )
+        self.assertIn(
+            "CURRENT INTERVIEWER QUESTION:\nWhat did you build next?",
+            app.codex_worker.jobs[0]["prompt"],
+        )
+
+    def test_empty_f8_promotes_latest_injected_checkpoint_without_resending_text(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            app = self._app(
+                codex_enabled=True,
+                log_path=Path(directory) / "session.jsonl",
+            )
+            question = "Tell me about the hardest pipeline challenge."
+            app._moonshine_checkpoint_ready(
+                time.perf_counter(),
+                {
+                    **self._result(question, 10_000),
+                    "checkpoint_saved": True,
+                },
+                None,
+            )
+            app.codex_worker.inject_jobs[0]["callback"](
+                {"item_count": 1},
+                None,
+            )
+
+            app._moonshine_question_ready(
+                None,
+                time.perf_counter(),
+                self._empty_result(10_000),
+                None,
+                commit_source="f8",
+            )
+
+            self.assertEqual(app.question_count, 1)
+            self.assertEqual(app.last_commit_state["text"], question)
+            self.assertEqual(
+                app.last_commit_state["commit_source"],
+                "f7_recovery",
+            )
+            self.assertEqual(
+                app.checkpoint_context[0]["promotion_status"],
+                "current",
+            )
+            self.assertEqual(len(app.codex_worker.jobs), 1)
+            prompt = app.codex_worker.jobs[0]["prompt"]
+            self.assertNotIn(question, prompt)
+            self.assertIn(
+                "immediately preceding INTERVIEWER CONTEXT CHECKPOINT",
+                prompt,
+            )
+            self._finish_job(app.codex_worker.jobs[0])
+            self.assertEqual(
+                app.codex_request_states[1]["status"],
+                "completed",
+            )
+            events = [
+                json.loads(line)
+                for line in app.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            promoted = next(
+                event
+                for event in events
+                if event["event"] == "question_promoted_from_checkpoint"
+            )
+            self.assertEqual(promoted["checkpoint_sequence"], 1)
+            self.assertEqual(promoted["question"], 1)
+
+    def test_empty_f8_waits_for_pending_checkpoint_injection_before_recovery(self):
+        app = self._app(codex_enabled=True)
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result("Why should we hire you?", 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._empty_result(10_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.codex_worker.jobs, [])
+        self.assertEqual(len(app.checkpoint_barrier_waiters), 1)
+        self.assertEqual(
+            app.checkpoint_context[0]["promotion_status"],
+            "promoting",
+        )
+        app.codex_worker.inject_jobs[0]["callback"]({"item_count": 1}, None)
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        self.assertEqual(
+            app.checkpoint_context[0]["promotion_status"],
+            "current",
+        )
+
+    def test_empty_f8_recovery_uses_failed_checkpoint_fallback(self):
+        app = self._app(codex_enabled=True)
+        question = "Describe a difficult migration."
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result(question, 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        checkpoint = app.checkpoint_context[0]
+        app.codex_worker.inject_jobs[0]["callback"](
+            None,
+            RuntimeError("inject failed"),
+        )
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._empty_result(10_000),
+            None,
+            commit_source="f8",
+        )
+
+        prompt = app.codex_worker.jobs[0]["prompt"]
+        self.assertEqual(prompt.count(question), 1)
+        self.assertIn(interview_app.INTERVIEW_CHECKPOINT_MARKER, prompt)
+        self.assertFalse(checkpoint["fallback_consumed"])
+        self._finish_job(app.codex_worker.jobs[0])
+        self.assertTrue(checkpoint["fallback_consumed"])
+
+    def test_empty_f8_retries_same_completed_question_and_supersedes_generation(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            app = self._app(
+                codex_enabled=True,
+                log_path=Path(directory) / "session.jsonl",
+            )
+            question = "And the migration?"
+            self._commit(app, 1, question, 10_000, "f8")
+            first_job = app.codex_worker.jobs[0]
+            first_job["on_start"]()
+            self._finish_job(first_job, "That sounds interesting.")
+
+            app._moonshine_question_ready(
+                None,
+                time.perf_counter(),
+                self._empty_result(10_000),
+                None,
+                commit_source="f8",
+            )
+
+            self.assertEqual(app.question_count, 1)
+            self.assertEqual(app.last_commit_state["question_number"], 1)
+            self.assertEqual(app.last_commit_state["codex_generation"], 2)
+            self.assertEqual(app.codex_request_states[1]["status"], "superseded")
+            self.assertFalse(app.codex_request_states[1]["spoken"])
+            retry_prompt = app.codex_worker.jobs[1]["prompt"]
+            self.assertIn("RETRY ANSWER:", retry_prompt)
+            self.assertIn("previous generated answer was NOT SPOKEN", retry_prompt)
+            self.assertIn(
+                f"CURRENT INTERVIEWER QUESTION:\n{question}",
+                retry_prompt,
+            )
+            self.assertIn("infer the interviewer's likely intended question", retry_prompt)
+            self.assertNotIn("previous interviewer question was incomplete", retry_prompt)
+            events = [
+                json.loads(line)
+                for line in app.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            retry_event = next(
+                event for event in events if event["event"] == "question_retry"
+            )
+            self.assertEqual(retry_event["previous_generation"], 1)
+            self.assertEqual(retry_event["new_generation"], 2)
+
+    def test_retry_replaces_completed_visible_answer_instead_of_appending(self):
+        app = self._app(codex_enabled=True)
+        app.answer_window = _ReplacementAnswerWindow()
+        self._commit(app, 1, "Why this company?", 10_000, "f8")
+        first_job = app.codex_worker.jobs[0]
+        first_job["on_start"]()
+        self._finish_job(first_job, "Old acknowledgement")
+        self.assertEqual(app.answer_window.answer_history, ["Old acknowledgement"])
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._empty_result(10_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.answer_window.discard_calls, [True])
+        self.assertEqual(app.answer_window.answer_history, [])
+        self.assertEqual(app.answer_window.prepare_alignment_calls, 1)
+        second_job = app.codex_worker.jobs[1]
+        second_job["on_start"]()
+        self._finish_job(second_job, "Direct replacement answer")
+        self.assertEqual(
+            app.answer_window.answer_history,
+            ["Direct replacement answer"],
+        )
+
+    def test_recovered_checkpoint_empty_f8_again_retries_not_repromotes(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            app = self._app(
+                codex_enabled=True,
+                log_path=Path(directory) / "session.jsonl",
+            )
+            app._moonshine_checkpoint_ready(
+                time.perf_counter(),
+                {
+                    **self._result("What was the outcome?", 10_000),
+                    "checkpoint_saved": True,
+                },
+                None,
+            )
+            app.codex_worker.inject_jobs[0]["callback"]({"item_count": 1}, None)
+            empty = self._empty_result(10_000)
+            app._moonshine_question_ready(
+                None, time.perf_counter(), empty, None, commit_source="f8"
+            )
+            self._finish_job(app.codex_worker.jobs[0], "First answer")
+
+            app._moonshine_question_ready(
+                None, time.perf_counter(), empty, None, commit_source="f8"
+            )
+
+            self.assertEqual(app.question_count, 1)
+            self.assertEqual(len(app.codex_worker.jobs), 2)
+            self.assertIn("RETRY ANSWER:", app.codex_worker.jobs[1]["prompt"])
+            events = [
+                json.loads(line)
+                for line in app.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                sum(
+                    event["event"] == "question_promoted_from_checkpoint"
+                    for event in events
+                ),
+                1,
+            )
+            self.assertEqual(
+                sum(event["event"] == "question_retry" for event in events),
+                1,
+            )
+
+    def test_f9_can_continue_a_question_promoted_from_checkpoint(self):
+        app = self._app(codex_enabled=False)
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result("How did you", 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._empty_result(10_000),
+            None,
+            commit_source="f8",
+        )
+
+        self._continue(app, "resolve that incident?", 20_000)
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(
+            app.conversation_context,
+            [("INTERVIEWER", "How did you resolve that incident?")],
+        )
+        self.assertEqual(
+            app.last_commit_state["commit_source"],
+            "f9_continuation",
+        )
+
+    def test_failed_accidental_f7_codex_turn_remains_retryable(self):
+        app = self._app(codex_enabled=True)
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result("Tell me about a conflict.", 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        checkpoint = app.checkpoint_context[0]
+        app.codex_worker.inject_jobs[0]["callback"](
+            None,
+            RuntimeError("inject failed"),
+        )
+        empty = self._empty_result(10_000)
+        app._moonshine_question_ready(
+            None, time.perf_counter(), empty, None, commit_source="f8"
+        )
+        first_job = app.codex_worker.jobs[0]
+        first_job["on_start"]()
+        self._finish_job(first_job, error=RuntimeError("Codex failed"))
+
+        self.assertFalse(checkpoint["fallback_consumed"])
+        self.assertEqual(app.codex_request_states[1]["status"], "failed")
+        app._moonshine_question_ready(
+            None, time.perf_counter(), empty, None, commit_source="f8"
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(len(app.codex_worker.jobs), 2)
+        self.assertIn("RETRY ANSWER:", app.codex_worker.jobs[1]["prompt"])
+        self.assertIn(checkpoint["text"], app.codex_worker.jobs[1]["prompt"])
+        self.assertFalse(checkpoint["fallback_consumed"])
+
+    def test_empty_f8_without_checkpoint_or_current_question_stays_suppressed(self):
+        app = self._app(codex_enabled=True)
+        app.asr_worker = SimpleNamespace(last_committed_sample_cursor=0)
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._empty_result(0),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 0)
+        self.assertEqual(app.codex_worker.jobs, [])
+        self.assertIsNone(app.last_commit_state)
+        self.assertEqual(app.answer_window.status, "Waiting for question…")
 
     def test_moonshine_ready_sets_listening_boundary_status(self):
         app = self._app()
