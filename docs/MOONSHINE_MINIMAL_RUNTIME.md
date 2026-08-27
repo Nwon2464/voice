@@ -62,7 +62,7 @@ F7 checkpoint는 user-role `thread/inject_items`로 순서대로 주입한다. F
 - `interview_app.py`: 기존 capture/F8/INTERVIEWER 창/Codex 흐름과 worker 연결
 - `tests/test_moonshine_streaming_worker.py`: worker 순서, barrier, snapshot과 stream reset 검증
 - `tests/test_interview_app.py`: raw PCM 단일 전달, atomic F8 cursor, 질문/Codex 단일 commit 검증
-- `requirements.txt`: `moonshine-voice==0.0.69`
+- `requirements.txt`: `moonshine-voice==0.1.5`
 
 ## 현재 의도적으로 제외한 것
 

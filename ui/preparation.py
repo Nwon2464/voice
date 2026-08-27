@@ -3,6 +3,7 @@
 import os
 import sys
 import threading
+from importlib import metadata
 from pathlib import Path
 
 from codex_app_server import CodexAppServerClient
@@ -46,11 +47,15 @@ STT_PRESENTATION = {
     },
     "ja": {
         "language": "Japanese",
-        "title": "Moonshine Base",
-        "model": "base-ja",
-        "mode": "Base ASR",
+        "title": "Moonshine Small Streaming",
+        "model": "small-streaming-ja",
+        "mode": "Streaming ASR",
     },
 }
+try:
+    MOONSHINE_VOICE_VERSION = metadata.version("moonshine-voice")
+except metadata.PackageNotFoundError:
+    MOONSHINE_VOICE_VERSION = "unknown"
 APP_MODE_TITLES = {
     "normal": "Normal Interview",
     "performance": "Performance Test",
@@ -140,6 +145,15 @@ def model_supports_fast(model):
 
 def stt_presentation(language):
     return STT_PRESENTATION.get(language, STT_PRESENTATION["en"])
+
+
+def stt_model_detail(language):
+    presentation = stt_presentation(language)
+    return (
+        f"model: {presentation['model']}  ·  "
+        f"moonshine-voice {MOONSHINE_VOICE_VERSION}  ·  "
+        f"{presentation['mode']}"
+    )
 
 
 def runtime_options(environment=None):
@@ -1550,13 +1564,12 @@ class PreparationDialog(Gtk.Dialog):
     def _update_stt_model_info(self, language):
         presentation = stt_presentation(language)
         self.stt_model_title.set_text(presentation["title"])
-        self.stt_model_detail.set_text(
-            f"model: {presentation['model']}  ·  {presentation['mode']}"
-        )
+        self.stt_model_detail.set_text(stt_model_detail(language))
         self.stt_summary_label.set_text(stt_status_summary(language))
         self.stt_summary_label.set_tooltip_text(
             f"{presentation['title']}\n"
             f"model: {presentation['model']}\n"
+            f"moonshine-voice {MOONSHINE_VOICE_VERSION}\n"
             f"{presentation['mode']}"
         )
         if hasattr(self, "runtime_summary_label"):

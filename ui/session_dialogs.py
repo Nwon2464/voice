@@ -55,7 +55,7 @@ def session_list_row(session):
 
 
 def stt_status_summary(language):
-    return "JA · Base" if language == "ja" else "EN · Streaming"
+    return "JA · Streaming" if language == "ja" else "EN · Streaming"
 
 
 def initial_session_settings(environment=None):

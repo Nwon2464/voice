@@ -115,6 +115,7 @@ from ui.preparation import (
     PREPARATION_CONVERSATION_RATIO,
     PREPARATION_MESSAGE_MARKER,
     STT_PRESENTATION,
+    MOONSHINE_VOICE_VERSION,
     PreparationDialog,
     can_start_interview,
     context_display_name,
@@ -130,6 +131,7 @@ from ui.preparation import (
     preparation_runtime_summary,
     preparation_section,
     runtime_options,
+    stt_model_detail,
     stt_presentation,
 )
 from ui.session_dialogs import (

@@ -3,7 +3,7 @@
 화상면접에서 상대방의 시스템 출력 음성을 실시간으로 자막화하고, 질문이 끝나면 Codex가 바로 말할 수 있는 답변 초안을 보여주는 Linux GNOME용 도구입니다.
 
 - 영어/일본어 면접 음성을 지원하며, Preparation 화면에서 언어를 선택합니다.
-- 영어는 Moonshine Small Streaming, 일본어는 Moonshine Base 모델로 실시간 자막화합니다.
+- 영어와 일본어 모두 Moonshine Small Streaming 모델로 실시간 자막화합니다.
 - F7은 현재 transcript를 context checkpoint로 주입하고 새 ASR stream을 시작합니다.
 - F8은 마지막 F7 이후 transcript만 새 질문으로 확정합니다.
 - F9으로 직전 질문에 이어진 발화를 합쳐 질문을 교정합니다.
@@ -34,7 +34,7 @@ Codex CLI 설치와 로그인이 완료되어 있어야 합니다.
 | 언어 | Moonshine 모델 |
 |---|---|
 | English | `small-streaming-en` / `SMALL_STREAMING` |
-| Japanese | `base-ja` / `BASE` |
+| Japanese | `small-streaming-ja` / `SMALL_STREAMING` |
 
 일본어는 비라틴 문자에서 필요한 token rate를 확보하기 위해 `max_tokens_per_second=13.0`을 사용합니다.
 

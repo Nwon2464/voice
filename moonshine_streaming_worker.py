@@ -15,7 +15,7 @@ UPDATE_INTERVAL_SECONDS = 0.5
 STOP_JOIN_TIMEOUT_SECONDS = 5.0
 MOONSHINE_MODEL_BY_LANGUAGE = {
     "en": ("small-streaming-en", "SMALL_STREAMING"),
-    "ja": ("base-ja", "BASE"),
+    "ja": ("small-streaming-ja", "SMALL_STREAMING"),
 }
 def transcript_lines_snapshot(transcript) -> list[dict]:
     """Copy Moonshine transcript lines before the native snapshot is released."""

@@ -122,7 +122,7 @@ def create_app_session(test_logging=None, benchmark_type=None):
 
 def moonshine_asr_backend(language):
     return (
-        "moonshine-base-ja"
+        "moonshine-small-streaming-ja"
         if language == "ja"
         else "moonshine-small-streaming"
     )
@@ -281,7 +281,9 @@ class InterviewApp:
                 live_codex_settings,
             )
         model_label = (
-            "Moonshine Small" if self.stt_language == "en" else "Moonshine Base JA"
+            "Moonshine Small Streaming EN"
+            if self.stt_language == "en"
+            else "Moonshine Small Streaming JA"
         )
         self.remote_window.set_status(f"{model_label} loading…")
         self.asr_worker.start()

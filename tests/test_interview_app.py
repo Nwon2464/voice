@@ -544,7 +544,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
 
         self.assertEqual(row, (
             "Backend Interview",
-            "JA · Base",
+            "JA · Streaming",
             "2026-08-11 09:15",
             "session-123",
         ))
@@ -651,10 +651,24 @@ class CodexLatestOnlyTest(unittest.TestCase):
         })
         self.assertEqual(interview_app.stt_presentation("ja"), {
             "language": "Japanese",
-            "title": "Moonshine Base",
-            "model": "base-ja",
-            "mode": "Base ASR",
+            "title": "Moonshine Small Streaming",
+            "model": "small-streaming-ja",
+            "mode": "Streaming ASR",
         })
+
+    def test_stt_model_detail_includes_moonshine_package_version(self):
+        self.assertEqual(
+            interview_app.stt_model_detail("en"),
+            "model: small-streaming-en  ·  "
+            f"moonshine-voice {interview_app.MOONSHINE_VOICE_VERSION}  ·  "
+            "Streaming ASR",
+        )
+        self.assertEqual(
+            interview_app.stt_model_detail("ja"),
+            "model: small-streaming-ja  ·  "
+            f"moonshine-voice {interview_app.MOONSHINE_VOICE_VERSION}  ·  "
+            "Streaming ASR",
+        )
 
     def test_context_scope_and_status_have_distinct_style_classes(self):
         self.assertEqual(
@@ -690,7 +704,10 @@ class CodexLatestOnlyTest(unittest.TestCase):
 
     def test_preparation_status_summaries_reflect_context_and_stt(self):
         self.assertEqual(interview_app.stt_status_summary("en"), "EN · Streaming")
-        self.assertEqual(interview_app.stt_status_summary("ja"), "JA · Base")
+        self.assertEqual(
+            interview_app.stt_status_summary("ja"),
+            "JA · Streaming",
+        )
         self.assertEqual(
             interview_app.context_status_summary([{"status": "SYNCED"}]),
             ("● Context Synced", "status-synced"),
@@ -720,7 +737,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertEqual(
             interview_app.preparation_runtime_summary(diagnostic, "ja"),
             "Mode: STT Diagnostic  ·  Codex: Off  ·  Logging: On  ·  "
-            "STT: Japanese / base-ja",
+            "STT: Japanese / small-streaming-ja",
         )
 
     def test_effective_contexts_keep_scope_name_file_and_path_for_ui(self):
@@ -2109,7 +2126,7 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             self.assertEqual(len(asr_events), 4)
             self.assertEqual(
                 {event["asr_backend"] for event in asr_events},
-                {"moonshine-base-ja"},
+                {"moonshine-small-streaming-ja"},
             )
 
     def test_empty_and_duplicate_f8_do_not_consume_question_number(self):

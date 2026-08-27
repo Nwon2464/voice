@@ -138,10 +138,10 @@ class MoonshineStreamingWorkerTests(unittest.TestCase):
             max_tokens_per_second=None,
         )
 
-    def test_japanese_uses_base_model_arch(self):
+    def test_japanese_uses_small_streaming_model_arch(self):
         self._assert_default_model_selection(
             language="ja",
-            arch_name="BASE",
+            arch_name="SMALL_STREAMING",
             max_tokens_per_second="13.0",
         )
 
