@@ -9,6 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import interview_app
+from codex import worker as codex_worker_module
+from interview import controller as controller_module
+from ui import preparation as preparation_module
+from ui import session_dialogs as session_dialogs_module
 from context_manager import (
     CONTEXT_STATUS_CHANGED,
     CONTEXT_STATUS_SYNCED,
@@ -397,7 +401,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
     def test_worker_interrupts_active_and_runs_only_newest_pending_turn(self):
         callbacks = []
         with patch.object(
-            interview_app,
+            codex_worker_module,
             "CodexAppServerClient",
             _LatestOnlyCodexClient,
         ), patch.object(
@@ -448,7 +452,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
                 return super().run_turn(prompt, **kwargs)
 
         with patch.object(
-            interview_app,
+            codex_worker_module,
             "CodexAppServerClient",
             OrderedClient,
         ), patch.object(
@@ -550,7 +554,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
         store = SimpleNamespace(active=lambda: [])
 
         with patch.object(
-            interview_app,
+            session_dialogs_module,
             "SessionChooserDialog",
             return_value=dialog,
         ):
@@ -591,7 +595,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
         ]
 
         with patch.object(
-            interview_app,
+            session_dialogs_module,
             "_archive_session",
             side_effect=[RuntimeError("failed"), None],
         ) as archive_session:
@@ -946,7 +950,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
             args=args
         )
         with patch.object(
-            interview_app,
+            preparation_module,
             "_new_codex_client",
             return_value=ReadClient(),
         ), patch.object(
@@ -1109,7 +1113,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
         dialog._show_context_error = lambda *_args, **_kwargs: captured.update(
             error=True
         )
-        with patch.object(interview_app, "InterviewThreadBackend", FakeBackend), \
+        with patch.object(preparation_module, "InterviewThreadBackend", FakeBackend), \
              patch.object(interview_app.threading, "Thread", _ImmediateThread), \
              patch.object(
                  interview_app.GLib,
@@ -1160,7 +1164,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
             captured.update(title=title, detail=detail)
         )
         with patch.object(
-            interview_app,
+            preparation_module,
             "InterviewThreadBackend",
             FailingBackend,
         ), patch.object(
@@ -1323,7 +1327,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
             )
         )
         with patch.object(
-            interview_app,
+            preparation_module,
             "_new_codex_client",
             return_value=CatalogClient(),
         ), patch.object(
@@ -1486,7 +1490,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
         completed = []
         done = threading.Event()
         with patch.object(
-            interview_app,
+            codex_worker_module,
             "CodexAppServerClient",
             _RecoveryCodexClient,
         ), patch.object(
@@ -1537,7 +1541,7 @@ class CodexLatestOnlyTest(unittest.TestCase):
         completed = []
         recovery_events = []
         with patch.object(
-            interview_app,
+            codex_worker_module,
             "CodexAppServerClient",
             _RecoveryCodexClient,
         ), patch.object(
@@ -2372,10 +2376,10 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
             second.trigger_lock_file = None
             second.socket_thread = None
 
-            with patch.object(interview_app, "RUNTIME_DIR", runtime_dir), \
-                    patch.object(interview_app, "TRIGGER_SOCKET", socket_path), \
+            with patch.object(controller_module, "RUNTIME_DIR", runtime_dir), \
+                    patch.object(controller_module, "TRIGGER_SOCKET", socket_path), \
                     patch.object(
-                        interview_app,
+                        controller_module,
                         "TRIGGER_LOCK_PATH",
                         lock_path,
                     ), patch.object(
@@ -2471,7 +2475,7 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
         dialog._ensure_background_state()
 
         with patch.object(
-            interview_app,
+            preparation_module,
             "_new_codex_client",
             return_value=client,
         ), patch.object(
@@ -2495,10 +2499,10 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
 
     def test_jsonl_session_log_uses_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
-            interview_app,
+            controller_module,
             "APP_DIR",
             Path(directory),
-        ), patch.object(interview_app, "TEST_LOGGING", True):
+        ), patch.object(controller_module, "TEST_LOGGING", True):
             session_dir, log_path = interview_app.create_app_session()
 
             self.assertEqual(session_dir.stat().st_mode & 0o777, 0o700)
@@ -2506,10 +2510,10 @@ class RuntimeLifecycleRegressionTest(unittest.TestCase):
 
     def test_benchmark_session_log_directory_includes_benchmark_type(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
-            interview_app,
+            controller_module,
             "APP_DIR",
             Path(directory),
-        ), patch.object(interview_app, "TEST_LOGGING", True), patch.dict(
+        ), patch.object(controller_module, "TEST_LOGGING", True), patch.dict(
             interview_app.os.environ,
             {"INTERVIEW_BENCHMARK_TYPE": "benchmark_a"},
             clear=False,
