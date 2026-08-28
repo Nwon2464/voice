@@ -48,6 +48,7 @@ CONFIG_DIR = Path(
 WINDOW_STATE_PATH = CONFIG_DIR / "window_state.json"
 SESSION_STORE_PATH = CONFIG_DIR / "sessions.json"
 ENTER_DEBOUNCE_MS = 300
+F8_CHECKPOINT_RECOVERY_MAX_SECONDS = 2.0
 TEST_LOGGING = os.environ.get("INTERVIEW_TEST_LOG", "0") != "0"
 TEST_LABEL = os.environ.get("INTERVIEW_TEST_LABEL")
 LOG_WRITE_LOCK = threading.Lock()
@@ -584,10 +585,26 @@ class InterviewApp:
             })
             return False
 
+        checkpoint = self._latest_recoverable_checkpoint()
+        if (
+            commit_source == "f8"
+            and checkpoint is not None
+            and self._is_f8_within_checkpoint_recovery_window(
+                checkpoint,
+                commit_started,
+            )
+        ):
+            self._promote_checkpoint_question(
+                checkpoint,
+                result,
+                trailing_fragment=result.get("text", "").strip() or None,
+            )
+            return False
+
         if not result.get("committed", True):
             if (
                 commit_source == "f8"
-                and self._recover_or_retry_empty_f8(result)
+                and self._retry_empty_f8()
             ):
                 return False
             self.answer_window.set_status("Waiting for question…")
@@ -609,7 +626,7 @@ class InterviewApp:
         if not question_text:
             if (
                 commit_source == "f8"
-                and self._recover_or_retry_empty_f8(result)
+                and self._retry_empty_f8()
             ):
                 return False
             self.answer_window.set_status("No question detected")
@@ -708,6 +725,7 @@ class InterviewApp:
                 "status": "pending" if self.codex_enabled else "skipped",
                 "fallback_consumed": False,
                 "target_sample_cursor": result["target_sample_cursor"],
+                "triggered_at": commit_started,
                 "promotion_status": "context_only",
                 "promoted_question_number": None,
                 "promoted_codex_generation": None,
@@ -849,6 +867,19 @@ class InterviewApp:
             return None
         return checkpoint
 
+    def _is_f8_within_checkpoint_recovery_window(
+        self,
+        checkpoint,
+        f8_triggered_at,
+    ):
+        checkpoint_triggered_at = checkpoint.get("triggered_at")
+        if checkpoint_triggered_at is None:
+            return False
+        trigger_gap = f8_triggered_at - checkpoint_triggered_at
+        return (
+            0 <= trigger_gap <= F8_CHECKPOINT_RECOVERY_MAX_SECONDS
+        )
+
     def _retryable_commit_state(self):
         base = getattr(self, "last_commit_state", None)
         if not self._continuation_base_is_valid(base):
@@ -860,7 +891,12 @@ class InterviewApp:
             return None
         return base
 
-    def _promote_checkpoint_question(self, checkpoint, result):
+    def _promote_checkpoint_question(
+        self,
+        checkpoint,
+        result,
+        trailing_fragment=None,
+    ):
         self.question_count += 1
         question_number = self.question_count
         question_text = checkpoint["text"]
@@ -874,6 +910,7 @@ class InterviewApp:
             "conversation_context_index": context_index,
             "codex_generation": None,
             "checkpoint_sequence": checkpoint["sequence"],
+            "recovery_trailing_fragment": trailing_fragment,
         }
         self.last_commit_state = commit_state
         checkpoint["promotion_status"] = "promoting"
@@ -887,19 +924,27 @@ class InterviewApp:
             "checkpoint_status": checkpoint["status"],
             "target_sample_cursor": checkpoint["target_sample_cursor"],
             "f8_target_sample_cursor": result["target_sample_cursor"],
+            "trailing_fragment": trailing_fragment,
         })
         if self.codex_enabled:
             def request_after_checkpoints(checkpoint_fallbacks):
+                current_question_prompt = (
+                    "The immediately preceding INTERVIEWER CONTEXT "
+                    "CHECKPOINT is the current interviewer utterance. "
+                    "Respond to it now naturally as the interview candidate."
+                )
+                if trailing_fragment:
+                    current_question_prompt += (
+                        "\n\nPOST-CHECKPOINT TRAILING TRANSCRIPT "
+                        "(context only, not a separate question):\n"
+                        f"{trailing_fragment}"
+                    )
                 generation = self._request_codex_answer(
                     question_number,
                     question_text,
                     trigger="f8_recovery",
                     checkpoint_fallbacks=checkpoint_fallbacks,
-                    current_question_prompt=(
-                        "The immediately preceding INTERVIEWER CONTEXT "
-                        "CHECKPOINT is the current interviewer question. "
-                        "Answer it now as the interview candidate."
-                    ),
+                    current_question_prompt=current_question_prompt,
                 )
                 commit_state["codex_generation"] = generation
                 checkpoint["promoted_codex_generation"] = generation
@@ -958,10 +1003,7 @@ class InterviewApp:
         self._after_checkpoint_barrier(request_after_checkpoints)
         return True
 
-    def _recover_or_retry_empty_f8(self, result):
-        checkpoint = self._latest_recoverable_checkpoint()
-        if checkpoint is not None:
-            return self._promote_checkpoint_question(checkpoint, result)
+    def _retry_empty_f8(self):
         base = self._retryable_commit_state()
         if base is not None:
             return self._retry_current_question(base)
@@ -1278,11 +1320,13 @@ Priority:
 
 1. If the current interviewer transcript contains a clear question or request, answer it directly.
 
-2. If the latest transcript is conversational, incomplete, phrased indirectly, or does not contain an explicit question, infer the interviewer's likely intended question from the immediately preceding interviewer context and checkpoints, then answer that inferred intent.
+2. If the question is indirect but reasonably inferable from the immediately preceding interviewer context and checkpoints, infer the interviewer's likely intended question and answer that inferred intent.
 
-3. Only if the intended question genuinely cannot be determined should you ask for clarification.
+3. If there is genuinely no question or request, respond naturally to the interviewer.
 
-Do not respond with conversational acknowledgements such as "That's interesting.", "Really?", "That sounds great.", "I can see why...", or similar interviewer-style reactions.
+4. Only ask for clarification when it is clear that an answer is expected but the intended question cannot reasonably be determined.
+
+Do not default to a conversational acknowledgement when there is a clear or reasonably inferable interviewer question or request. If there is genuinely no question or request, respond naturally to the interviewer.
 Do not mention that this is a retry.
 Do not explain your reasoning.
 Respond as the interview candidate.

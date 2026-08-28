@@ -1941,6 +1941,9 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             job["items"][0]["role"] == "user"
             for job in app.codex_worker.inject_jobs
         ))
+        app.checkpoint_context[-1]["triggered_at"] -= (
+            controller_module.F8_CHECKPOINT_RECOVERY_MAX_SECONDS + 0.1
+        )
 
         current_question = "post checkpoint question"
         app._moonshine_question_ready(
@@ -2106,11 +2109,14 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             None,
         )
         app.codex_worker.inject_jobs[0]["callback"]({"item_count": 1}, None)
+        app.checkpoint_context[0]["triggered_at"] -= (
+            controller_module.F8_CHECKPOINT_RECOVERY_MAX_SECONDS + 0.1
+        )
 
         app._moonshine_question_ready(
             None,
             time.perf_counter(),
-            self._result("What did you build next?", 20_000),
+            self._result("Describe the next system you built.", 18_000),
             None,
             commit_source="f8",
         )
@@ -2122,8 +2128,88 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             "context_only",
         )
         self.assertIn(
-            "CURRENT INTERVIEWER QUESTION:\nWhat did you build next?",
+            "CURRENT INTERVIEWER QUESTION:\n"
+            "Describe the next system you built.",
             app.codex_worker.jobs[0]["prompt"],
+        )
+
+    def test_immediate_short_fragment_f8_recovers_latest_checkpoint(self):
+        app = self._app(codex_enabled=True)
+        question = "What was the hardest part of rebuilding the pipeline?"
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result(question, 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        app.codex_worker.inject_jobs[0]["callback"]({"item_count": 1}, None)
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result("お願いします", 18_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(app.last_commit_state["commit_source"], "f7_recovery")
+        self.assertEqual(app.last_commit_state["text"], question)
+        self.assertEqual(
+            app.last_commit_state["recovery_trailing_fragment"],
+            "お願いします",
+        )
+        self.assertEqual(
+            app.checkpoint_context[0]["promotion_status"],
+            "current",
+        )
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        prompt = app.codex_worker.jobs[0]["prompt"]
+        self.assertNotIn(question, prompt)
+        self.assertIn(
+            "immediately preceding INTERVIEWER CONTEXT CHECKPOINT",
+            prompt,
+        )
+        self.assertIn("POST-CHECKPOINT TRAILING TRANSCRIPT", prompt)
+        self.assertIn("お願いします", prompt)
+        self.assertNotIn("CURRENT INTERVIEWER QUESTION:\nお願いします", prompt)
+
+    def test_immediate_question_mark_transcript_still_recovers_checkpoint(self):
+        app = self._app(codex_enabled=True)
+        checkpoint_text = "Tell me about your latest project."
+        app._moonshine_checkpoint_ready(
+            time.perf_counter(),
+            {
+                **self._result(checkpoint_text, 10_000),
+                "checkpoint_saved": True,
+            },
+            None,
+        )
+        app.codex_worker.inject_jobs[0]["callback"]({"item_count": 1}, None)
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._result("What happened next?", 80_000),
+            None,
+            commit_source="f8",
+        )
+
+        self.assertEqual(app.question_count, 1)
+        self.assertEqual(app.last_commit_state["commit_source"], "f7_recovery")
+        self.assertEqual(app.last_commit_state["text"], checkpoint_text)
+        self.assertEqual(
+            app.last_commit_state["recovery_trailing_fragment"],
+            "What happened next?",
+        )
+        self.assertEqual(len(app.codex_worker.jobs), 1)
+        prompt = app.codex_worker.jobs[0]["prompt"]
+        self.assertIn("What happened next?", prompt)
+        self.assertNotIn(
+            "CURRENT INTERVIEWER QUESTION:\nWhat happened next?",
+            prompt,
         )
 
     def test_empty_f8_promotes_latest_injected_checkpoint_without_resending_text(self):
@@ -2295,6 +2381,39 @@ class MoonshineAppIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(retry_event["previous_generation"], 1)
             self.assertEqual(retry_event["new_generation"], 2)
+
+    def test_retry_prompt_allows_natural_response_to_genuine_greeting(self):
+        app = self._app(codex_enabled=True)
+        greeting = "Hello, nice to meet you."
+        self._commit(app, 1, greeting, 10_000, "f8")
+        self._finish_job(app.codex_worker.jobs[0], "Nice to meet you too.")
+
+        app._moonshine_question_ready(
+            None,
+            time.perf_counter(),
+            self._empty_result(10_000),
+            None,
+            commit_source="f8",
+        )
+
+        retry_prompt = app.codex_worker.jobs[1]["prompt"]
+        self.assertIn(
+            "If there is genuinely no question or request, respond naturally",
+            retry_prompt,
+        )
+        self.assertIn(
+            "Only ask for clarification when it is clear that an answer is "
+            "expected",
+            retry_prompt,
+        )
+        self.assertNotIn(
+            "Do not respond with conversational acknowledgements",
+            retry_prompt,
+        )
+        self.assertIn(
+            f"CURRENT INTERVIEWER QUESTION:\n{greeting}",
+            retry_prompt,
+        )
 
     def test_retry_replaces_completed_visible_answer_instead_of_appending(self):
         app = self._app(codex_enabled=True)
