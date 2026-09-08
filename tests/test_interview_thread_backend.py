@@ -72,6 +72,21 @@ class InterviewThreadBackendTest(unittest.TestCase):
             factory,
         ), captured_settings
 
+    def test_sync_excludes_global_and_include_restores_snapshot(self):
+        context = self.context_manager.create_context("global", "session-local", "Profile")
+        context.path.write_text("Private global profile", encoding="utf-8")
+        self.context_manager.set_global_context_excluded("session-local", context.name, True)
+        backend, _ = self._backend(FakeCodexClient())
+        result = backend.create(self.session_store.active()[0])
+        self.assertNotIn("Private global profile", result["snapshot"])
+        self.assertEqual(result["context_count"], 0)
+        self.assertTrue(self.context_manager.has_sync_metadata("session-local"))
+        self.assertEqual(self.context_manager.excluded_global_keys("session-local"), {"profile"})
+        self.context_manager.set_global_context_excluded("session-local", context.name, False)
+        backend, _ = self._backend(FakeCodexClient())
+        result = backend.create(self.session_store.active()[0])
+        self.assertIn("Private global profile", result["snapshot"])
+
     def test_create_injects_one_authoritative_snapshot_and_saves_state(self):
         global_context = self.context_manager.create_context(
             "global",

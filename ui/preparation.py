@@ -156,6 +156,33 @@ def stt_model_detail(language):
     )
 
 
+def codex_model_summary(settings, models):
+    model_id = settings.get("codex_model") or "unknown"
+    model = next(
+        (item for item in models if item.get("model") == model_id),
+        None,
+    )
+    display_name = model.get("displayName") if model is not None else None
+    model_name = (
+        f"{display_name} ({model_id})"
+        if display_name and display_name != model_id
+        else model_id
+    )
+    reasoning = settings.get("codex_reasoning_effort") or "unknown"
+    fast_mode = "On" if settings.get("codex_fast_mode") else "Off"
+    return (
+        f"Codex · {model_name} · Reasoning: {reasoning} · Fast: {fast_mode}"
+    )
+
+
+def stt_version_summary(language):
+    presentation = stt_presentation(language)
+    return (
+        f"STT · {presentation['language']} · {presentation['model']} · "
+        f"moonshine-voice {MOONSHINE_VOICE_VERSION}"
+    )
+
+
 def runtime_options(environment=None):
     environment = os.environ if environment is None else environment
     return {
@@ -248,9 +275,19 @@ def context_display_rows(contexts):
 
 
 def load_context_display_rows(context_manager, session_id):
-    return context_display_rows(
+    rows = context_display_rows(
         context_manager.resolve_effective_context_states(session_id)
     )
+    excluded = context_manager.excluded_global_keys(session_id)
+    rows.extend({
+        "scope": "GLOBAL",
+        "display_name": context_display_name(context.name),
+        "filename": context.name,
+        "path": context.path,
+        "status": "EXCLUDED",
+    } for context in context_manager.list_global_contexts()
+        if context_manager.context_logical_key(context.name) in excluded)
+    return rows
 
 
 def interview_conversation_messages(thread):
@@ -294,15 +331,21 @@ def interview_conversation_messages(thread):
     return messages
 
 
-def can_start_interview(session, context_rows, codex_enabled=True):
+def can_start_interview(
+    session,
+    context_rows,
+    codex_enabled=True,
+    context_snapshot_synced=True,
+):
     if not session:
         return False
     if not codex_enabled:
         return True
     return bool(
         session.get("interview_thread_id")
+        and context_snapshot_synced
         and all(
-            row.get("status") == CONTEXT_STATUS_SYNCED
+            row.get("status") in {CONTEXT_STATUS_SYNCED, "EXCLUDED"}
             for row in context_rows
         )
     )
@@ -335,6 +378,7 @@ class PreparationDialog(Gtk.Dialog):
         self.active = False
         self.context_sync_in_progress = False
         self.context_sync_generation = 0
+        self.context_snapshot_synced = True
         self.model_catalog_load_generation = 0
         self.conversation_load_generation = 0
         self.preparation_worker = None
@@ -378,6 +422,10 @@ class PreparationDialog(Gtk.Dialog):
         status_frame.get_style_context().add_class(
             "preparation-status-bar"
         )
+        status_content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+        )
         status_bar = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=10,
@@ -385,18 +433,20 @@ class PreparationDialog(Gtk.Dialog):
         self.session_summary_label = Gtk.Label(label=session_name)
         self.session_summary_label.set_xalign(0)
         self.session_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.session_summary_label.set_max_width_chars(28)
         self.session_summary_label.get_style_context().add_class(
             "status-session"
         )
         status_bar.pack_start(
             self.session_summary_label,
-            True,
-            True,
+            False,
+            False,
             0,
         )
         self.runtime_summary_label = Gtk.Label()
         self.runtime_summary_label.set_xalign(0)
         self.runtime_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.runtime_summary_label.set_max_width_chars(52)
         status_bar.pack_start(
             self.runtime_summary_label,
             True,
@@ -418,15 +468,44 @@ class PreparationDialog(Gtk.Dialog):
             False,
             0,
         )
-        self.stt_summary_label = Gtk.Label()
-        self.stt_summary_label.get_style_context().add_class("status-stt")
-        status_bar.pack_start(self.stt_summary_label, False, False, 0)
         self.settings_button = Gtk.Button(label="⚙ Settings")
         self.settings_button.set_relief(Gtk.ReliefStyle.NONE)
         self.settings_button.get_style_context().add_class("settings-button")
         self.settings_button.connect("clicked", self._show_settings)
         status_bar.pack_end(self.settings_button, False, False, 0)
-        status_frame.add(status_bar)
+        status_content.pack_start(status_bar, False, False, 0)
+
+        model_status_bar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+        model_status_bar.set_halign(Gtk.Align.START)
+        self.codex_summary_label = Gtk.Label()
+        self.codex_summary_label.set_xalign(0)
+        self.codex_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.codex_summary_label.set_max_width_chars(68)
+        self.codex_summary_label.get_style_context().add_class(
+            "status-model"
+        )
+        model_status_bar.pack_start(
+            self.codex_summary_label,
+            False,
+            False,
+            0,
+        )
+        self.stt_summary_label = Gtk.Label()
+        self.stt_summary_label.set_xalign(0)
+        self.stt_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.stt_summary_label.set_max_width_chars(64)
+        self.stt_summary_label.get_style_context().add_class("status-stt")
+        model_status_bar.pack_start(
+            self.stt_summary_label,
+            False,
+            False,
+            0,
+        )
+        status_content.pack_start(model_status_bar, False, False, 0)
+        status_frame.add(status_content)
         content.pack_start(status_frame, False, False, 0)
 
         self.settings_dialog = Gtk.Dialog(
@@ -813,10 +892,40 @@ class PreparationDialog(Gtk.Dialog):
             edit_button = Gtk.Button(label="Edit")
             edit_button.get_style_context().add_class("context-edit")
             edit_button.connect("clicked", self._edit_context, row)
+            folder_button = Gtk.Button(label="Folder")
+            folder_button.get_style_context().add_class("context-edit")
+            folder_button.set_tooltip_text("Open containing folder")
+            folder_button.connect(
+                "clicked",
+                self._open_context_folder,
+                row,
+            )
+            delete_button = Gtk.Button(label="Delete")
+            delete_button.get_style_context().add_class("context-edit")
+            delete_button.get_style_context().add_class(
+                "destructive-action"
+            )
+            delete_button.connect("clicked", self._delete_context, row)
+            action_box = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                spacing=5,
+            )
+            action_box.pack_start(edit_button, False, False, 0)
+            action_box.pack_start(folder_button, False, False, 0)
+            if row["scope"] == "GLOBAL":
+                exclusion_button = Gtk.Button(
+                    label="Include" if row["status"] == "EXCLUDED" else "Exclude"
+                )
+                exclusion_button.set_tooltip_text("이 세션에서만 포함/제외 · 변경 후 Sync Context")
+                exclusion_button.get_style_context().add_class("context-edit")
+                exclusion_button.connect("clicked", self._toggle_context_exclusion, row)
+                action_box.pack_start(exclusion_button, False, False, 0)
+                delete_button.set_tooltip_text("공유 파일 삭제 · 모든 세션에 영향")
+            action_box.pack_start(delete_button, False, False, 0)
             context_grid.attach(scope_label, 0, grid_row, 1, 1)
             context_grid.attach(display_label, 1, grid_row, 1, 1)
             context_grid.attach(status_label, 2, grid_row, 1, 1)
-            context_grid.attach(edit_button, 3, grid_row, 1, 1)
+            context_grid.attach(action_box, 3, grid_row, 1, 1)
         if not self.context_rows:
             empty_label = Gtk.Label(label="등록된 Context가 없습니다.")
             empty_label.set_xalign(0)
@@ -835,6 +944,14 @@ class PreparationDialog(Gtk.Dialog):
             0,
         )
         self.context_list_box.show_all()
+        self.context_snapshot_status = (
+            self.context_manager.snapshot_status(self.session_id)
+            if self.context_manager is not None
+            and self.session is not None
+            and self.session.get("interview_thread_id")
+            else "NOT SYNCED"
+        )
+        self.context_snapshot_synced = self.context_snapshot_status == CONTEXT_STATUS_SYNCED
         self._update_context_summary()
         self._update_start_button()
         self._update_preparation_chat()
@@ -843,6 +960,12 @@ class PreparationDialog(Gtk.Dialog):
         if not hasattr(self, "context_panel_button"):
             return
         label, style_class = context_status_summary(self.context_rows)
+        if getattr(self, "context_snapshot_status", None) == "NOT SYNCED":
+            label = "● Context Not Synced"
+            style_class = "status-not-synced"
+        elif not getattr(self, "context_snapshot_synced", True):
+            label = "● Context Changed"
+            style_class = "status-changed"
         if self.context_sync_in_progress:
             label = "◌ Context Syncing..."
             style_class = "status-not-synced"
@@ -1087,7 +1210,15 @@ class PreparationDialog(Gtk.Dialog):
             self.active
             and getattr(self, "codex_enabled", True)
             and not self.context_sync_in_progress
-            and can_start_interview(self.session, self.context_rows)
+            and can_start_interview(
+                self.session,
+                self.context_rows,
+                context_snapshot_synced=getattr(
+                    self,
+                    "context_snapshot_synced",
+                    True,
+                ),
+            )
         ):
             return None
         return self.session.get("interview_thread_id")
@@ -1270,6 +1401,7 @@ class PreparationDialog(Gtk.Dialog):
             self.session,
             self.context_rows,
             getattr(self, "codex_enabled", True),
+            getattr(self, "context_snapshot_synced", True),
         ):
             return None
         return self.session.get("interview_thread_id")
@@ -1286,6 +1418,84 @@ class PreparationDialog(Gtk.Dialog):
                 "Context 파일을 열 수 없습니다.",
                 str(error),
             )
+
+    def _open_context_folder(self, _button, row):
+        try:
+            path = Path(row["path"]).resolve(strict=True)
+            directory = path.parent
+            if not path.is_file() or not directory.is_dir():
+                raise OSError(f"Context folder does not exist: {directory}")
+            if not Gio.AppInfo.launch_default_for_uri(
+                directory.as_uri(),
+                None,
+            ):
+                raise OSError(f"No application can open: {directory}")
+        except (OSError, ValueError, GLib.Error) as error:
+            self._show_context_error(
+                "Context 폴더를 열 수 없습니다.",
+                str(error),
+            )
+
+    def _toggle_context_exclusion(self, _button, row):
+        if self.context_sync_in_progress:
+            self._show_context_error("Context를 변경할 수 없습니다.", "Sync 완료 후 다시 시도해 주세요.")
+            return
+        try:
+            self.context_manager.set_global_context_excluded(
+                self.session_id, row["filename"], row["status"] != "EXCLUDED",
+            )
+        except (OSError, ValueError) as error:
+            self._show_context_error("Context를 변경할 수 없습니다.", str(error))
+            return
+        self._refresh_contexts()
+
+    def _delete_context(self, _button, row):
+        if self.context_sync_in_progress:
+            self._show_context_error(
+                "Context를 삭제할 수 없습니다.",
+                "Context sync가 끝난 뒤 다시 시도해 주세요.",
+            )
+            return
+        if not self._confirm_context_delete(row):
+            return
+        try:
+            self.context_manager.delete_context(
+                row["scope"].lower(),
+                self.session_id,
+                row["filename"],
+            )
+        except (OSError, ValueError) as error:
+            self._show_context_error(
+                "Context를 삭제할 수 없습니다.",
+                str(error),
+            )
+            return
+        self._refresh_contexts()
+
+    def _confirm_context_delete(self, row):
+        is_global = row["scope"] == "GLOBAL"
+        impact = (
+            "GLOBAL Context이므로 모든 세션에서 제거됩니다."
+            if is_global
+            else "현재 세션에서만 제거됩니다."
+        )
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Context를 삭제할까요?",
+        )
+        dialog.format_secondary_text(
+            f"{row['display_name']} ({row['filename']})\n\n"
+            f"{impact}\n삭제한 파일은 복구할 수 없습니다."
+        )
+        dialog.add_button("취소", Gtk.ResponseType.CANCEL)
+        delete_button = dialog.add_button("삭제", Gtk.ResponseType.OK)
+        delete_button.get_style_context().add_class("destructive-action")
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.OK
 
     def _show_context_error(self, title, detail, parent=None):
         dialog = Gtk.MessageDialog(
@@ -1477,6 +1687,7 @@ class PreparationDialog(Gtk.Dialog):
         self._populate_reasoning(available[selected_model])
         self._sync_fast(available[selected_model])
         self._updating_settings_ui = False
+        self._update_codex_summary()
         if persist:
             self._persist_settings()
 
@@ -1565,7 +1776,7 @@ class PreparationDialog(Gtk.Dialog):
         presentation = stt_presentation(language)
         self.stt_model_title.set_text(presentation["title"])
         self.stt_model_detail.set_text(stt_model_detail(language))
-        self.stt_summary_label.set_text(stt_status_summary(language))
+        self.stt_summary_label.set_text(stt_version_summary(language))
         self.stt_summary_label.set_tooltip_text(
             f"{presentation['title']}\n"
             f"model: {presentation['model']}\n"
@@ -1577,7 +1788,22 @@ class PreparationDialog(Gtk.Dialog):
             self.runtime_summary_label.set_text(summary)
             self.runtime_summary_label.set_tooltip_text(summary)
 
+    def _update_codex_summary(self):
+        if not hasattr(self, "codex_summary_label"):
+            return
+        self.codex_summary_label.set_text(
+            codex_model_summary(self.codex_settings, self.codex_models)
+        )
+        self.codex_summary_label.set_tooltip_text(
+            f"Model: {self.codex_settings['codex_model']}\n"
+            "Reasoning: "
+            f"{self.codex_settings['codex_reasoning_effort']}\n"
+            "Fast: "
+            f"{'On' if self.codex_settings['codex_fast_mode'] else 'Off'}"
+        )
+
     def _persist_settings(self):
+        self._update_codex_summary()
         if self.session_store is not None:
             self.session_store.update_settings(
                 self.session_id,
@@ -1597,6 +1823,7 @@ class PreparationDialog(Gtk.Dialog):
                 self.session,
                 self.context_rows,
                 getattr(self, "codex_enabled", True),
+                getattr(self, "context_snapshot_synced", True),
             )
         )
 

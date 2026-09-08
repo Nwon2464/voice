@@ -257,6 +257,62 @@ class ContextManagerTest(unittest.TestCase):
         self.assertEqual(session_context.name, "answer-style.md")
         self.assertTrue(global_path.is_file())
 
+    def test_delete_session_context_invalidates_only_its_sync_metadata(self):
+        context = self.manager.create_context(
+            "session",
+            "thread-123",
+            "Company",
+        )
+        other_context = self.manager.create_context(
+            "session",
+            "thread-other",
+            "Position",
+        )
+        self.manager.record_successful_sync("thread-123", context)
+        self.manager.record_successful_sync("thread-other", other_context)
+
+        self.manager.delete_context(
+            "session",
+            "thread-123",
+            context.name,
+        )
+
+        self.assertFalse(context.path.exists())
+        self.assertFalse(self.manager.has_sync_metadata("thread-123"))
+        self.assertTrue(self.manager.has_sync_metadata("thread-other"))
+
+    def test_delete_global_context_invalidates_all_session_sync_metadata(self):
+        context = self.manager.create_context(
+            "global",
+            "thread-123",
+            "Profile",
+        )
+        for session_id in ("thread-123", "thread-other"):
+            self.manager.record_successful_sync(session_id, context)
+
+        self.manager.delete_context(
+            "global",
+            "thread-123",
+            context.name,
+        )
+
+        self.assertFalse(context.path.exists())
+        self.assertFalse(self.manager.has_sync_metadata("thread-123"))
+        self.assertFalse(self.manager.has_sync_metadata("thread-other"))
+
+    def test_delete_context_rejects_path_traversal(self):
+        outside = self.config_dir / "outside.md"
+        outside.write_text("keep", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            self.manager.delete_context(
+                "session",
+                "thread-123",
+                "../outside.md",
+            )
+
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
+
     def test_new_context_is_not_synced(self):
         context = self.manager.create_context(
             "session",
@@ -270,6 +326,53 @@ class ContextManagerTest(unittest.TestCase):
         self.assertEqual(states[0].path, context.path)
         self.assertEqual(states[0].status, CONTEXT_STATUS_NOT_SYNCED)
         self.assertIsNone(states[0].synced_hash)
+
+    def test_global_exclusion_is_persistent_and_session_local(self):
+        context = self.manager.create_context("global", "one", "Profile")
+        for session in ("one", "two"):
+            self.manager.record_successful_sync(session, context)
+        self.manager.set_global_context_excluded("one", context.name, True)
+        manager = ContextManager(self.config_dir)
+        self.assertEqual(manager.resolve_effective_contexts("one"), [])
+        self.assertEqual(manager.resolve_effective_contexts("two"), [context])
+        self.assertTrue(context.path.exists())
+        self.assertFalse(manager.has_sync_metadata("one"))
+        self.assertTrue(manager.has_sync_metadata("two"))
+        manager.replace_sync_hashes("one", {})
+        manager.set_global_context_excluded("one", context.name, False)
+        self.assertFalse(manager.has_sync_metadata("one"))
+        self.assertEqual(manager.resolve_effective_contexts("one"), [context])
+
+    def test_snapshot_status_tracks_complete_selection_and_content(self):
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_NOT_SYNCED)
+        context = self.manager.create_context("global", "one", "Profile")
+        self.manager.record_successful_sync("one", context)
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_SYNCED)
+        context.path.write_text("changed", encoding="utf-8")
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_CHANGED)
+        context.path.write_text("", encoding="utf-8")
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_SYNCED)
+        context.path.unlink()
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_CHANGED)
+        self.manager.replace_sync_hashes("one", {})
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_SYNCED)
+        self.manager.create_context("session", "one", "New")
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_CHANGED)
+
+    def test_empty_snapshot_requires_valid_sync_record(self):
+        self.manager.ensure_session("one")
+        for content in ('invalid', '[]', '{}', '{"sync_hashes": {"a": "bad"}}'):
+            with self.subTest(content=content):
+                self.manager.sync_metadata_path("one").write_text(content, encoding="utf-8")
+                self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_NOT_SYNCED)
+        self.manager.replace_sync_hashes("one", {})
+        self.assertEqual(self.manager.snapshot_status("one"), CONTEXT_STATUS_SYNCED)
+
+    def test_global_exclusion_does_not_exclude_session_override(self):
+        global_context = self.manager.create_context("global", "one", "Profile")
+        local_context = self.manager.create_context("session", "one", "Profile")
+        self.manager.set_global_context_excluded("one", global_context.name, True)
+        self.assertEqual(self.manager.resolve_effective_contexts("one"), [local_context])
 
     def test_matching_recorded_hash_is_synced(self):
         context = self.manager.create_context(

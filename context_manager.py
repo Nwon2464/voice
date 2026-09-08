@@ -110,6 +110,29 @@ class ContextManager:
         path.chmod(0o600)
         return ContextFile(scope=scope, name=filename, path=path)
 
+    def delete_context(self, scope, session_id, filename):
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or Path(filename).suffix.casefold() != ".md"
+        ):
+            raise ValueError("Context filename must be a Markdown filename")
+        if scope == "global":
+            directory = self.global_context_dir
+        elif scope == "session":
+            directory = self.session_context_dir(session_id)
+        else:
+            raise ValueError(f"unsupported Context scope: {scope!r}")
+
+        path = directory / filename
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(f"Context does not exist: {filename}")
+        path.unlink()
+        if scope == "global":
+            self._invalidate_all_sync_metadata()
+        else:
+            self.remove_sync_metadata(session_id)
+
     def list_global_contexts(self):
         return self._list_contexts(self.global_context_dir, "global")
 
@@ -117,8 +140,44 @@ class ContextManager:
         context_dir = self.session_context_dir(session_id)
         return self._list_contexts(context_dir, "session")
 
+    def excluded_global_keys(self, session_id):
+        path = self.session_context_dir(session_id).parent / "context_exclusions.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        keys = payload.get("excluded_global_keys") if isinstance(payload, dict) else None
+        if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+            raise ValueError("Invalid Context exclusion settings")
+        return set(keys)
+
+    def set_global_context_excluded(self, session_id, filename, excluded):
+        if filename not in {context.name for context in self.list_global_contexts()}:
+            raise ValueError("Global Context does not exist")
+        keys = self.excluded_global_keys(session_id)
+        key = self.context_logical_key(filename)
+        if (key in keys) == excluded:
+            return
+        if excluded:
+            keys.add(key)
+        else:
+            keys.discard(key)
+        directory = self.ensure_session(session_id).parent
+        path = directory / "context_exclusions.json"
+        temporary_path = path.with_suffix(".json.tmp")
+        # Invalidate before changing selection so a failed write cannot leave
+        # the previous snapshot marked synced for a different selection.
+        self.remove_sync_metadata(session_id)
+        temporary_path.write_text(
+            json.dumps({"excluded_global_keys": sorted(keys)}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.chmod(0o600)
+        temporary_path.replace(path)
+
     def resolve_effective_contexts(self, session_id):
         global_contexts = self.list_global_contexts()
+        excluded_keys = self.excluded_global_keys(session_id)
         session_contexts = self.list_session_contexts(session_id)
         session_keys = {
             self.context_logical_key(context.name)
@@ -128,6 +187,7 @@ class ContextManager:
             context
             for context in global_contexts
             if self.context_logical_key(context.name) not in session_keys
+            and self.context_logical_key(context.name) not in excluded_keys
         ] + session_contexts
 
     def resolve_effective_context_states(self, session_id):
@@ -195,6 +255,31 @@ class ContextManager:
     def remove_sync_metadata(self, session_id):
         self.sync_metadata_path(session_id).unlink(missing_ok=True)
 
+    def has_sync_metadata(self, session_id):
+        return self.sync_metadata_path(session_id).is_file()
+
+    def snapshot_status(self, session_id):
+        """Compare the complete effective snapshot, including removed entries."""
+        try:
+            payload = json.loads(self.sync_metadata_path(session_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return CONTEXT_STATUS_NOT_SYNCED
+        hashes = payload.get("sync_hashes") if isinstance(payload, dict) else None
+        if not isinstance(hashes, dict) or not all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+            for value in hashes.values()
+        ):
+            return CONTEXT_STATUS_NOT_SYNCED
+        current = {
+            self.context_logical_key(context.name): self.context_content_hash(context)
+            for context in self.resolve_effective_contexts(session_id)
+        }
+        return (
+            CONTEXT_STATUS_SYNCED
+            if current == {key: value.casefold() for key, value in hashes.items()}
+            else CONTEXT_STATUS_CHANGED
+        )
+
     def _load_sync_hashes(self, session_id):
         path = self.sync_metadata_path(session_id)
         try:
@@ -227,6 +312,18 @@ class ContextManager:
         temporary_path.chmod(0o600)
         temporary_path.replace(path)
         path.chmod(0o600)
+
+    def _invalidate_all_sync_metadata(self):
+        if not self.sessions_dir.is_dir():
+            return
+        for session_dir in self.sessions_dir.iterdir():
+            if not session_dir.is_dir() or session_dir.is_symlink():
+                continue
+            try:
+                session_id = self._validate_session_id(session_dir.name)
+            except ValueError:
+                continue
+            self.remove_sync_metadata(session_id)
 
     @staticmethod
     def _list_contexts(directory, scope):

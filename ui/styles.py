@@ -44,7 +44,22 @@ def install_application_css():
         padding: 6px 9px;
     }
     .status-session { color: #e8edf3; font: bold 11px Sans; }
-    .status-stt { color: #aeb7c3; font: 10px Sans; }
+    .status-model {
+        color: #dce8f5;
+        background-color: rgba(68, 91, 120, 0.24);
+        border: 1px solid rgba(123, 157, 197, 0.22);
+        border-radius: 5px;
+        padding: 3px 7px;
+        font: bold 10px Sans;
+    }
+    .status-stt {
+        color: #c7d0db;
+        background-color: rgba(82, 88, 99, 0.24);
+        border: 1px solid rgba(146, 155, 168, 0.20);
+        border-radius: 5px;
+        padding: 3px 7px;
+        font: 10px Sans;
+    }
     .context-panel-toggle { padding: 3px 8px; }
     .settings-button { padding: 3px 9px; }
     .settings-heading { color: #dce8f5; font: bold 11px Sans; }

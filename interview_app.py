@@ -118,6 +118,7 @@ from ui.preparation import (
     MOONSHINE_VOICE_VERSION,
     PreparationDialog,
     can_start_interview,
+    codex_model_summary,
     context_display_name,
     context_display_rows,
     context_scope_style,
@@ -133,6 +134,7 @@ from ui.preparation import (
     runtime_options,
     stt_model_detail,
     stt_presentation,
+    stt_version_summary,
 )
 from ui.session_dialogs import (
     SESSION_RESPONSE_ARCHIVE,

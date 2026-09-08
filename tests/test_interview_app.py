@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import interview_app
 from codex import worker as codex_worker_module
@@ -686,6 +686,28 @@ class CodexLatestOnlyTest(unittest.TestCase):
             f"moonshine-voice {interview_app.MOONSHINE_VOICE_VERSION}  ·  "
             "Streaming ASR",
         )
+
+    def test_preparation_model_summaries_show_exact_versions(self):
+        settings = {
+            "codex_model": "gpt-5.6-sol",
+            "codex_reasoning_effort": "high",
+            "codex_fast_mode": True,
+        }
+        models = [{
+            "model": "gpt-5.6-sol",
+            "displayName": "GPT-5.6 Sol",
+        }]
+
+        self.assertEqual(
+            interview_app.codex_model_summary(settings, models),
+            "Codex · GPT-5.6 Sol (gpt-5.6-sol) · "
+            "Reasoning: high · Fast: On",
+        )
+        self.assertEqual(
+            interview_app.stt_version_summary("ja"),
+            "STT · Japanese · small-streaming-ja · "
+            f"moonshine-voice {interview_app.MOONSHINE_VOICE_VERSION}",
+        )
         self.assertEqual(
             interview_app.stt_model_detail("ja"),
             "model: small-streaming-ja  ·  "
@@ -714,6 +736,77 @@ class CodexLatestOnlyTest(unittest.TestCase):
             interview_app.context_status_style("NOT SYNCED"),
             "status-not-synced",
         )
+
+    def test_preparation_context_delete_uses_scope_and_refreshes(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog.context_sync_in_progress = False
+        dialog.session_id = "session-local"
+        deleted = []
+        refreshed = []
+        dialog.context_manager = SimpleNamespace(
+            delete_context=lambda scope, session_id, filename: deleted.append(
+                (scope, session_id, filename)
+            )
+        )
+        dialog._confirm_context_delete = lambda _row: True
+        dialog._refresh_contexts = lambda: refreshed.append(True)
+        dialog._show_context_error = lambda *_args, **_kwargs: self.fail(
+            "delete should not show an error"
+        )
+
+        dialog._delete_context(None, {
+            "scope": "SESSION",
+            "display_name": "Company",
+            "filename": "company.md",
+        })
+
+        self.assertEqual(
+            deleted,
+            [("session", "session-local", "company.md")],
+        )
+        self.assertEqual(refreshed, [True])
+
+    def test_preparation_context_folder_opens_containing_directory(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog._show_context_error = lambda *_args, **_kwargs: self.fail(
+            "folder open should not show an error"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = {
+                "GLOBAL": root / "global_contexts" / "profile.md",
+                "SESSION": (
+                    root / "sessions" / "session-local" / "contexts"
+                    / "company.md"
+                ),
+            }
+            for path in paths.values():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("context", encoding="utf-8")
+
+            with patch.object(
+                preparation_module.Gio.AppInfo,
+                "launch_default_for_uri",
+                return_value=True,
+            ) as launch:
+                for scope, path in paths.items():
+                    with self.subTest(scope=scope):
+                        dialog._open_context_folder(None, {
+                            "scope": scope,
+                            "path": path,
+                        })
+
+            self.assertEqual(
+                [call.args for call in launch.call_args_list],
+                [
+                    (paths["GLOBAL"].parent.as_uri(), None),
+                    (paths["SESSION"].parent.as_uri(), None),
+                ],
+            )
 
     def test_preparation_workspace_starts_at_72_28_ratio(self):
         self.assertEqual(
@@ -1022,6 +1115,65 @@ class CodexLatestOnlyTest(unittest.TestCase):
         ))
         self.assertIsNone(captured["args"][3])
 
+    def test_excluded_global_stays_visible_and_can_be_included(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ContextManager(directory)
+            context = manager.create_context("global", "one", "Profile")
+            dialog = interview_app.PreparationDialog.__new__(interview_app.PreparationDialog)
+            dialog.context_manager = manager
+            dialog.session_id = "one"
+            dialog.context_sync_in_progress = False
+            dialog._refresh_contexts = lambda: None
+            row = interview_app.load_context_display_rows(manager, "one")[0]
+            dialog._toggle_context_exclusion(None, row)
+            rows = interview_app.load_context_display_rows(manager, "one")
+            self.assertEqual(rows[0]["status"], "EXCLUDED")
+            self.assertEqual(rows[0]["path"], context.path)
+            session = {"interview_thread_id": "thread"}
+            self.assertFalse(interview_app.can_start_interview(
+                session, rows, context_snapshot_synced=manager.has_sync_metadata("one"),
+            ))
+            manager.replace_sync_hashes("one", {})
+            self.assertTrue(interview_app.can_start_interview(
+                session, rows, context_snapshot_synced=manager.has_sync_metadata("one"),
+            ))
+            dialog._toggle_context_exclusion(None, rows[0])
+            self.assertEqual(manager.resolve_effective_contexts("one"), [context])
+            self.assertFalse(manager.has_sync_metadata("one"))
+
+    def test_refresh_snapshot_status_and_start_gate_for_empty_and_deleted_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ContextManager(directory)
+            context = manager.create_context("global", "one", "Profile")
+            dialog = interview_app.PreparationDialog.__new__(interview_app.PreparationDialog)
+            dialog.context_manager = manager
+            dialog.session_id = "one"
+            dialog.session = {"interview_thread_id": None}
+            dialog.context_sync_in_progress = False
+            dialog.context_list_box = MagicMock()
+            dialog.context_panel_button = MagicMock()
+            dialog.start_button = MagicMock()
+            dialog._update_preparation_chat = MagicMock()
+            manager.set_global_context_excluded("one", context.name, True)
+            with patch.multiple(preparation_module.Gtk, **{
+                name: MagicMock() for name in ("Grid", "Label", "Button", "Box", "ScrolledWindow")
+            }):
+                dialog._refresh_contexts()
+                self.assertIn("Not Synced", dialog.context_panel_button.set_label.call_args.args[0])
+                dialog.start_button.set_sensitive.assert_called_with(False)
+                manager.replace_sync_hashes("one", {})
+                dialog.session["interview_thread_id"] = "thread"
+                dialog._refresh_contexts()
+                self.assertIn("Context Synced", dialog.context_panel_button.set_label.call_args.args[0])
+                dialog.start_button.set_sensitive.assert_called_with(True)
+                manager.set_global_context_excluded("one", context.name, False)
+                manager.record_successful_sync("one", context)
+                context.path.unlink()
+                dialog._refresh_contexts()
+                self.assertIn("Context Changed", dialog.context_panel_button.set_label.call_args.args[0])
+                dialog.start_button.set_sensitive.assert_called_with(False)
+                self.assertIsNone(dialog.interview_thread_id())
+
     def test_context_refresh_reloads_changed_and_restored_status(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             manager = ContextManager(temporary_directory)
@@ -1262,6 +1414,11 @@ class CodexLatestOnlyTest(unittest.TestCase):
         self.assertTrue(interview_app.can_start_interview(
             {"interview_thread_id": "thread-interview"},
             synced,
+        ))
+        self.assertFalse(interview_app.can_start_interview(
+            {"interview_thread_id": "thread-interview"},
+            synced,
+            context_snapshot_synced=False,
         ))
 
     def test_codex_off_session_can_start_without_thread_or_context_sync(self):
