@@ -230,7 +230,7 @@ def context_status_summary(context_rows):
     return "● Context Synced", "status-synced"
 
 
-PREPARATION_CONVERSATION_RATIO = 0.72
+PREPARATION_CONVERSATION_RATIO = 0.5
 
 
 def preparation_conversation_position(width):
@@ -629,6 +629,7 @@ class PreparationDialog(Gtk.Dialog):
         workspace.set_wide_handle(True)
         workspace.set_hexpand(True)
         workspace.set_vexpand(True)
+        self._workspace_position_initialized = False
         workspace.connect("size-allocate", self._allocate_workspace)
         content.pack_start(workspace, True, True, 0)
         self.workspace_paned = workspace
@@ -830,6 +831,8 @@ class PreparationDialog(Gtk.Dialog):
         self.show_all()
 
     def _allocate_workspace(self, paned, allocation):
+        if self._workspace_position_initialized:
+            return
         position = (
             preparation_conversation_position(allocation.width)
             if self.context_panel_button.get_active()
@@ -837,6 +840,7 @@ class PreparationDialog(Gtk.Dialog):
         )
         if paned.get_position() != position:
             paned.set_position(position)
+        self._workspace_position_initialized = True
 
     def _toggle_context_panel(self, button):
         if button.get_active():

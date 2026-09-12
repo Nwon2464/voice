@@ -808,15 +808,31 @@ class CodexLatestOnlyTest(unittest.TestCase):
                 ],
             )
 
-    def test_preparation_workspace_starts_at_72_28_ratio(self):
+    def test_preparation_workspace_starts_at_50_50_ratio(self):
         self.assertEqual(
             interview_app.preparation_conversation_position(1000),
-            720,
+            500,
         )
         self.assertEqual(
             interview_app.preparation_conversation_position(800),
-            576,
+            400,
         )
+
+    def test_preparation_workspace_keeps_user_adjusted_position(self):
+        dialog = interview_app.PreparationDialog.__new__(
+            interview_app.PreparationDialog
+        )
+        dialog._workspace_position_initialized = False
+        dialog.context_panel_button = MagicMock()
+        dialog.context_panel_button.get_active.return_value = True
+        paned = MagicMock()
+        paned.get_position.side_effect = [0, 640]
+        allocation = SimpleNamespace(width=1000)
+
+        dialog._allocate_workspace(paned, allocation)
+        dialog._allocate_workspace(paned, allocation)
+
+        paned.set_position.assert_called_once_with(500)
 
     def test_preparation_status_summaries_reflect_context_and_stt(self):
         self.assertEqual(interview_app.stt_status_summary("en"), "EN · Streaming")
