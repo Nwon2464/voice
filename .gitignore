@@ -15,7 +15,7 @@ test_runs/
 .vscode/
 *~
 
-# Local development documentation (public guide: README_QUICKSTART.md)
-README.md
+# Local-only Markdown documentation
+*.md
 .venv-kokoro
 check.md
